@@ -1,0 +1,42 @@
+# Snowmageddon — MS/MS structure elucidation agent config
+
+# Orchestration hint passed to the agent: "parallel" (try all models) or "cascade" (retrieval → simulator → denovo).
+# The agent decides which tools to call; this is guidance, not hard control.
+mode: parallel
+
+# Input: path to a .raw file or pre-converted spectrum file (mzML, MGF, etc.)
+# Preprocessing is skipped if the file is already in a supported format.
+input: ""
+
+# Output directory for elucidation results
+output_dir: results/
+
+models:
+  simulator:
+    # Path to local ms-pred clone (github.com/coleygroup/ms-pred).
+    # Each machine sets this to wherever the repo is cloned.
+    ms_pred_src: "/home/magled/ms-pred-dev"
+    # Absolute paths to ICEBERG checkpoints.
+    gen_ckpt: "/home/runzhong/ms-models/iceberg_results_20260413/iceberg_nist23/split_1_rnd1/ckpt/gen/best.ckpt"
+    inten_ckpt: "/home/runzhong/ms-models/iceberg_results_20260413/iceberg_nist23/split_1_rnd1/ckpt/inten/best.ckpt"
+    env: simulator-iceberg
+    collision_energies: [20, 40]
+    adduct: "[M+H]+"
+    instrument: "Orbitrap"
+    cuda_devices: null   # set to "0" or "0,1" to use GPU; null = CPU
+
+  retrieval:
+    db_path: ""         # TODO: path to spectral database
+    env: retrieval
+    top_k: 10
+
+  denovo:
+    checkpoint: ""      # TODO: path to de novo model checkpoint
+    env: denovo
+    top_k: 10
+
+preprocessing:
+  env: preprocess
+  # Conversion tool: "msconvert" (ProteoWizard) or other
+  converter: msconvert
+  output_format: mzML

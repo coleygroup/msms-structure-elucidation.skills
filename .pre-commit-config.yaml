@@ -1,0 +1,21 @@
+repos:
+  # Linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.15.12
+    hooks:
+      # Run the linter with auto-fixing enabled
+      # for more rules cf. https://docs.astral.sh/ruff/rules/#pydoclint-doc
+      - id: ruff
+        args:
+          - --fix
+          - --select=D100
+          # - --select=D1 # run when codebase is more mature
+      # Run the formatter with auto-fixing enabled
+      - id: ruff-format
+
+  # Delete output from notebooks
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.6.1
+    hooks:
+      - id: nbstripout
