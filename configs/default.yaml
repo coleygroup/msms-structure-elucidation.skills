@@ -31,9 +31,20 @@ models:
     top_k: 10
 
   denovo:
-    checkpoint: ""      # TODO: path to de novo model checkpoint
+    # Path to local FRIGID clone (github.com/coleygroup/FRIGID).
+    # Each machine sets this to wherever the repo is cloned.
+    frigid_src: "/home/magled/FRIGID"
+    # Absolute paths to FRIGID checkpoints (extracted from frigid_pretrained_checkpoints.tar.gz).
+    dlm_ckpt: "checkpoints/frigid/DLM.ckpt"
+    mist_ckpt: "checkpoints/mist/mist_canopus.pt"
+    # ICEBERG checkpoints used for inference-time refinement (bundled in the FRIGID tarball).
+    iceberg_gen_ckpt: "checkpoints/iceberg/iceberg_canopus_model1.ckpt"
+    iceberg_inten_ckpt: "checkpoints/iceberg/iceberg_canopus_model2.ckpt"
     env: denovo
     top_k: 10
+    num_rounds: 2      # ICEBERG refinement rounds (0 = FRIGID-base only, no ICEBERG)
+    batch_size: 128
+    cuda_devices: "0"   # GPU index; set to null for CPU-only
 
 preprocessing:
   env: preprocess

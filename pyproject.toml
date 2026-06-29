@@ -21,7 +21,7 @@ snowmageddon = "snowmageddon.cli:main"
 # Pixi workspace — one environment per model + one shared agent env
 [tool.pixi.workspace]
 channels = ["conda-forge", "pytorch"]
-platforms = ["linux-64"]
+platforms = [{ platform = "linux-64", cuda = "12" }, { platform = "linux-64" }]
 
 [tool.pixi.pypi-dependencies]
 snowmageddon = { path = ".", editable = true }
@@ -42,7 +42,10 @@ simulator = { features = ["simulator"] }
 # Spectral database retrieval
 retrieval = { features = ["retrieval"] }
 # De novo structure prediction
-denovo = { features = ["denovo"] }
+denovo = { features = ["denovo-frigid"] }
+
+[tool.pixi.feature.agent]
+platforms = ["linux-64"]
 
 # Feature dependency sets
 [tool.pixi.feature.agent.dependencies]
@@ -65,7 +68,7 @@ python = ">=3.10"
 # Python 3.10 required by ms_pred and DGL 2.4
 [tool.pixi.feature.simulator-iceberg.dependencies]
 python = "3.10.*"
-pytorch = { version = "2.4.0", channel = "pytorch" }
+pytorch = { version = "==2.4.0", channel = "pytorch" }
 cython = "*"
 matplotlib = "*"
 rdkit = "*"
@@ -110,13 +113,18 @@ python = ">=3.10"
 [tool.pixi.feature.retrieval.pypi-dependencies]
 mcp = "*"
 
-[tool.pixi.feature.denovo.dependencies]
-python = ">=3.10"
-# TODO: add de novo model deps
-# pytorch = {version = ">=2.0", channel = "pytorch"}
+[tool.pixi.feature.denovo-frigid.dependencies]
+python = "3.10.*"
+# numpy pinned to match FRIGID's requirements (numpy==1.26.4)
+numpy = "==1.26.4"
+rdkit = "*"
 
-[tool.pixi.feature.denovo.pypi-dependencies]
-mcp = "*"
+[tool.pixi.feature.denovo-frigid.pypi-dependencies]
+# CPU wheel installs everywhere; setup_env.sh reinstalls the CUDA build on GPU machines
+torch = "==2.6.0"
+
+# FRIGID deps (torch-scatter, torch-sparse, DGL, ms-pred, ngboost, safe-mol, etc.)
+# must be installed via pip AFTER pixi install. Run: bash .agents/skills/msms-denovo/scripts/setup_env.sh
 
 [tool.pixi.tasks]
 elucidation = "python -m snowmageddon.cli run"
