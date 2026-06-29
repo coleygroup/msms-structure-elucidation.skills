@@ -8,6 +8,7 @@ Start manually:
 """
 
 import json
+import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
@@ -111,6 +112,20 @@ async def _isomers(arguments: dict) -> list[TextContent]:
 
     try:
         cids_data = _get(cids_url)
+        # Formula search is async — poll ListKey until results are ready.
+        # A 400 on the listkey poll means no compounds matched.
+        for _ in range(10):
+            if "Waiting" not in cids_data:
+                break
+            list_key = cids_data["Waiting"]["ListKey"]
+            time.sleep(2)
+            try:
+                cids_data = _get(
+                    f"{PUBCHEM_BASE}/compound/listkey/{list_key}/cids/JSON"
+                )
+            except Exception:
+                cids_data = {}
+                break
     except Exception as e:
         return [
             TextContent(
@@ -128,7 +143,7 @@ async def _isomers(arguments: dict) -> list[TextContent]:
 
     props_url = (
         f"{PUBCHEM_BASE}/compound/cid/{','.join(str(c) for c in cids)}"
-        "/property/CanonicalSMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName/JSON"
+        "/property/ConnectivitySMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName/JSON"
     )
     try:
         props = _get(props_url)
@@ -154,7 +169,7 @@ async def _compound(arguments: dict) -> list[TextContent]:
 
     props_url = (
         f"{PUBCHEM_BASE}/compound/{id_type}/{encoded}"
-        "/property/CanonicalSMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName/JSON"
+        "/property/ConnectivitySMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName/JSON"
     )
     synonyms_url = f"{PUBCHEM_BASE}/compound/{id_type}/{encoded}/synonyms/JSON"
 

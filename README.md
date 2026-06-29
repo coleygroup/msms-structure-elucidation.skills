@@ -49,7 +49,7 @@ snowmageddon run --input sample.mzML --mode cascade
 ```
 .agents/skills/
   msms-preprocess/        # .raw/.d → mzML/MGF
-  msms-sim-iceberg/       # ICEBERG simulator (working)
+  msms-sim-iceberg/       # Simulators
   msms-simulator/         # generic simulator stub (TODO)
   msms-retrieval/         # spectral DB retrieval stub (TODO)
   msms-denovo/            # de novo prediction stub (TODO)
