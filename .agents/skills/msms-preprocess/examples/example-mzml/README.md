@@ -3,13 +3,17 @@
 ## Goal
 Convert a Thermo `.raw` file from an LC-MS/MS experiment to mzML.
 
+## Prerequisites
+Docker must be available and the pwiz image pulled:
+```bash
+docker pull proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses
+```
+
 ## Steps
 ```bash
-# Env: preprocess
-python .agents/skills/msms-preprocess/scripts/run.py \
+pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
     --input examples/example-mzml/input.raw \
-    --output examples/example-mzml/output.mzML \
-    --format mzML
+    --output examples/example-mzml/output.mzML
 ```
 
 ## Expected Output

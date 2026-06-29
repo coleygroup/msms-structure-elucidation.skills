@@ -61,8 +61,6 @@ mcp = "*"
 
 [tool.pixi.feature.preprocess.dependencies]
 python = ">=3.10"
-# TODO: add msconvert wrapper or pyteomics, pymzml, etc.
-# pyteomics = "*"
 
 # -- ICEBERG simulator (ms-pred from coleygroup/ms-pred) ---------------------
 # Python 3.10 required by ms_pred and DGL 2.4
