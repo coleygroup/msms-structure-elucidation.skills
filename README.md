@@ -6,58 +6,33 @@ Three in-house models — ICEBERG simulator, spectral database retrieval, de nov
 
 ## Setup
 
-```bash
-# Install all pixi environments
-pixi install
+### Environments
 
-# Or install a specific env only
-pixi install --environment simulator-iceberg
+```bash
+bash setup_envs.sh   # pixi install + all per-skill post-install steps
 ```
+
+### Checkpoints
+
+Download model weights and update paths in `configs/default.yaml`.
+
+| Model | Source |
+|-------|--------|
+| ICEBERG (simulator) | [coleygroup/ms-pred releases](https://github.com/coleygroup/ms-pred) — `gen_ckpt` and `inten_ckpt` |
+| GLACIER (simulator) | [coleygroup/ms-pred releases](https://github.com/coleygroup/ms-pred) — `gen_ckpt` and `inten_ckpt` |
+| Retrieval | TODO |
+| FRIGID (de novo) | [coleygroup/FRIGID releases](https://github.com/coleygroup/FRIGID) |
+
+curl -L "https://zenodo.org/records/19685145/files/frigid_pretrained_checkpoints.tar.gz?download=1" -o checkpoints/frigid_pretrained_checkpoints.tar.gz
 
 ### Dev setup (pre-commit hooks)
 
 ```bash
-pixi install                          # installs pre-commit into the default env
-pixi run pre-commit install           # wires hooks into .git/hooks/
+pixi run pre-commit install
 ```
 
-After this, ruff (lint + format) and nbstripout run automatically on every commit.
-To run all hooks manually: `pixi run pre-commit run --all-files`
-
-### Before pushing (CI checks)
-
-CI runs `ruff check` and `ruff format --check` on `src/`. Pre-commit handles both
-automatically on every commit. To run manually:
-
-```bash
-pixi run pre-commit run --all-files   # lint + format everything
-# or individually:
-pixi run ruff check src/
-pixi run ruff format src/
-```
-
-
-### ICEBERG checkpoints
-
-Download from [coleygroup/ms-pred releases](https://github.com/coleygroup/ms-pred) and place in `downloads/`:
-
-```
-downloads/
-├── iceberg_dag_gen_msg_best.ckpt
-└── iceberg_dag_inten_msg_best.ckpt
-```
-
-DGL and `ms_pred` must be installed manually after `pixi install --environment simulator-iceberg`:
-
-```bash
-pixi run --environment simulator-iceberg \
-  pip install dgl --find-links https://data.dgl.ai/wheels/torch-2.4/repo.html
-pixi run --environment simulator-iceberg \
-  pip install torch-scatter torch-sparse \
-    --find-links https://data.pyg.org/whl/torch-2.4.0+cpu.html
-pixi run --environment simulator-iceberg \
-  pip install git+https://github.com/coleygroup/ms-pred
-```
+Ruff (lint + format) and nbstripout run automatically on every commit.
+To run manually: `pixi run pre-commit run --all-files`
 
 ## Usage
 
