@@ -144,10 +144,14 @@ def run_frigid(
     ]
 
     cuda = denovo.get("cuda_devices")
+    env = os.environ.copy()
     if cuda:
+        # spec2mol_scaling.py hardcodes device "cuda" (i.e. cuda:0) with no device
+        # flag of its own, so remap the configured GPU to index 0 via visibility.
         cmd += ["--iceberg-gpu"] + str(cuda).split(",")
+        env["CUDA_VISIBLE_DEVICES"] = str(cuda).split(",")[0]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise RuntimeError(
             f"FRIGID failed (exit {result.returncode}):\n"

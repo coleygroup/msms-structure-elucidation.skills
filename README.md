@@ -25,6 +25,22 @@ Download model weights and update paths in `configs/default.yaml`.
 
 curl -L "https://zenodo.org/records/19685145/files/frigid_pretrained_checkpoints.tar.gz?download=1" -o checkpoints/frigid_pretrained_checkpoints.tar.gz
 
+
+Data processing ?
+# Positive mode
+/Applications/mzmine.app/Contents/MacOS/mzmine \
+  -user "/Users/magdalenalederbauer/.mzmine/users/yourfile.mzuser" \
+  -batch "/path/to/Marhall_6_pos_batch_v2.mzbatch" \
+  -input "/Users/magdalenalederbauer/Downloads/BMS_data_260626_raw_files/*.raw" \
+  -output "/Users/magdalenalederbauer/Downloads/BMS_data_260626_raw_files/results/pos"
+
+# Negative mode
+/Applications/mzmine.app/Contents/MacOS/mzmine \
+  -user "/Users/magdalenalederbauer/.mzmine/users/yourfile.mzuser" \
+  -batch "/path/to/Marhall_6_neg_batch_v2.mzbatch" \
+  -input "/Users/magdalenalederbauer/Downloads/BMS_data_260626_raw_files/*.raw" \
+  -output "/Users/magdalenalederbauer/Downloads/BMS_data_260626_raw_files/results/neg"
+
 ### Dev setup (pre-commit hooks)
 
 ```bash

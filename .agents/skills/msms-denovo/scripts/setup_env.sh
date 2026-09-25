@@ -33,12 +33,16 @@ if [[ ! -f "$FRIGID_DIR/ms-pred/setup.py" && ! -f "$FRIGID_DIR/ms-pred/pyproject
     exit 1
 fi
 
-echo "=== Verifying PyTorch 2.6 (installed by pixi from conda-forge, CUDA 12.6 build) ==="
+echo "=== Verifying PyTorch 2.6 and detecting installed CUDA build ==="
 $PIXI python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available — check pyproject.toml system requirements'; print('  torch', torch.__version__, '| CUDA', torch.version.cuda, '| GPUs:', torch.cuda.device_count())"
 
-echo "=== Installing torch-scatter and torch-sparse (torch-2.6+cu126 wheel index) ==="
+# torch-scatter/torch-sparse wheels are tagged by CUDA toolkit version and must match
+# the *installed* torch build exactly (e.g. cu124 vs cu126) or the compiled extension
+# fails at import with an ABI mismatch (undefined symbol from libtorch).
+CUDA_TAG=$($PIXI python -c "import torch; print('cu' + torch.version.cuda.replace('.', ''))")
+echo "=== Installing torch-scatter and torch-sparse (torch-2.6+${CUDA_TAG} wheel index) ==="
 $PIXI python -m pip install torch-scatter torch-sparse \
-    --find-links https://data.pyg.org/whl/torch-2.6.0+cu126.html
+    --find-links "https://data.pyg.org/whl/torch-2.6.0+${CUDA_TAG}.html"
 
 echo "=== Installing DGL (torch-2.6 wheel index) ==="
 $PIXI python -m pip install dgl \

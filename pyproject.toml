@@ -61,6 +61,18 @@ mcp = "*"
 
 [tool.pixi.feature.preprocess.dependencies]
 python = ">=3.10"
+pyteomics = "*"
+psims = "*"
+lxml = "*"
+matplotlib = "*"
+jupyterlab = "*"
+ipywidgets = "*"
+plotly = "*"
+seaborn = "*"
+rdkit = "*"
+
+[tool.pixi.feature.preprocess.pypi-dependencies]
+pypalettes = "*"
 
 # -- ICEBERG simulator (ms-pred from coleygroup/ms-pred) ---------------------
 # Python 3.10 required by ms_pred and DGL 2.4
@@ -104,9 +116,10 @@ python = ">=3.10"
 
 [tool.pixi.feature.retrieval.dependencies]
 python = ">=3.10"
-# TODO: add retrieval deps (faiss, numpy, etc.)
-# faiss-cpu = "*"
-# numpy = "*"
+numpy = "*"
+rdkit = "*"
+h5py = "*"
+# TODO: add faiss-cpu once vector-based retrieval (beyond atlas MGF lookup) is needed
 
 [tool.pixi.feature.retrieval.pypi-dependencies]
 mcp = "*"
@@ -116,6 +129,8 @@ python = "3.10.*"
 # numpy pinned to match FRIGID's requirements (numpy==1.26.4)
 numpy = "==1.26.4"
 rdkit = "*"
+# wandb (pulled in by safe-mol) imports pkg_resources.parse_version, removed in setuptools>=81
+setuptools = "<81"
 
 [tool.pixi.feature.denovo-frigid.pypi-dependencies]
 # CPU wheel installs everywhere; setup_env.sh reinstalls the CUDA build on GPU machines

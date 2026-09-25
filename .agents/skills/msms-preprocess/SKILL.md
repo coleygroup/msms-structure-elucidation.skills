@@ -38,6 +38,15 @@ pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/
     --format MGF
 ```
 
+4. **Mixed-polarity `.raw` files** — most instrument methods acquire positive and negative ESI in one run. Splitting can be done either here (msconvert) or in `msms-feature-detect` itself (MZmine's chromatogram builder, via `--polarity "+"` / `--polarity "-"` — see its SKILL.md, this is now the preferred path since it avoids an extra conversion pass). To split here instead:
+```bash
+pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+    --input path/to/sample.raw --output results/sample_pos.mzML --polarity positive
+pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+    --input path/to/sample.raw --output results/sample_neg.mzML --polarity negative
+```
+`--polarity` defaults to `any` (no filtering) — safe to omit for files already acquired in a single polarity, or if you plan to split downstream in `msms-feature-detect` instead.
+
 ## Constraints
 - **Environment**: `preprocess` (`pixi run --environment preprocess python ...`)
 - **Supported input formats**: `.raw` (Thermo), `.d` (Bruker) — extend as needed
@@ -45,6 +54,7 @@ pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/
 - **Converter**: msconvert (ProteoWizard) via Docker (`proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses`) or system binary
 - **Docker stack**: `your script → Docker → Wine → msconvert.exe → .mzML`
 - **Machine requirement**: Docker must be installed; on molgpu nodes, molgpu06 has it
+- **Polarity filtering**: `--polarity {positive,negative,any}` maps to msconvert's own `polarity` filter. Equivalent to (and interchangeable with) splitting in `msms-feature-detect --polarity "+"/"-"` — pick whichever fits your pipeline; MZmine's version needs the literal `+`/`-` symbol, not a word.
 
 ## References
 - Chambers et al., "A cross-platform toolkit for mass spectrometry and proteomics", *Nature Biotechnology*, 2012. [DOI](https://doi.org/10.1038/nbt.2377)

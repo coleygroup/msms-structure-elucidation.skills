@@ -47,7 +47,7 @@ pixi run --environment <env-name> python .agents/skills/<skill>/scripts/run.py [
 ```
 .agents/skills/
   msms-preprocess/    # .raw/.d → mzML/MGF
-  msms-simulator/     # predict spectrum from SMILES
+  msms-sim-iceberg/   # predict spectrum from SMILES (ICEBERG)
   msms-retrieval/     # match spectrum against DB
   msms-denovo/        # generate structures de novo
 .agents/workflows/
