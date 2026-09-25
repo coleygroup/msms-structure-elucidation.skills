@@ -30,13 +30,20 @@ models:
     env: retrieval
     top_k: 10
 
+  atlas:
+    # Full precomputed ICEBERG spectral atlas (PubChem-scale), keyed by formula + InChIKey.
+    # Mounted read-only from iceberg-ms.mit.edu:/home/coley-group/atlas via NFS.
+    # Layout: <atlas_dir>/h_plus_out_mgf/<C.../O.../H...>/<formula>.mgf(.idx)
+    atlas_dir: "/mnt/iceberg_atlas"
+    env: retrieval
+
   denovo:
     # Path to local FRIGID clone (github.com/coleygroup/FRIGID).
     # Each machine sets this to wherever the repo is cloned.
     frigid_src: "/home/magled/FRIGID"
     # Absolute paths to FRIGID checkpoints (extracted from frigid_pretrained_checkpoints.tar.gz).
     dlm_ckpt: "checkpoints/frigid/DLM.ckpt"
-    mist_ckpt: "checkpoints/mist/mist_canopus.pt"
+    mist_ckpt: "/home/liuhx25/mist_msg.ckpt" #"checkpoints/mist/mist_canopus.pt"
     # ICEBERG checkpoints used for inference-time refinement (bundled in the FRIGID tarball).
     iceberg_gen_ckpt: "checkpoints/iceberg/iceberg_canopus_model1.ckpt"
     iceberg_inten_ckpt: "checkpoints/iceberg/iceberg_canopus_model2.ckpt"
@@ -44,10 +51,18 @@ models:
     top_k: 10
     num_rounds: 2      # ICEBERG refinement rounds (0 = FRIGID-base only, no ICEBERG)
     batch_size: 128
-    cuda_devices: "0"   # GPU index; set to null for CPU-only
+    cuda_devices: "1"   # GPU index; set to null for CPU-only (GPU 0 often busy on shared box)
 
 preprocessing:
   env: preprocess
   # Conversion tool: "msconvert" (ProteoWizard) or other
   converter: msconvert
   output_format: mzML
+
+feature_detect:
+  env: preprocess
+  # Path to the MZmine 4 binary. Each machine sets this to wherever it was extracted
+  # (see .agents/skills/msms-feature-detect/SKILL.md for install instructions — no root needed).
+  mzmine_bin: "/home/magled/mzmine-4.7.8/opt/mzmine/bin/mzmine"
+  # Path to a .mzuser login file. Generate with: <mzmine_bin> -login-console
+  mzmine_user: "/home/magled/.mzmine/users/mlederbauer.mzuser"
