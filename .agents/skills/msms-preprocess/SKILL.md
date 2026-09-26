@@ -46,6 +46,8 @@ python .agents/skills/msms-preprocess/scripts/run.py \
 ```
 `--polarity` defaults to `any` (no filtering) — safe to omit for files already acquired in a single polarity, or if you plan to split downstream in `msms-feature-detect` instead.
 
+5. **GNPS/MZmine feature MGF to `.ms`** — after confirming NCE versus absolute eV, run `msms-structure-elucidation convert-mgf --input features.mgf --collision-unit eV --output-dir converted`. Add `--raw-mzxml raw.mzXML` to read precursor-specific collision energies from referenced MS2 scans. `SOURCE_SCAN` and `SCANS` can identify the MS1 apex and are never used as MS2 energy evidence. A `needs_energy` manifest row requires a verified `--energy` override or raw MS2 metadata. Bruker Q-TOF collision values are absolute eV set per precursor m/z; inspect the MS2 scan in raw mzXML. Process `converted/manifest.csv` with `msms-structure-elucidation batch`.
+
 ## Constraints
 - **Environment**: `preprocess` (`python ...`)
 - **Supported input formats**: `.raw` (Thermo), `.d` (Bruker) — extend as needed

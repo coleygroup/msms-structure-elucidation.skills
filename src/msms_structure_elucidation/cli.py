@@ -2,23 +2,43 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import concurrent.futures
+from collections import Counter
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from msms_structure_elucidation.atlas import download_mgf
+from msms_structure_elucidation.atlas import AtlasNoEntry, download_mgf
+from msms_structure_elucidation.config import asset, choice, settings
 from msms_structure_elucidation.report import write_report
 from msms_structure_elucidation.spectrum import inspect_ms
+
+_MODEL_SEMAPHORE = None
+
+
+def _instrument(value: str | None) -> str | None:
+    if not value:
+        return None
+    compact = value.upper().replace('-', '').replace(' ', '')
+    if compact.startswith('ORBITRAP'):
+        return 'Orbitrap'
+    if 'QTOF' in compact:
+        return 'QTOF'
+    return {'QTOF': 'QTOF', 'ORBITRAP': 'Orbitrap', 'ITFT': 'IT-FT'}.get(compact, value)
 
 
 def model_python(explicit: str | None) -> str:
     if explicit:
-        return explicit
+        path = Path(explicit).expanduser()
+        return str(path.resolve()) if path.exists() else shutil.which(explicit) or explicit
     if os.environ.get('MS_PRED_PYTHON'):
-        return os.environ['MS_PRED_PYTHON']
+        return model_python(os.environ['MS_PRED_PYTHON'])
     try:
         import ms_pred  # noqa: F401
         return sys.executable
@@ -35,19 +55,110 @@ def model_python(explicit: str | None) -> str:
 
 
 def worker(python: str, action: str, **kwargs):
+    cwd = kwargs.pop('ms_pred_dir', None)
+    if cwd:
+        cwd = Path(cwd).expanduser().resolve()
+        if not (cwd / 'src/ms_pred').is_dir():
+            raise FileNotFoundError(f'Not an ms-pred checkout: {cwd}. Clone https://github.com/coleygroup/ms-pred and follow its README.')
+    if cwd is None and Path(python).resolve() == Path(sys.executable).resolve():
+        from msms_structure_elucidation import worker as science
+        if action == 'rank':
+            return science.rank(str(kwargs['spectrum']), str(kwargs['mgf']), kwargs['formula'],
+                int(kwargs['top_k']), kwargs['experimental_unit'])
+        if action == 'formula':
+            return science.formula_candidates(str(kwargs['spectrum']), kwargs['experimental_unit'])
+        if action == 'validate':
+            return science.validate_smiles(json.loads(Path(kwargs['smiles_json']).read_text()), kwargs['formula'])
+        if action == 'atlas-smiles':
+            return science.atlas_smiles(str(kwargs['mgf']))
+        if action == 'atlas-info':
+            return science.atlas_info(str(kwargs['mgf']), [int(x) for x in kwargs['energies'].split(',')],
+                str(kwargs['spectrum']), kwargs['formula'], kwargs['experimental_unit'])
     cmd = [python, '-m', 'msms_structure_elucidation.worker', action]
     for key, value in kwargs.items():
         if value is not None:
             cmd += ['--' + key.replace('_', '-'), str(value)]
     env = os.environ.copy()
-    env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get('PYTHONPATH', '')
-    run = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    env['PYTHONPATH'] = os.pathsep.join(x for x in (
+        str(cwd / 'src') if cwd else None, str(Path(__file__).resolve().parents[1]), env.get('PYTHONPATH')) if x)
+    run = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
     if run.returncode:
-        raise RuntimeError(run.stderr[-4000:] or run.stdout[-4000:])
+        raise RuntimeError(f'{action} failed (exit {run.returncode}):\n{run.stdout[-6000:]}\n{run.stderr[-6000:]}')
     for line in reversed(run.stdout.splitlines()):
         if line.startswith('RESULT_JSON='):
             return json.loads(line.removeprefix('RESULT_JSON='))
     raise RuntimeError(f'No worker result: {run.stdout[-2000:]}')
+
+
+def _model_options(args, config: dict, default_model='iceberg') -> dict:
+    model_cfg = config.get('models', {}).get('simulator', {})
+    def path_option(cli_value, env_name, configured):
+        if cli_value:
+            return str(Path(cli_value).expanduser().resolve())
+        if env_name and os.environ.get(env_name):
+            return str(Path(os.environ[env_name]).expanduser().resolve())
+        return asset(configured, config)
+    return {'model': getattr(args, 'model', None) or model_cfg.get('model') or default_model,
+        'ms_pred_dir': path_option(getattr(args, 'ms_pred_dir', None), 'MS_PRED_DIR', model_cfg.get('ms_pred_src')),
+        'checkpoint': path_option(getattr(args, 'checkpoint', None), None, model_cfg.get('glacier_ckpt')),
+        'gen_checkpoint': path_option(getattr(args, 'gen_checkpoint', None), None, model_cfg.get('gen_ckpt')),
+        'inten_checkpoint': path_option(getattr(args, 'inten_checkpoint', None), None, model_cfg.get('inten_ckpt')),
+        'cuda_devices': choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices')),
+        'batch_size': getattr(args, 'model_batch_size', None) or model_cfg.get('batch_size', 1)}
+
+
+def _save(result: dict, out: Path, no_report=False) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / 'retrieval.json').write_text(json.dumps(result, indent=2, allow_nan=False))
+    if not no_report:
+        write_report(result, out / 'report.html')
+
+
+def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str,
+                     out: Path, options: dict, instrument: str | None, shard_size: int,
+                     top_k: int, smiles: list[str] | None = None) -> tuple[list[dict], int]:
+    from msms_structure_elucidation.worker import sort_candidates
+    if not options['ms_pred_dir']:
+        raise FileNotFoundError('Set --ms-pred-dir or models.simulator.ms_pred_src to an ms-pred checkout for local model inference')
+    if options['model'] != 'iceberg':
+        raise ValueError('Atlas energy fallback uses ICEBERG on every atlas structure; set --model iceberg')
+    if not all(options.get(k) and Path(options[k]).is_file() for k in ('gen_checkpoint', 'inten_checkpoint')):
+        raise FileNotFoundError('ICEBERG generation and intensity checkpoints are required for exact-energy fallback. Set them in configs/default.yaml or --gen-checkpoint/--inten-checkpoint; see ms-pred README for public weights.')
+    if smiles is None:
+        smiles = worker(python, 'atlas-smiles', mgf=mgf)
+    if not smiles:
+        return [], 0
+    shards = out / 'model_shards' / formula
+    shards.mkdir(parents=True, exist_ok=True)
+    leaders = []
+    input_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    for start in range(0, len(smiles), shard_size):
+        chunk = smiles[start:start + shard_size]
+        checkpoint_versions = {k: (str(options.get(k)), Path(options[k]).stat().st_size, Path(options[k]).stat().st_mtime_ns)
+            for k in ('gen_checkpoint', 'inten_checkpoint') if options.get(k)}
+        signature = hashlib.sha256(json.dumps([chunk, input_hash, unit, instrument,
+            {k: str(options.get(k)) for k in ('model','ms_pred_dir','cuda_devices','batch_size')},
+            checkpoint_versions], sort_keys=True).encode()).hexdigest()[:16]
+        saved = shards / f'{start:08d}-{signature}.json'
+        if saved.is_file():
+            candidates = json.loads(saved.read_text())
+        else:
+            listing = shards / f'{start:08d}-{signature}.smiles.json'
+            listing.write_text(json.dumps(chunk))
+            if _MODEL_SEMAPHORE is None:
+                candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
+                    formula=formula, experimental_unit=unit, output_dir=out,
+                    instrument=instrument, **options)
+            else:
+                with _MODEL_SEMAPHORE:
+                    candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
+                        formula=formula, experimental_unit=unit, output_dir=out,
+                        instrument=instrument, **options)
+            temp = saved.with_suffix('.tmp')
+            temp.write_text(json.dumps(candidates, allow_nan=False))
+            temp.replace(saved)
+        leaders = sort_candidates(leaders + candidates)[:top_k]
+    return leaders, len(smiles)
 
 
 def run(args):
@@ -55,87 +166,133 @@ def run(args):
     if path.suffix.lower() != '.ms':
         raise ValueError('Use a .ms spectrum. For raw or mzML input, run the preprocess/feature-detect skills first.')
     data = inspect_ms(path, args.collision_unit)
-    out = Path(args.output_dir).resolve()
+    config = settings(getattr(args, 'config', None))
+    model_options = _model_options(args, config)
+    top_k = getattr(args, 'top_k', None) or config.get('models', {}).get('retrieval', {}).get('top_k', 10)
+    shard_size = getattr(args, 'model_shard_size', None) or config.get('models', {}).get('simulator', {}).get('shard_size', 256)
+    if shard_size < 1 or top_k < 1:
+        raise ValueError('--model-shard-size and --top-k must be positive')
+    out = Path(args.output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     result = {'input': str(path), 'parentmass': data['parentmass'], 'adduct': data['adduct'],
               'peaks': data['peaks'], 'spectra': data['spectra'], 'candidates': [], 'warnings': [],
               'collision_unit': data['collision_unit'], 'header_units': data['header_units'],
-              'energy_mapping': data['energy_mapping']}
+              'energy_mapping': data['energy_mapping'], 'status': 'running',
+              'instrument': _instrument(getattr(args, 'instrument', None) or data['metadata'].get('instrumentation') or config.get('models', {}).get('simulator', {}).get('instrument')),
+              'formula_results': [], 'config': config['_config_path'],
+              'model_settings': model_options}
     if data['header_units'] and data['header_units'] != [args.collision_unit]:
         result['warnings'].append(
             f"Collision headers say {', '.join(data['header_units'])}; using user-supplied {args.collision_unit}.")
-    python = model_python(args.ms_pred_python)
-    formula = args.formula or data['metadata'].get('formula')
-    if not formula:
+    python = model_python(getattr(args, 'ms_pred_python', None))
+    formulas = []
+    if getattr(args, 'formulas_file', None):
+        formulas = [x.strip() for x in Path(args.formulas_file).read_text().splitlines() if x.strip() and not x.startswith('#')]
+        result['formula_source'] = 'user list'
+    elif args.formula or data['metadata'].get('formula'):
+        formulas = [args.formula or data['metadata']['formula']]
+        result['formula_source'] = 'provided' if args.formula else 'input'
+    else:
         try:
             inferred = worker(python, 'formula', spectrum=path,
                               experimental_unit=args.collision_unit)
-            if inferred:
-                formula = inferred[0]['formula']
-                result['formula_hypotheses'] = inferred
-                result['formula_source'] = 'MSBuddy inferred'
+            formulas = [x['formula'] for x in inferred[:3]]
+            result['formula_hypotheses'] = inferred
+            result['formula_source'] = 'MSBuddy inferred'
         except Exception as exc:
-            result['warnings'].append(str(exc))
-    else:
-        result['formula_source'] = 'provided' if args.formula else 'input'
-    result['formula'] = formula
-    if formula:
+            result['warnings'].append(f'Formula inference unavailable: {exc}')
+    formulas = list(dict.fromkeys(formulas))
+    result['formula'] = formulas[0] if formulas else None
+    if not formulas:
+        result['status'] = 'needs_formula'
+        result['warnings'].append('No formula available. Supply --formula or --formulas-file, or obtain formula hypotheses from isotope/MS1 evidence. FRIGID also requires a formula.')
+    candidates = []
+    operational_error = None
+    for formula in formulas:
+        record = {'formula': formula, 'status': 'running'}
+        result['formula_results'].append(record)
         try:
-            mgf = Path(args.atlas_mgf) if args.atlas_mgf else download_mgf(formula, data['adduct'], out / 'atlas' / f'{formula}.mgf', args.atlas_url)
-            ranked = worker(python, 'rank', spectrum=path, mgf=mgf, formula=formula,
-                            top_k=args.top_k, experimental_unit=args.collision_unit)
-            result.update(ranked)
-            result['atlas_mgf'] = str(mgf)
-            scores = [c['entropy_similarity'] for c in result['candidates']]
-            result['qc'] = {'experimental_collision_energies': len(data['spectra']),
-                'experimental_peaks': data['peaks'], 'library_structures': ranked['library_structures'],
-                'scored_structures': ranked['scored_structures'],
-                'nonzero_top_scores': sum(score > 0 for score in scores),
-                'top_score_range': [min(scores), max(scores)] if scores else None,
-                'top_energy_pairs': len(result['candidates'][0]['energy_alignment']) if scores else 0,
-                'top_predicted_peaks': sum(len(v) for v in result['candidates'][0]['predicted_spectra'].values()) if scores else 0}
-            if result['candidates']:
-                best = result['candidates'][0]
-                aligned = {p['experimental_key'] for p in best['energy_alignment']}
-                unmatched_energies = [e for e in data['spectra'] if e not in aligned]
-                result['qc']['unmatched_experimental_energies_ev'] = unmatched_energies
-                if unmatched_energies:
-                    result['warnings'].append(
-                        f"{len(unmatched_energies)} experimental collision energies had no atlas spectrum within 2 eV: {', '.join(unmatched_energies)} eV.")
-                matched = {(str(p['ce']), p['mz']) for p in best['matched_peaks']}
-                unexplained = []
-                for ce, peaks in data['spectra'].items():
-                    for mz, intensity in peaks:
-                        if (str(ce), mz) not in matched:
-                            unexplained.append({'ce': ce, 'mz': mz, 'intensity': intensity})
-                result['review_evidence'] = {'best_candidate': best['smiles'],
-                    'entropy_similarity': best['entropy_similarity'],
-                    'explained_intensity': best['explained_intensity'],
-                    'matched_peak_count': len(best['matched_peaks']),
-                    'total_peak_count': data['peaks'],
-                    'matched_peaks': best['matched_peaks'],
-                    'strongest_unexplained_peaks': sorted(unexplained,
-                        key=lambda p: p['intensity'], reverse=True)[:20],
-                    'weak_match_review_suggested': best['entropy_similarity'] < 0.5 or best['explained_intensity'] < 0.5 or len(best['matched_peaks']) < 10}
-            if not result['candidates']:
-                result['warnings'].append('No comparable atlas candidates; consider de novo prediction or additional formula hypotheses.')
+            if args.atlas_mgf and len(formulas) > 1:
+                raise ValueError('--atlas-mgf can only be used with one formula')
+            cache_dir = Path(getattr(args, 'atlas_cache_dir', None) or out / 'atlas').resolve()
+            mgf = Path(args.atlas_mgf).resolve() if args.atlas_mgf else download_mgf(formula, data['adduct'], cache_dir / f'{formula}_{data["adduct"].replace("/", "_")}.mgf',
+                getattr(args, 'atlas_url', None) or config.get('models', {}).get('retrieval', {}).get('atlas_url', 'https://iceberg-ms.mit.edu'))
+            coverage = worker(python, 'atlas-info', spectrum=path, mgf=mgf, formula=formula,
+                experimental_unit=args.collision_unit,
+                energies=','.join(str(row['model_energy_ev']) for row in data['energy_mapping']))
+            record.update({'atlas_mgf': str(mgf), 'library_structures': coverage['library_structures'],
+                'missing_energies_ev': coverage['missing_energies_ev']})
+            if coverage['missing_energies_ev'] and coverage['library_structures']:
+                record['status'] = 'model_fallback'
+                record['reason'] = 'no_exact_atlas_energy'
+                record['prediction_source'] = 'local ICEBERG'
+                simulated, simulated_count = _simulate_shards(python, path, mgf, formula, args.collision_unit, out,
+                    model_options, result['instrument'],
+                    shard_size, top_k, coverage['smiles'])
+                candidates.extend(simulated)
+                record['status'] = 'ranked' if simulated else 'no_model_predictions'
+                record['scored_structures'] = simulated_count
+            else:
+                ranked = worker(python, 'rank', spectrum=path, mgf=mgf, formula=formula,
+                    top_k=top_k, experimental_unit=args.collision_unit) if coverage['library_structures'] else {
+                    'candidates': [], 'scored_structures': 0}
+                record['scored_structures'] = ranked['scored_structures']
+                candidates.extend(ranked['candidates'])
+                record['status'] = 'ranked' if ranked['candidates'] else 'no_atlas_coverage' if not coverage['library_structures'] else 'no_comparable_candidates'
+                record['prediction_source'] = 'public ICEBERG atlas'
         except Exception as exc:
-            result['warnings'].append(f'Atlas retrieval failed: {exc}')
-    else:
-        result['warnings'].append('No formula available; provide --formula to query the formula-indexed public atlas.')
-    (out / 'retrieval.json').write_text(json.dumps(result, indent=2, allow_nan=False))
-    if not args.no_report:
-        write_report(result, out / 'report.html')
-    print(json.dumps({'output_dir': str(out), 'formula': formula,
-        'candidates': len(result['candidates']), 'warnings': result['warnings']}, indent=2))
-    return 0 if result['candidates'] else 2
+            if isinstance(exc, AtlasNoEntry):
+                record['status'] = 'no_atlas_coverage'
+                record['reason'] = str(exc)
+            elif isinstance(exc, ValueError) and str(exc).startswith('Formula/adduct precursor mismatch'):
+                record['status'] = 'formula_incompatible'
+                record['reason'] = str(exc)
+            else:
+                record['status'] = 'blocked_model_assets' if isinstance(exc, FileNotFoundError) and record.get('reason') == 'no_exact_atlas_energy' else 'error'
+                record['error'] = str(exc)
+                operational_error = exc
+                break
+    from msms_structure_elucidation.worker import sort_candidates
+    result['candidates'] = sort_candidates(candidates)[:top_k]
+    if result['candidates']:
+        best = result['candidates'][0]
+        result['formula'] = best['formula']
+        result['atlas_mgf'] = next((r['atlas_mgf'] for r in result['formula_results'] if r['formula'] == best['formula'] and 'atlas_mgf' in r), None)
+        scores = [c['entropy_similarity'] for c in result['candidates']]
+        result['qc'] = {'experimental_collision_energies': len(data['spectra']), 'experimental_peaks': data['peaks'],
+            'library_structures': sum(r.get('library_structures', 0) for r in result['formula_results']),
+            'scored_structures': sum(r.get('scored_structures', 0) for r in result['formula_results']),
+            'nonzero_top_scores': sum(s > 0 for s in scores), 'top_score_range': [min(scores), max(scores)],
+            'top_energy_pairs': len(best['energy_alignment']),
+            'top_predicted_peaks': sum(len(v) for v in best['predicted_spectra'].values())}
+        matched = {(str(p['ce']), p['mz']) for p in best['matched_peaks']}
+        unexplained = [{'ce': ce, 'mz': mz, 'intensity': intensity} for ce, peaks in data['spectra'].items()
+            for mz, intensity in peaks if (str(ce), mz) not in matched]
+        result['review_evidence'] = {'best_candidate': best['smiles'], 'entropy_similarity': best['entropy_similarity'],
+            'explained_intensity': best['explained_intensity'], 'matched_peak_count': len(best['matched_peaks']),
+            'total_peak_count': data['peaks'], 'matched_peaks': best['matched_peaks'],
+            'strongest_unexplained_peaks': sorted(unexplained, key=lambda p: p['intensity'], reverse=True)[:20],
+            'weak_match_review_suggested': best['entropy_similarity'] < 0.5 or best['explained_intensity'] < 0.5 or len(best['matched_peaks']) < 10}
+    result['status'] = ('blocked_model_assets' if operational_error and any(r['status'] == 'blocked_model_assets' for r in result['formula_results']) else
+        'error' if operational_error else 'ranked' if candidates else
+        result['status'] if result['status'] == 'needs_formula' else 'no_atlas_coverage' if
+        all(r['status'] == 'no_atlas_coverage' for r in result['formula_results']) else 'no_candidates')
+    _save(result, out, args.no_report)
+    print(json.dumps({'output_dir': str(out), 'status': result['status'], 'formula': result['formula'],
+        'candidates': len(result['candidates']), 'formula_results': result['formula_results'],
+        'warnings': result['warnings']}, indent=2))
+    if operational_error:
+        raise RuntimeError(f'{operational_error} (result: {out / "retrieval.json"})') from operational_error
+    return 0
 
 
 def review(args):
     """Validate agent-proposed SMILES, reuse atlas matches, simulate absent structures."""
     result_path = Path(args.result).resolve()
     result = json.loads(result_path.read_text())
-    formula = result.get('formula')
+    config = settings(getattr(args, 'config', None))
+    options = _model_options(args, config, default_model='glacier')
+    formula = getattr(args, 'formula', None) or result.get('formula')
     if not formula:
         raise ValueError('Review needs a molecular formula; rerun retrieval with --formula')
     proposals = json.loads(Path(args.smiles_json).read_text())
@@ -148,8 +305,10 @@ def review(args):
     if not valid:
         raise ValueError('No proposed SMILES matched the target formula')
     existing = list(result.get('candidates', []))
-    if result.get('atlas_mgf') and Path(result['atlas_mgf']).exists():
-        atlas = worker(python, 'rank', spectrum=result['input'], mgf=result['atlas_mgf'],
+    atlas_mgf = next((r.get('atlas_mgf') for r in result.get('formula_results', []) if r['formula'] == formula), result.get('atlas_mgf'))
+    if atlas_mgf and Path(atlas_mgf).exists() and not any(
+            row.get('missing_energies_ev') for row in result.get('formula_results', []) if row['formula'] == formula):
+        atlas = worker(python, 'rank', spectrum=result['input'], mgf=atlas_mgf,
                        formula=formula, top_k=100000,
                        experimental_unit=result['collision_unit'])
         by_smiles = {c.get('canonical_smiles', c['smiles']): c for c in atlas['candidates']}
@@ -162,25 +321,157 @@ def review(args):
             added.append(by_smiles[smiles]); seen.add(smiles)
     missing = [s for s in valid if s not in seen]
     if missing:
+        if not options['ms_pred_dir']:
+            raise FileNotFoundError('Review simulation requires --ms-pred-dir or models.simulator.ms_pred_src')
         temp = result_path.parent / 'review_smiles.json'
         temp.write_text(json.dumps(missing))
-        try:
-            added.extend(worker(python, 'simulate', spectrum=result['input'],
-                smiles_json=temp, formula=formula, model=args.model,
-                checkpoint=args.checkpoint, gen_checkpoint=args.gen_checkpoint,
-                inten_checkpoint=args.inten_checkpoint, output_dir=result_path.parent,
-                experimental_unit=result['collision_unit']))
-        except Exception as exc:
-            result.setdefault('warnings', []).append(f'Local {args.model} simulation unavailable: {exc}')
+        added.extend(worker(python, 'simulate', spectrum=result['input'],
+            smiles_json=temp, formula=formula, output_dir=result_path.parent,
+            experimental_unit=result['collision_unit'],
+            instrument=_instrument(getattr(args, 'instrument', None) or result.get('instrument') or config.get('models', {}).get('simulator', {}).get('instrument')),
+            **options))
     result['review'] = {'proposed': len(proposals), 'formula_valid': len(valid),
                         'formula_rejected': rejected, 'atlas_reused': sum(c['source'].startswith('public') for c in added),
-                        'simulated': sum(c['source'] in ('GLACIER', 'ICEBERG') for c in added)}
-    result['candidates'] = sorted(existing + added,
-        key=lambda c: (c['entropy_similarity'], c['explained_intensity']), reverse=True)
+                        'simulated': sum(c['source'] in ('GLACIER', 'ICEBERG') for c in added),
+                        'model_settings': options}
+    from msms_structure_elucidation.worker import sort_candidates
+    result['candidates'] = sort_candidates(existing + added)
     result_path.write_text(json.dumps(result, indent=2, allow_nan=False))
     write_report(result, result_path.parent / 'report.html')
     print(json.dumps(result['review'], indent=2))
     return 0 if valid else 2
+
+
+def convert_mgf_command(args):
+    from msms_structure_elucidation.mgf import convert_mgf
+    manifest = convert_mgf(Path(args.input).expanduser().resolve(), Path(args.output_dir).expanduser().resolve(),
+        args.collision_unit, args.energy, Path(args.raw_mzxml).expanduser().resolve() if args.raw_mzxml else None,
+        args.instrument)
+    print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': sum(r['status'] == 'ready' for r in manifest),
+        'needs_energy': sum(r['status'] == 'needs_energy' for r in manifest)}, indent=2))
+    return 0
+
+
+def batch(args):
+    global _MODEL_SEMAPHORE
+    config = settings(args.config)
+    config_hash = hashlib.sha256(Path(config['_config_path']).read_bytes()).hexdigest()
+    formula_list_hash = hashlib.sha256(Path(args.formulas_file).read_bytes()).hexdigest() if args.formulas_file else None
+    model_options = _model_options(args, config)
+    asset_versions = {key: (model_options[key], Path(model_options[key]).stat().st_size,
+        Path(model_options[key]).stat().st_mtime_ns) for key in ('checkpoint', 'gen_checkpoint', 'inten_checkpoint')
+        if model_options.get(key) and Path(model_options[key]).is_file()}
+    defaults = config.get('models', {}).get('batch', {})
+    max_workers = args.max_workers or defaults.get('max_workers', 1)
+    max_model_jobs = args.max_model_jobs or defaults.get('max_model_jobs', 1)
+    min_free_gb = args.min_free_memory_gb if args.min_free_memory_gb is not None else defaults.get('min_free_memory_gb', 4)
+    if min(max_workers, max_model_jobs) < 1:
+        raise ValueError('Batch worker counts must be positive')
+    try:
+        import psutil
+    except ImportError as exc:
+        raise RuntimeError('Batch memory checks require the batch extra: pip install .[batch]') from exc
+    _MODEL_SEMAPHORE = threading.Semaphore(max_model_jobs)
+    out = Path(args.output_dir).expanduser().resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    cache = out / 'atlas_cache'
+    with Path(args.manifest).open(newline='') as file:
+        rows = list(csv.DictReader(file))
+    jobs = {}
+    summary = []
+    for row in rows:
+        if row.get('status') and row['status'] != 'ready':
+            summary.append({'feature_id': row.get('feature_id', ''), 'status': row['status'], 'output_dir': ''})
+            continue
+        path = row.get('ms_path') or row.get('input')
+        if not path:
+            continue
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(args.manifest).expanduser().resolve().parent / candidate
+        key = (row.get('feature_id') or candidate.stem, str(candidate.resolve()))
+        jobs[key] = row
+    feature_counts = Counter(feature for feature, _ in jobs)
+    def execute(key, row):
+        feature, path = key
+        name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in feature)
+        if feature_counts[feature] > 1 or name != feature:
+            name += '__' + hashlib.sha256((feature + path).encode()).hexdigest()[:8]
+        target = out / name
+        try:
+            old = json.loads((target / 'batch_state.json').read_text()) if (target / 'batch_state.json').exists() else {}
+        except (OSError, ValueError):
+            old = {}
+        formula = row.get('formula') or None
+        unit = row.get('collision_unit') or args.collision_unit
+        if not unit:
+            return {'feature_id': feature, 'status': 'needs_energy_unit', 'output_dir': str(target)}
+        digest = hashlib.sha256()
+        try:
+            with Path(path).open('rb') as file:
+                for block in iter(lambda: file.read(1024 * 1024), b''):
+                    digest.update(block)
+        except OSError as exc:
+            return {'feature_id': feature, 'status': 'error', 'output_dir': str(target), 'error': str(exc)}
+        file_hash = digest.hexdigest()
+        signature = hashlib.sha256(json.dumps([file_hash, unit, formula,
+            formula_list_hash, config_hash, asset_versions, args.model, args.ms_pred_dir,
+            args.instrument, args.cuda_devices, args.top_k, args.atlas_url], sort_keys=True).encode()).hexdigest()
+        if old.get('signature') == signature and (target / 'retrieval.json').is_file():
+            previous = json.loads((target / 'retrieval.json').read_text())
+            if previous.get('status') in ('ranked', 'needs_formula', 'no_atlas_coverage', 'no_candidates'):
+                return {'feature_id': feature, 'status': previous['status'], 'output_dir': str(target), 'resumed': True}
+        opts = argparse.Namespace(input=path, collision_unit=unit, output_dir=str(target), formula=formula,
+            formulas_file=args.formulas_file, ms_pred_python=args.ms_pred_python, ms_pred_dir=args.ms_pred_dir,
+            config=args.config, instrument=row.get('instrument') or args.instrument,
+            cuda_devices=args.cuda_devices, model=args.model, checkpoint=args.checkpoint,
+            gen_checkpoint=args.gen_checkpoint, inten_checkpoint=args.inten_checkpoint,
+            model_batch_size=args.model_batch_size, model_shard_size=args.model_shard_size,
+            atlas_mgf=None, atlas_cache_dir=str(cache), atlas_url=args.atlas_url,
+            top_k=args.top_k, no_report=args.no_report)
+        try:
+            run(opts)
+            status = json.loads((target / 'retrieval.json').read_text())['status']
+        except Exception as exc:
+            status = 'error'
+            error = str(exc)
+        (target / 'batch_state.json').write_text(json.dumps({'signature': signature}))
+        return {'feature_id': feature, 'status': status, 'output_dir': str(target), **({'error': error} if status == 'error' else {})}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending = iter(jobs.items())
+        active = {}
+        exhausted = False
+        while active or not exhausted:
+            while len(active) < max_workers and not exhausted:
+                available_gb = psutil.virtual_memory().available / 1024**3
+                if available_gb - 2 * len(active) < min_free_gb:
+                    if not active:
+                        for key, _ in pending:
+                            summary.append({'feature_id': key[0], 'status': 'deferred_memory', 'output_dir': ''})
+                        exhausted = True
+                    break
+                try:
+                    key, row = next(pending)
+                except StopIteration:
+                    exhausted = True
+                    break
+                active[pool.submit(execute, key, row)] = key
+            if active:
+                done = next(concurrent.futures.as_completed(active))
+                try:
+                    summary.append(done.result())
+                except Exception as exc:
+                    summary.append({'feature_id': active[done][0], 'status': 'error',
+                        'output_dir': '', 'error': str(exc)})
+                del active[done]
+    _MODEL_SEMAPHORE = None
+    (out / 'batch_summary.json').write_text(json.dumps(summary, indent=2))
+    with (out / 'batch_summary.csv').open('w', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=['feature_id', 'status', 'output_dir', 'resumed', 'error'])
+        writer.writeheader(); writer.writerows(summary)
+    print(json.dumps({'features': len(summary), 'status_counts': {s: sum(r['status'] == s for r in summary) for s in {r['status'] for r in summary}},
+        'summary': str(out / 'batch_summary.csv')}, indent=2))
+    return 1 if any(r['status'] == 'error' for r in summary) else 0
 
 
 def denovo(args):
@@ -255,19 +546,66 @@ def main(argv=None):
                          help='user-confirmed unit of all experimental collision labels')
     command.add_argument('--output-dir', required=True)
     command.add_argument('--formula', help='neutral molecular formula; otherwise inferred with MSBuddy')
+    command.add_argument('--formulas-file', help='one neutral formula per line; all are searched')
     command.add_argument('--ms-pred-python', help='Python interpreter with ms_pred, msbuddy, RDKit')
+    command.add_argument('--ms-pred-dir', help='ms-pred source checkout used as model working directory')
+    command.add_argument('--config', help='shared YAML settings (default configs/default.yaml)')
+    command.add_argument('--instrument', help='model instrument; otherwise .ms >instrumentation, then config')
+    command.add_argument('--cuda-devices', help='GPU IDs, for example 0; or MSMS_CUDA_DEVICES')
+    command.add_argument('--model', choices=['iceberg'], default=None, help='exact-energy atlas fallback')
+    command.add_argument('--checkpoint')
+    command.add_argument('--gen-checkpoint')
+    command.add_argument('--inten-checkpoint')
+    command.add_argument('--model-batch-size', type=int)
+    command.add_argument('--model-shard-size', type=int)
     command.add_argument('--atlas-mgf', help='local formula MGF for offline use')
-    command.add_argument('--atlas-url', default='https://iceberg-ms.mit.edu')
-    command.add_argument('--top-k', type=int, default=10)
+    command.add_argument('--atlas-cache-dir', help='shared atlas cache, useful in batch runs')
+    command.add_argument('--atlas-url')
+    command.add_argument('--top-k', type=int)
     command.add_argument('--no-report', action='store_true')
     reviewer = sub.add_parser('review', help='validate candidate SMILES and rerank via atlas or a local model')
     reviewer.add_argument('--result', required=True, help='retrieval.json from run')
     reviewer.add_argument('--smiles-json', required=True, help='JSON array of proposed SMILES')
     reviewer.add_argument('--ms-pred-python')
+    reviewer.add_argument('--ms-pred-dir')
+    reviewer.add_argument('--config')
+    reviewer.add_argument('--formula', help='target formula if result contains several hypotheses')
+    reviewer.add_argument('--instrument')
+    reviewer.add_argument('--cuda-devices')
+    reviewer.add_argument('--model-batch-size', type=int)
     reviewer.add_argument('--model', choices=['glacier', 'iceberg'], default='glacier')
     reviewer.add_argument('--checkpoint', help='GLACIER checkpoint')
     reviewer.add_argument('--gen-checkpoint', help='ICEBERG generation checkpoint')
     reviewer.add_argument('--inten-checkpoint', help='ICEBERG intensity checkpoint')
+    converter = sub.add_parser('convert-mgf', help='convert GNPS/MZmine MS2 entries to .ms and a batch manifest')
+    converter.add_argument('--input', required=True)
+    converter.add_argument('--output-dir', required=True)
+    converter.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'])
+    converter.add_argument('--energy', type=float, help='confirmed energy override for entries without MS2 energy')
+    converter.add_argument('--raw-mzxml', help='read collisionEnergy from referenced MS2 scans')
+    converter.add_argument('--instrument')
+    batcher = sub.add_parser('batch', help='run a feature manifest with shared atlas cache and bounded model jobs')
+    batcher.add_argument('--manifest', required=True)
+    batcher.add_argument('--output-dir', required=True)
+    batcher.add_argument('--collision-unit', choices=['NCE', 'eV'], help='fallback when manifest has no unit')
+    batcher.add_argument('--formulas-file')
+    batcher.add_argument('--ms-pred-python')
+    batcher.add_argument('--ms-pred-dir')
+    batcher.add_argument('--config')
+    batcher.add_argument('--instrument')
+    batcher.add_argument('--cuda-devices')
+    batcher.add_argument('--model', choices=['iceberg'])
+    batcher.add_argument('--checkpoint')
+    batcher.add_argument('--gen-checkpoint')
+    batcher.add_argument('--inten-checkpoint')
+    batcher.add_argument('--model-batch-size', type=int)
+    batcher.add_argument('--model-shard-size', type=int)
+    batcher.add_argument('--atlas-url')
+    batcher.add_argument('--top-k', type=int)
+    batcher.add_argument('--max-workers', type=int)
+    batcher.add_argument('--max-model-jobs', type=int)
+    batcher.add_argument('--min-free-memory-gb', type=float)
+    batcher.add_argument('--no-report', action='store_true')
     generator = sub.add_parser('denovo', help='run optional FRIGID fallback for a retrieval result')
     generator.add_argument('--result', required=True)
     generator.add_argument('--ms-pred-python')
@@ -287,7 +625,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         return {'run': run, 'review': review, 'denovo': denovo,
-                'visualize': visualize}[args.command](args)
+                'visualize': visualize, 'convert-mgf': convert_mgf_command,
+                'batch': batch}[args.command](args)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 
