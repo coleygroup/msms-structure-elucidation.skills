@@ -10,7 +10,7 @@ For an experimental spectrum and proposed SMILES, use the portable review comman
 
 ```bash
 msms-structure-elucidation review --result results/sample/retrieval.json \
-  --smiles-json results/sample/proposals.json --model iceberg \
+  --smiles-json results/sample/proposals.json --model iceberg --ms-pred-dir /path/to/ms-pred \
   --gen-checkpoint /path/to/gen.ckpt --inten-checkpoint /path/to/inten.ckpt
 ```
 
@@ -22,4 +22,4 @@ For simulation alone, run the existing ms-pred adapter with the model interprete
   --collision_energies 20 40 --output_dir results/iceberg
 ```
 
-The adapter accepts integer eV values and calls ICEBERG with `nce=False`. If the source is experimental NCE, confirm that unit with the provider, convert using precursor m/z, and round to integer eV before invoking it. Validate collision energies and adduct before comparing predicted and experimental spectra. Similarity is not calibrated confidence.
+The adapter accepts integer eV values and calls ICEBERG with `nce=False`. If the source is experimental NCE, confirm that unit with the provider, convert using precursor m/z, and round to integer eV before invoking it. For atlas energy gaps, `run` automatically calls ICEBERG on all atlas structures for that formula with no total candidate cap, using resumable shards; set both checkpoints, an ms-pred checkout, and bounded batch/model workers. Validate collision energies and adduct before comparing predicted and experimental spectra. Similarity is not calibrated confidence.

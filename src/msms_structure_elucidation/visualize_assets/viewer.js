@@ -11,6 +11,7 @@ function svgElement(tag, attrs = {}) {
 }
 function candidate() { return state.result.candidates[state.candidate]; }
 function pair() { return state.pair; }
+function predictionKey() { return pair()?.prediction_key ?? pair()?.atlas_key; }
 function noteForCurrent() { return state.notes.candidates[candidate().review_key] || {}; }
 function fragmentNoteKey() { return state.peak ? `${state.peak.ce}:${state.peak.index}` : null; }
 function rememberDraft() {
@@ -36,7 +37,7 @@ function makeCandidateButton(c, index) {
   const rank = document.createElement('strong'); rank.textContent = `#${index + 1}`;
   const img = document.createElement('img'); img.alt = ''; img.src = c.structure_image || '';
   const text = document.createElement('span');
-  const score = document.createElement('strong'); score.textContent = Number(c.entropy_similarity).toFixed(4);
+  const score = document.createElement('strong'); score.textContent = `${Number(c.entropy_similarity).toFixed(4)} · ${(100 * Number(c.explained_intensity)).toFixed(1)}% explained`;
   const small = document.createElement('small'); small.textContent = c.smiles;
   text.append(score, small); button.append(rank, img, text);
   button.onclick = () => { rememberDraft(); state.candidate = index; selectCandidate(); };
@@ -48,7 +49,7 @@ function selectCandidate() {
   const c = candidate();
   $('structure').src = c.structure_image || '';
   $('candidate-title').textContent = `Rank ${state.candidate + 1} · ${c.source}`;
-  $('candidate-meta').textContent = `${c.formula || state.result.formula || ''} · ${c.inchikey || 'No InChIKey'}`;
+  $('candidate-meta').textContent = `${c.formula || state.result.formula || ''} · ${c.inchikey || 'No InChIKey'}${c.ambiguity?.length ? ' · ' + c.ambiguity.join('; ') : ''}`;
   $('smiles').textContent = c.smiles;
   $('metrics').replaceChildren();
   for (const [label, value] of [['Entropy similarity', Number(c.entropy_similarity).toFixed(4)],
@@ -63,7 +64,7 @@ function selectCandidate() {
   const selector = $('energy'); selector.replaceChildren();
   for (const alignment of alignments) {
     const option = document.createElement('option'); option.value = alignment.experimental_key;
-    option.textContent = `${alignment.input_value} ${alignment.input_unit} → ${Number(alignment.experimental_ev).toFixed(2)} eV; prediction ${alignment.atlas_ev} eV`;
+    option.textContent = `${alignment.input_value} ${alignment.input_unit} → ${Number(alignment.experimental_ev).toFixed(2)} eV; ${c.source} ${alignment.model_energy_ev ?? alignment.atlas_ev} eV`;
     selector.append(option);
   }
   selector.disabled = !alignments.length;
@@ -74,8 +75,8 @@ function getPeaks() {
   if (!pair()) return { experimental: [], predicted: [], ids: [] };
   const c = candidate();
   return { experimental: state.result.spectra[pair().experimental_key] || [],
-    predicted: c.predicted_spectra?.[pair().atlas_key] || [],
-    ids: c.predicted_fragment_ids?.[pair().atlas_key] || [] };
+    predicted: c.predicted_spectra?.[predictionKey()] || [],
+    ids: c.predicted_fragment_ids?.[predictionKey()] || [] };
 }
 function globalMaxMz() {
   const c = candidate();
@@ -152,9 +153,9 @@ function focusPeak(index, active) {
   document.querySelectorAll(`[data-peak="${index}"]`).forEach(el => el.classList.toggle('focused', active));
 }
 async function fragmentData(index) {
-  const key = `${state.candidate}|${pair().atlas_key}|${index}`;
+  const key = `${state.candidate}|${predictionKey()}|${index}`;
   if (state.fragmentCache.has(key)) return state.fragmentCache.get(key);
-  const response = await fetch(`/api/fragment/${state.candidate}/${encodeURIComponent(pair().atlas_key)}/${index}`);
+  const response = await fetch(`/api/fragment/${state.candidate}/${encodeURIComponent(predictionKey())}/${index}`);
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `Fragment request failed (${response.status})`);
   state.fragmentCache.set(key, data);
@@ -169,7 +170,7 @@ function svgImage(svg) {
 async function selectPeak(index) {
   rememberDraft();
   const { predicted, ids } = getPeaks();
-  state.peak = ids[index] != null ? { ce: pair().atlas_key, index } : null;
+  state.peak = ids[index] != null ? { ce: predictionKey(), index } : null;
   restoreReview(); drawMirror();
   document.querySelectorAll('.fragment-card').forEach(el => el.classList.toggle('active', Number(el.dataset.peak) === index));
   const detail = $('fragment-detail');
@@ -250,8 +251,9 @@ $('save-review').onclick = saveReview;
 
 fetch('/api/state').then(response => response.json()).then(data => {
   state.result = data.result; state.notes = data.notes; state.token = data.review_token;
-  $('summary').textContent = `${data.result.input?.split('/').pop() || 'Experimental spectrum'} · ${data.result.candidates.length} candidates · ${data.result.formula || 'unknown formula'} · experimental unit ${data.result.collision_unit || 'unspecified'}`;
-  $('source-warning').textContent = (data.result.warnings || []).join(' ');
+  $('summary').textContent = `${data.result.input?.split('/').pop() || 'Experimental spectrum'} · ${data.result.candidates.length} candidates · ${data.result.formula || 'unknown formula'} · ${data.result.status || 'legacy result'} · experimental unit ${data.result.collision_unit || 'unspecified'}`;
+  $('source-warning').textContent = [...(data.result.warnings || []),
+    ...(data.result.formula_results || []).map(r => `${r.formula}: ${r.status}${r.reason ? ' (' + r.reason + ')' : ''}`)].join(' ');
   if (data.result.candidates.length) selectCandidate();
-  else $('detail').textContent = 'No ranked candidates are available in this result.';
+  else $('detail').textContent = `No ranked candidates: ${data.result.status || 'unknown reason'}. See formula results and warnings in retrieval.json.`;
 }).catch(error => { $('error').textContent = `Cannot load result: ${error.message}`; });

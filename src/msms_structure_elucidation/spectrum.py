@@ -46,9 +46,11 @@ def inspect_ms(path: Path, collision_unit: str) -> dict:
     energy_mapping = []
     for source, peaks in raw_spectra.items():
         ev = round(float(source) if collision_unit == 'eV' else float(source) * parentmass / 500, 8)
+        if not math.isfinite(ev) or int(round(ev)) <= 0:
+            raise ValueError(f'{path}: collision energy must convert to a positive finite integer eV')
         spectra[str(ev)] = peaks
         energy_mapping.append({'input_value': float(source), 'input_unit': collision_unit,
-                               'collision_energy_ev': ev})
+                               'collision_energy_ev': ev, 'model_energy_ev': int(round(ev))})
     return {'metadata': metadata, 'spectra': spectra, 'parentmass': parentmass,
             'adduct': metadata.get('ionization', '[M+H]+'),
             'peaks': sum(map(len, spectra.values())), 'collision_unit': collision_unit,
