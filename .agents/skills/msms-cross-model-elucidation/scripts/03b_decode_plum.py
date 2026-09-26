@@ -33,8 +33,8 @@ mirrors `unified_conditioned_generation`'s own input-construction pattern
 the full pool string instead of an empty bos/eos pair.
 
 Usage:
-    # Env: external FRIGID/PLUM conda env (not a snowmageddon pixi env)
-    /mnt/home/magled/miniconda3/envs/masskit_ai/envs/frigid/bin/python \\
+    # Env: external FRIGID/PLUM conda env (not a msms-structure-elucidation Python env)
+    $FRIGID_PYTHON \\
         .agents/skills/msms-cross-model-elucidation/scripts/03b_decode_plum.py \\
         --jam-metrics results/<timestamp>/02b_jam_reactant_aug/metrics.json \\
         --jam-fingerprints results/<timestamp>/02b_jam_reactant_aug/predicted_fingerprints.npz \\
@@ -55,8 +55,8 @@ import safe as sf
 import torch
 import yaml
 
-PLUM_ROOT = Path("/mnt/home/magled/PLUM")
-FRIGID_ROOT = Path("/mnt/home/magled/FRIGID")
+PLUM_ROOT = Path(os.environ.get("PLUM_DIR", "../PLUM")).resolve()
+FRIGID_ROOT = Path(os.environ.get("FRIGID_DIR", "../FRIGID")).resolve()
 sys.path.insert(0, str(PLUM_ROOT / "src"))
 sys.path.insert(0, str(FRIGID_ROOT / "src"))
 

@@ -6,15 +6,15 @@ PeakFormulaFeaturizer` expects, featurizes it, runs the JAM (MistNet) encoder to
 get per-bit sigmoid probabilities, binarizes at a fixed threshold, and scores the
 result against an RDKit Morgan fingerprint of the ground-truth SMILES.
 
-JAM lives in a sibling pixi project, so this script is executed with that
-project's interpreter (`pixi run --manifest-path /mnt/home/magled/jam/pixi.toml`)
+JAM lives in a separate project, so this script is executed with that
+project's interpreter (`$JAM_PYTHON`)
 rather than one of this repo's envs. The stage-1 fragment formula strings are
 re-emitted through `jam.chem.formula_to_vec`/`vec_to_formula` so the element
 ordering matches jam's own convention (ms-pred orders elements differently).
 
 Usage:
-    # Env: external jam pixi project (not a snowmageddon pixi env)
-    pixi run --manifest-path /mnt/home/magled/jam/pixi.toml python \\
+    # Env: JAM environment (not a msms-structure-elucidation Python env)
+    $JAM_PYTHON \\
         .agents/skills/msms-cross-model-elucidation/scripts/02_predict_jam_fingerprint.py \\
         --spectra-dir results/<timestamp>/01_glacier/spectra \\
         --manifest results/<timestamp>/01_glacier/manifest.json \\
@@ -27,12 +27,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import os
 
 import numpy as np
 import torch
 import yaml
 
-JAM_ROOT = Path("/mnt/home/magled/jam")
+JAM_ROOT = Path(os.environ.get("JAM_DIR", "../jam")).resolve()
 sys.path.insert(0, str(JAM_ROOT / "src"))
 
 from jam import chem  # noqa: E402

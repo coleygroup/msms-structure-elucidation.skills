@@ -228,6 +228,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--adduct", default="[M+H]+", choices=["[M+H]+", "[M-H]-"])
     p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--atlas-dir", type=Path, help="Local mounted atlas root; required for private/NIST lookup")
     p.add_argument(
         "--limit", type=int, default=None, help="Only process the first N rows"
     )
@@ -252,8 +253,10 @@ def main() -> None:
     with open(project_root / args.config) as f:
         cfg = yaml.safe_load(f)
 
-    atlas_cfg = cfg["models"]["atlas"]
-    atlas_dir = Path(atlas_cfg["atlas_dir"]).expanduser()
+    atlas_value = args.atlas_dir or os.environ.get('MSMS_PRIVATE_ATLAS_DIR') or cfg.get('models', {}).get('atlas', {}).get('atlas_dir')
+    if not atlas_value:
+        raise ValueError('Local atlas path required: pass --atlas-dir or set MSMS_PRIVATE_ATLAS_DIR. For the public HTTP atlas, use msms-retrieval.')
+    atlas_dir = Path(atlas_value).expanduser()
     adduct_subdir = {"[M+H]+": "h_plus_out_mgf", "[M-H]-": "h_minus_out_mgf"}[
         args.adduct
     ]

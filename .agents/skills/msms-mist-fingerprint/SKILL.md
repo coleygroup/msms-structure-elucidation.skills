@@ -1,7 +1,6 @@
 ---
 name: msms-mist-fingerprint
 description: Predict molecular fingerprints from MS/MS spectra using only FRIGID's MIST encoder, skipping diffusion generation and ICEBERG refinement.
-category: denovo
 ---
 
 # msms-mist-fingerprint
@@ -28,9 +27,7 @@ against ground-truth Morgan fingerprints.
 
 ## Prerequisites
 
-Same as `msms-denovo`: FRIGID cloned + `denovo` env set up
-(`.agents/skills/msms-denovo/scripts/setup_env.sh`), `mist_ckpt` set in
-`configs/default.yaml`.
+Same as `msms-denovo`: clone [coleygroup/FRIGID](https://github.com/coleygroup/FRIGID) with submodules if needed, read its `README.md` **Installation** section, and follow that checkout's environment instructions. Set `mist_ckpt` in `configs/default.yaml`.
 
 Spectra must already be in `.ms` format with subformulae computed —
 see `msms-atlas-to-ms` (for atlas-derived spectra) and
@@ -61,7 +58,7 @@ python .agents/skills/msms-mist-fingerprint/scripts/run.py \
 
 ## Constraints
 
-- **Environment**: `denovo` (`pixi run --environment denovo python ...`)
+- **Environment**: `denovo` (`python ...`)
 - **MIST atom support**: only `C, O, P, N, S, Cl, F, H` — molecules with any
   other element (Br, I, Si, metals, etc.) are silently dropped by FRIGID's
   data loader; this skill detects and logs those as failures

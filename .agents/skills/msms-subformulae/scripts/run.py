@@ -28,19 +28,11 @@ import yaml
 
 
 def _setup_ms_pred(project_root: Path) -> Path:
-    """Add ms-pred-dev to sys.path and return its root."""
-    cfg_path = project_root / "configs" / "default.yaml"
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
-    src = Path(cfg["models"]["simulator"]["ms_pred_src"]).expanduser()
-    if not src.exists():
-        raise FileNotFoundError(
-            f"ms_pred_src not found: {src}\n"
-            "Set models.simulator.ms_pred_src in configs/default.yaml."
-        )
-    ms_pred_src = str(src / "src")
-    if ms_pred_src not in sys.path:
-        sys.path.insert(0, ms_pred_src)
+    """Use the installed ms-pred package and its source tree."""
+    import ms_pred
+    src = Path(ms_pred.__file__).resolve().parents[2]
+    if not (src / "data_scripts" / "forms" / "01_assign_subformulae.py").exists():
+        raise FileNotFoundError("ms-pred source checkout with data_scripts is required; use editable install or set MS_PRED_PYTHON to one")
     return src
 
 

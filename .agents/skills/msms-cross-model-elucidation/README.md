@@ -22,7 +22,7 @@ SMILES list (one per line, no header)
   │    labels.tsv + split.tsv → predict_smis_joint → preds.hdf5 (PredSpecDB)
   │    → spectra/<name>_ce<ce>.json   {masses, intensities, frag_formulas, adduct}
   │
-  ├─ 02_predict_jam_fingerprint.py ───── jam pixi project
+  ├─ 02_predict_jam_fingerprint.py ───── JAM environment
   │    → subformulae/<spec>.json       {output_tbl, cand_form, cand_ion}
   │    → MistNet.encode_spectra → predicted_fingerprints.npz (probs + bits)
   │    → metrics.json                  fingerprint Tanimoto vs RDKit Morgan
@@ -31,7 +31,7 @@ SMILES list (one per line, no header)
   │    JAM predicted bits + target formula → generate_with_formula_filter
   │    → results.json, summary.json     exact match / Tanimoto top-1 and top-10
   │
-  └─ 04_build_report.py ──────────────── preprocess pixi env
+  └─ 04_build_report.py ──────────────── preprocess Python env
        → notebooks/msms_cross_model_cascade.ipynb (executed)
        → results/<timestamp>/report.md
 ```
@@ -61,7 +61,7 @@ ranked against one.
 
 ## Environments
 
-Stages 1 and 4 use this project's pixi envs (`default`, `preprocess`). Stages 2
+Stages 1 and 4 use this project's Python envs (`default`, `preprocess`). Stages 2
 and 3 run under the sibling repositories' own environment managers and are
 invoked by absolute interpreter path — those repos are deliberately **not**
 declared in this project's `pyproject.toml`.

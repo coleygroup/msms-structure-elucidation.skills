@@ -13,8 +13,8 @@ env's interpreter and inserts `<frigid_root>/src` onto sys.path the same way
 FRIGID's own eval script does.
 
 Usage:
-    # Env: external FRIGID conda env (not a snowmageddon pixi env)
-    /mnt/home/magled/miniconda3/envs/masskit_ai/envs/frigid/bin/python \\
+    # Env: external FRIGID conda env (not a msms-structure-elucidation Python env)
+    $FRIGID_PYTHON \\
         .agents/skills/msms-cross-model-elucidation/scripts/03_decode_frigid.py \\
         --jam-metrics results/<timestamp>/02_jam/metrics.json \\
         --jam-fingerprints results/<timestamp>/02_jam/predicted_fingerprints.npz \\
@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-FRIGID_ROOT = Path("/mnt/home/magled/FRIGID")
+FRIGID_ROOT = Path(os.environ.get("FRIGID_DIR", "../FRIGID")).resolve()
 sys.path.insert(0, str(FRIGID_ROOT / "src"))
 
 from dlm.sampler import Sampler  # noqa: E402

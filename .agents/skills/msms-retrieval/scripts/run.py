@@ -1,75 +1,39 @@
-"""
-Retrieve candidate structures from a spectral database for an experimental spectrum.
-
-Usage:
-    python run.py --spectrum sample.mzML --db_path /data/spectral_db --top_k 10 --output out.json
-
-Requirements:
-    - Env: retrieval
-    - Database path set in configs/default.yaml or via --db_path
-"""
-
+"""Retrieve public ICEBERG atlas candidates for an ms-pred .ms spectrum."""
 import argparse
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-import yaml
 
-
-def load_db(db_path: str):
-    # TODO: load spectral database (e.g. from HDF5, FAISS index, etc.)
-    raise NotImplementedError("Spectral database not yet implemented.")
-
-
-def load_spectrum(spectrum_path: str) -> dict:
-    """Load and parse a spectrum file (mzML or MGF)."""
-    # TODO: parse spectrum using pyteomics or pymzml
-    raise NotImplementedError
-
-
-def search(db, spectrum: dict, top_k: int) -> list[dict]:
-    """
-    Search database for top_k candidates matching the spectrum.
-
-    Returns:
-        List of {smiles, score, db_id} dicts, sorted by score descending.
-    """
-    # TODO: compute spectral similarity and rank candidates
-    raise NotImplementedError
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Retrieve structure candidates from spectral database."
-    )
-    parser.add_argument(
-        "--spectrum", required=True, help="Path to query spectrum (mzML or MGF)"
-    )
-    parser.add_argument(
-        "--db_path", default="", help="Path to spectral database (overrides config)"
-    )
-    parser.add_argument(
-        "--top_k", type=int, default=10, help="Number of candidates to return"
-    )
-    parser.add_argument("--output", required=True, help="Path to output JSON file")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--spectrum', required=True)
+    parser.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'])
+    parser.add_argument('--formula')
+    parser.add_argument('--atlas-mgf', '--db_path', dest='atlas_mgf')
+    parser.add_argument('--top-k', '--top_k', type=int, default=10)
+    parser.add_argument('--ms-pred-python')
+    parser.add_argument('--output', required=True)
     args = parser.parse_args()
+    output = Path(args.output).resolve()
+    cmd = [sys.executable, '-m', 'msms_structure_elucidation.cli', 'run',
+           '--input', args.spectrum, '--collision-unit', args.collision_unit,
+           '--output-dir', str(output.parent), '--top-k', str(args.top_k)]
+    if args.formula:
+        cmd += ['--formula', args.formula]
+    if args.atlas_mgf:
+        cmd += ['--atlas-mgf', args.atlas_mgf]
+    if args.ms_pred_python:
+        cmd += ['--ms-pred-python', args.ms_pred_python]
+    env = os.environ.copy()
+    env['PYTHONPATH'] = str(Path(__file__).resolve().parents[4] / 'src') + os.pathsep + env.get('PYTHONPATH', '')
+    run = subprocess.run(cmd, env=env)
+    source = output.parent / 'retrieval.json'
+    if source.exists() and source != output:
+        output.write_text(source.read_text())
+    return run.returncode
 
-    db = load_db(args.db_path)
-    spectrum = load_spectrum(args.spectrum)
-    candidates = search(db, spectrum, args.top_k)
-
-    result = {
-        "query_spectrum": args.spectrum,
-        "top_k": args.top_k,
-        "candidates": candidates,
-    }
-
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, indent=2))
-    (output_path.parent / "input_configs.yaml").write_text(yaml.dump(vars(args)))
-    print(output_path)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())

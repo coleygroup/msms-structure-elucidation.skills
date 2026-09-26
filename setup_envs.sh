@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
-# Run all per-skill environment setup scripts after `pixi install`.
-# Add a new entry here whenever a skill gains a setup_env.sh.
-
+# Create an isolated ms-pred environment without requiring a particular package manager.
 set -euo pipefail
-
-SKILL_DIR=".agents/skills"
-
-run_if_exists() {
-    local script="$SKILL_DIR/$1/scripts/setup_env.sh"
-    if [[ -f "$script" ]]; then
-        echo ">>> $1"
-        bash "$script"
-    fi
-}
-
-pixi install
-
-run_if_exists msms-sim-iceberg
-run_if_exists msms-retrieval
-run_if_exists msms-denovo
-run_if_exists msms-preprocess
-
-echo ""
-echo "All environments set up."
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+ASSETS="${MSMS_ASSETS_DIR:-$ROOT/.cache}"
+PYTHON="${MSMS_BASE_PYTHON:-python3}"
+MS_PRED_DIR="${MS_PRED_DIR:-$ASSETS/ms-pred}"
+if [[ ! -d "$MS_PRED_DIR/.git" ]]; then
+  mkdir -p "$ASSETS"
+  git clone https://github.com/coleygroup/ms-pred.git "$MS_PRED_DIR"
+fi
+if [[ ! -x "$ASSETS/ms-pred-venv/bin/python" ]]; then
+  "$PYTHON" -m venv "$ASSETS/ms-pred-venv"
+fi
+"$ASSETS/ms-pred-venv/bin/python" -m pip install --upgrade pip
+"$ASSETS/ms-pred-venv/bin/python" -m pip install -e "$ROOT"
+"$ASSETS/ms-pred-venv/bin/python" -m pip install -e "$MS_PRED_DIR[cpu]"
+"$ASSETS/ms-pred-venv/bin/python" -c 'import ms_pred, msbuddy, rdkit; print("ms-pred environment ready")'
+printf 'Set MS_PRED_PYTHON=%s\n' "$ASSETS/ms-pred-venv/bin/python"

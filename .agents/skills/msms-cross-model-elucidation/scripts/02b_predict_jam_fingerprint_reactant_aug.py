@@ -27,12 +27,12 @@ called, matching exactly what `MistNet._reactant_vector`
 (jam/src/jam/models/mist.py) and `ReactantCombiner.forward`
 (jam/src/jam/models/mist_modules.py, combine="max") expect.
 
-JAM lives in a sibling pixi project, so this script is executed with that
+JAM lives in a separate project, so this script is executed with that
 project's interpreter, same as stage 2.
 
 Usage:
-    # Env: external jam pixi project (not a snowmageddon pixi env)
-    pixi run --manifest-path /mnt/home/magled/jam/pixi.toml python \\
+    # Env: JAM environment (not a msms-structure-elucidation Python env)
+    $JAM_PYTHON \\
         .agents/skills/msms-cross-model-elucidation/scripts/02b_predict_jam_fingerprint_reactant_aug.py \\
         --spectra-dir results/<timestamp>/01_glacier/spectra \\
         --manifest results/<timestamp>/01_glacier/manifest.json \\
@@ -46,12 +46,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import os
 
 import numpy as np
 import torch
 import yaml
 
-JAM_ROOT = Path("/mnt/home/magled/jam")
+JAM_ROOT = Path(os.environ.get("JAM_DIR", "../jam")).resolve()
 sys.path.insert(0, str(JAM_ROOT / "src"))
 
 from jam import chem  # noqa: E402
@@ -64,10 +65,7 @@ from rdkit.Chem import rdFingerprintGenerator  # noqa: E402
 
 RDLogger.DisableLog("rdApp.*")
 
-DEFAULT_CHECKPOINT = Path(
-    "/home/magled/jam/results/"
-    "2026-09-14_01-44-04_reactant_concat_pooled_max_all_maxtrain_4096_bs128/best.ckpt"
-)
+DEFAULT_CHECKPOINT = Path(os.environ.get("JAM_REACTANT_CHECKPOINT", "checkpoints/jam_reactant/best.ckpt"))
 ADDUCT = "[M+H]+"
 DEFAULT_THRESHOLD = 0.15
 REACTANT_SMILES = "O=C(Cl)c1ccccc1Cl"

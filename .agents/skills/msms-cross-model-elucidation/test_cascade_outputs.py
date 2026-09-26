@@ -6,7 +6,7 @@ would produce plausible-looking but wrong numbers.
 
 Usage:
     # Env: preprocess
-    pixi run --environment preprocess python \
+    python \
         .agents/skills/msms-cross-model-elucidation/test_cascade_outputs.py \
         results/<timestamp>
 """

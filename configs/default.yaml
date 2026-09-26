@@ -1,68 +1,31 @@
-# Snowmageddon — MS/MS structure elucidation agent config
-
-# Orchestration hint passed to the agent: "parallel" (try all models) or "cascade" (retrieval → simulator → denovo).
-# The agent decides which tools to call; this is guidance, not hard control.
-mode: parallel
-
-# Input: path to a .raw file or pre-converted spectrum file (mzML, MGF, etc.)
-# Preprocessing is skipped if the file is already in a supported format.
-input: ""
-
-# Output directory for elucidation results
-output_dir: results/
-
+# Optional model settings. The atlas CLI takes paths as arguments or environment variables.
 models:
   simulator:
-    # Path to local ms-pred clone (github.com/coleygroup/ms-pred).
-    # Each machine sets this to wherever the repo is cloned.
-    ms_pred_src: "/home/magled/ms-pred-dev"
-    # Absolute paths to ICEBERG checkpoints.
-    gen_ckpt: "/home/runzhong/ms-models/iceberg_results_20260413/iceberg_nist23/split_1_rnd1/ckpt/gen/best.ckpt"
-    inten_ckpt: "/home/runzhong/ms-models/iceberg_results_20260413/iceberg_nist23/split_1_rnd1/ckpt/inten/best.ckpt"
-    env: simulator-iceberg
-    collision_energies: [20, 40]
-    adduct: "[M+H]+"
-    instrument: "Orbitrap"
-    cuda_devices: null   # set to "0" or "0,1" to use GPU; null = CPU
-
+    ms_pred_src: .cache/ms-pred
+    model: glacier
+    glacier_ckpt: ''  # Public MassSpecGym weights: see ms-pred README; licensed NIST weights can be supplied locally
+    gen_ckpt: ''      # ICEBERG generator, when --model iceberg
+    inten_ckpt: ''    # ICEBERG intensity, when --model iceberg
+    collision_energies: [10, 20, 30, 40, 50]
+    adduct: '[M+H]+'
+    instrument: Orbitrap
+    cuda_devices: null
   retrieval:
-    db_path: ""         # TODO: path to spectral database
-    env: retrieval
     top_k: 10
-
-  atlas:
-    # Full precomputed ICEBERG spectral atlas (PubChem-scale), keyed by formula + InChIKey.
-    # Mounted read-only from iceberg-ms.mit.edu:/home/coley-group/atlas via NFS.
-    # Layout: <atlas_dir>/h_plus_out_mgf/<C.../O.../H...>/<formula>.mgf(.idx)
-    atlas_dir: "/mnt/iceberg_atlas"
-    env: retrieval
-
+    atlas_url: https://iceberg-ms.mit.edu
   denovo:
-    # Path to local FRIGID clone (github.com/coleygroup/FRIGID).
-    # Each machine sets this to wherever the repo is cloned.
-    frigid_src: "/home/magled/FRIGID"
-    # Absolute paths to FRIGID checkpoints (extracted from frigid_pretrained_checkpoints.tar.gz).
-    dlm_ckpt: "checkpoints/frigid/DLM.ckpt"
-    mist_ckpt: "/home/liuhx25/mist_msg.ckpt" #"checkpoints/mist/mist_canopus.pt"
-    # ICEBERG checkpoints used for inference-time refinement (bundled in the FRIGID tarball).
-    iceberg_gen_ckpt: "checkpoints/iceberg/iceberg_canopus_model1.ckpt"
-    iceberg_inten_ckpt: "checkpoints/iceberg/iceberg_canopus_model2.ckpt"
-    env: denovo
+    frigid_src: .cache/FRIGID
+    dlm_ckpt: ''
+    mist_ckpt: ''
+    iceberg_gen_ckpt: ''
+    iceberg_inten_ckpt: ''
     top_k: 10
-    num_rounds: 2      # ICEBERG refinement rounds (0 = FRIGID-base only, no ICEBERG)
+    num_rounds: 0   # FRIGID-base; set >0 when ICEBERG weights and GPU are available
     batch_size: 128
-    cuda_devices: "1"   # GPU index; set to null for CPU-only (GPU 0 often busy on shared box)
-
+    cuda_devices: null
 preprocessing:
-  env: preprocess
-  # Conversion tool: "msconvert" (ProteoWizard) or other
   converter: msconvert
   output_format: mzML
-
 feature_detect:
-  env: preprocess
-  # Path to the MZmine 4 binary. Each machine sets this to wherever it was extracted
-  # (see .agents/skills/msms-feature-detect/SKILL.md for install instructions — no root needed).
-  mzmine_bin: "/home/magled/mzmine-4.7.8/opt/mzmine/bin/mzmine"
-  # Path to a .mzuser login file. Generate with: <mzmine_bin> -login-console
-  mzmine_user: "/home/magled/.mzmine/users/mlederbauer.mzuser"
+  mzmine_bin: ''
+  mzmine_user: ''

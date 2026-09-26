@@ -1,143 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "snowmageddon"
-version = "0.1.0"
-description = "MS/MS structure elucidation agent using simulator, retrieval, and de novo models"
+name = "msms-structure-elucidation"
+version = "0.2.0"
+description = "Portable MS/MS structure elucidation workflow"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "pyyaml",
-    "click",
-]
+dependencies = []
 
 [project.optional-dependencies]
-cpu = []  # placeholder — add CPU-only model deps here when needed
-
-[dependency-groups]
-dev = ["ruff"]
+plot = ["matplotlib"]
+mcp = ["mcp"]
+visualize = ["flask>=3.0"]
 
 [project.scripts]
-snowmageddon = "snowmageddon.cli:main"
+msms-structure-elucidation = "msms_structure_elucidation.cli:main"
 
-# Pixi workspace — one environment per model + one shared agent env
-[tool.pixi.workspace]
-channels = ["conda-forge", "pytorch"]
-platforms = [{ platform = "linux-64", cuda = "12" }, { platform = "linux-64" }]
+[tool.setuptools.packages.find]
+where = ["src"]
 
-[tool.pixi.pypi-dependencies]
-snowmageddon = { path = ".", editable = true }
-
-# Environments
-# Each model gets its own isolated env. Fill in deps when you wire up a model.
-# pixi run --environment <name> python ...
-
-[tool.pixi.environments]
-# Base agent env: shared utilities, CLI, orchestration
-default = { features = ["agent"] }
-# Raw file preprocessing (e.g. msconvert / pyteomics)
-preprocess = { features = ["preprocess"] }
-# ICEBERG simulator (ms-pred, DGL, PyTorch 2.4, Python 3.10)
-simulator-iceberg = { features = ["simulator-iceberg"] }
-# Generic simulator placeholder (fill in when a second simulator is added)
-simulator = { features = ["simulator"] }
-# Spectral database retrieval
-retrieval = { features = ["retrieval"] }
-# De novo structure prediction
-denovo = { features = ["denovo-frigid"] }
-
-[tool.pixi.feature.agent]
-platforms = ["linux-64"]
-
-# Feature dependency sets
-[tool.pixi.feature.agent.dependencies]
-python = ">=3.11"
-pyyaml = "*"
-click = "*"
-pre-commit = "*"
-ruff = "*"
-
-[tool.pixi.feature.agent.pypi-dependencies]
-anthropic = "*"
-mcp = "*"
-
-[tool.pixi.feature.preprocess.dependencies]
-python = ">=3.10"
-pyteomics = "*"
-psims = "*"
-lxml = "*"
-matplotlib = "*"
-jupyterlab = "*"
-ipywidgets = "*"
-plotly = "*"
-seaborn = "*"
-rdkit = "*"
-
-[tool.pixi.feature.preprocess.pypi-dependencies]
-pypalettes = "*"
-
-# -- ICEBERG simulator (ms-pred from coleygroup/ms-pred) ---------------------
-# Python 3.10 required by ms_pred and DGL 2.4
-[tool.pixi.feature.simulator-iceberg.dependencies]
-python = "3.10.*"
-pytorch = { version = "==2.4.0", channel = "pytorch" }
-cython = "*"
-matplotlib = "*"
-rdkit = "*"
-python-graphviz = "*"
-pygraphviz = "*"
-einops = "*"
-seaborn = "*"
-h5py = "*"
-
-[tool.pixi.feature.simulator-iceberg.pypi-dependencies]
-mcp = "*"
-ipython = "*"
-pytorch-lightning = "*"
-ray = { version = "==2.7.2", extras = ["tune"] }
-"setuptools" = "<81"
-pydantic = "*"
-scikit-learn = "*"
-pathos = "*"
-CairoSVG = "*"
-omegaconf = "*"
-pubchempy = "*"
-pygmtools = "*"
-msbuddy = "*"
-lightgbm = "*"
-platformdirs = "*"
-pyyaml = "*"
-numpy = "*"
-# ms_pred, DGL, torch-scatter, torch-sparse must be installed manually after pixi install.
-# Run: bash .agents/skills/msms-sim-iceberg/scripts/setup_env.sh
-
-# -- Generic simulator placeholder -------------------------------------------
-[tool.pixi.feature.simulator.dependencies]
-python = ">=3.10"
-# TODO: add deps for a second simulator when needed
-
-[tool.pixi.feature.retrieval.dependencies]
-python = ">=3.10"
-numpy = "*"
-rdkit = "*"
-h5py = "*"
-# TODO: add faiss-cpu once vector-based retrieval (beyond atlas MGF lookup) is needed
-
-[tool.pixi.feature.retrieval.pypi-dependencies]
-mcp = "*"
-
-[tool.pixi.feature.denovo-frigid.dependencies]
-python = "3.10.*"
-# numpy pinned to match FRIGID's requirements (numpy==1.26.4)
-numpy = "==1.26.4"
-rdkit = "*"
-# wandb (pulled in by safe-mol) imports pkg_resources.parse_version, removed in setuptools>=81
-setuptools = "<81"
-
-[tool.pixi.feature.denovo-frigid.pypi-dependencies]
-# CPU wheel installs everywhere; setup_env.sh reinstalls the CUDA build on GPU machines
-torch = "==2.6.0"
-
-# FRIGID deps (torch-scatter, torch-sparse, DGL, ms-pred, ngboost, safe-mol, etc.)
-# must be installed via pip AFTER pixi install. Run: bash .agents/skills/msms-denovo/scripts/setup_env.sh
-
-[tool.pixi.tasks]
-elucidation = "python -m snowmageddon.cli run"
+[tool.setuptools.package-data]
+msms_structure_elucidation = ["visualize_assets/*.html", "visualize_assets/*.css", "visualize_assets/*.js"]

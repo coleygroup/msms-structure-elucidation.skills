@@ -82,6 +82,11 @@ def build_dataset_dir(
 
     # split.tsv — FRIGID expects a "name" column (not "spec")
     (data_dir / "split.tsv").write_text(f"name\tsplit\n{spec_name}\ttest\n")
+    # Upstream uses labels SMILES for evaluation. The BUDDY file supplies the
+    # actual unknown formula for generation instead of the placeholder SMILES.
+    (data_dir / "buddy_formulas.csv").write_text(
+        f"identifier,formula_rank_1\n{spec_name},{formula}\n"
+    )
 
     # subformulae — symlink the folder produced by msms-subformulae
     subform_dst = data_dir / "subformulae" / "default_subformulae"
@@ -91,7 +96,7 @@ def build_dataset_dir(
         raise FileNotFoundError(
             f"Subformulae not found at {subform_src}.\n"
             "Run msms-subformulae skill first:\n"
-            "  pixi run --environment denovo python "
+            "  python "
             ".agents/skills/msms-subformulae/scripts/run.py --spectrum ... --formula ..."
         )
     subform_dst.symlink_to(subform_src)
@@ -101,6 +106,7 @@ def build_dataset_dir(
 
 def run_frigid(
     data_dir: Path,
+    frigid_python: str,
     frigid_dir: Path,
     cfg: dict,
     project_root: Path,
@@ -114,8 +120,18 @@ def run_frigid(
     if not frigid_cfg.exists():
         raise FileNotFoundError(f"FRIGID config not found: {frigid_cfg}")
 
+    for key in ("mist_ckpt", "dlm_ckpt"):
+        path = resolve(denovo.get(key, ""), project_root)
+        if not denovo.get(key) or not path.is_file():
+            raise FileNotFoundError(f"Missing {key}: supply --{key.replace('_', '-')} or download public FRIGID assets")
+    if num_rounds > 0:
+        for key in ("iceberg_gen_ckpt", "iceberg_inten_ckpt"):
+            path = resolve(denovo.get(key, ""), project_root)
+            if not denovo.get(key) or not path.is_file():
+                raise FileNotFoundError(f"Missing {key} for ICEBERG refinement")
+
     cmd = [
-        sys.executable,
+        frigid_python,
         str(frigid_dir / "scripts" / "spec2mol_scaling.py"),
         "--config",
         str(frigid_cfg),
@@ -123,10 +139,6 @@ def run_frigid(
         str(resolve(denovo["mist_ckpt"], project_root)),
         "--dlm-checkpoint",
         str(resolve(denovo["dlm_ckpt"], project_root)),
-        "--iceberg-gen-ckpt",
-        str(resolve(denovo["iceberg_gen_ckpt"], project_root)),
-        "--iceberg-inten-ckpt",
-        str(resolve(denovo["iceberg_inten_ckpt"], project_root)),
         "--data-dir",
         str(data_dir),
         "--split",
@@ -137,11 +149,21 @@ def run_frigid(
         str(num_rounds),
         "--batch-size",
         str(batch_size),
+        "--buddy-formula-path",
+        str(data_dir / "buddy_formulas.csv"),
         "--output-dir",
         str(output_dir),
         "--seed",
         "42",
     ]
+    # Upstream counts the initial generation as round 1 and requires at least
+    # one round. Zero requested refinement rounds therefore means one base round.
+    cmd[cmd.index("--num-rounds") + 1] = str(num_rounds + 1)
+    if num_rounds == 0:
+        cmd += ["--num-unique-to-refine", "0", "--masks-per-molecule", "0"]
+    if num_rounds > 0:
+        cmd += ["--iceberg-gen-ckpt", str(resolve(denovo["iceberg_gen_ckpt"], project_root)),
+                "--iceberg-inten-ckpt", str(resolve(denovo["iceberg_inten_ckpt"], project_root))]
 
     cuda = denovo.get("cuda_devices")
     env = os.environ.copy()
@@ -159,7 +181,7 @@ def run_frigid(
         )
 
     # FRIGID writes a CSV with pred_smiles_1, pred_smiles_2, ... columns
-    pred_csvs = list(output_dir.rglob("predictions*.csv"))
+    pred_csvs = [output_dir / "predictions.csv"] if (output_dir / "predictions.csv").exists() else sorted(output_dir.rglob("predictions_round_*.csv"), reverse=True)
     pred_jsons = list(output_dir.rglob("predictions*.json"))
 
     candidates = []
@@ -172,7 +194,7 @@ def run_frigid(
             row = rows[0]
             i = 1
             while f"pred_smiles_{i}" in row and row[f"pred_smiles_{i}"]:
-                candidates.append({"smiles": row[f"pred_smiles_{i}"], "score": 1.0 / i})
+                candidates.append({"smiles": row[f"pred_smiles_{i}"], "rank": i})
                 i += 1
     elif pred_jsons:
         data = json.loads(pred_jsons[0].read_text())
@@ -251,6 +273,12 @@ def main() -> None:
         "--batch-size", type=int, default=None, help="Samples per round"
     )
     parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--frigid-dir", help="FRIGID checkout; overrides config")
+    parser.add_argument("--frigid-python", help="FRIGID environment Python")
+    parser.add_argument("--mist-ckpt", help="MIST checkpoint")
+    parser.add_argument("--dlm-ckpt", help="DLM checkpoint")
+    parser.add_argument("--iceberg-gen-ckpt", help="ICEBERG generator checkpoint")
+    parser.add_argument("--iceberg-inten-ckpt", help="ICEBERG intensity checkpoint")
     parser.add_argument("--output", required=True, help="Output JSON path")
     args = parser.parse_args()
 
@@ -258,7 +286,16 @@ def main() -> None:
     cfg = load_config(project_root, args.config)
     denovo_cfg = cfg["models"]["denovo"]
 
-    frigid_dir = resolve(denovo_cfg["frigid_src"], project_root)
+    for arg_name, config_name in (("mist_ckpt", "mist_ckpt"), ("dlm_ckpt", "dlm_ckpt"),
+                                  ("iceberg_gen_ckpt", "iceberg_gen_ckpt"),
+                                  ("iceberg_inten_ckpt", "iceberg_inten_ckpt")):
+        value = getattr(args, arg_name)
+        if value:
+            denovo_cfg[config_name] = value
+    frigid_dir = resolve(args.frigid_dir or denovo_cfg["frigid_src"], project_root)
+    frigid_python = args.frigid_python or str(project_root / ".cache/frigid-venv/bin/python")
+    if not Path(frigid_python).is_file():
+        raise FileNotFoundError(f"FRIGID Python missing: {frigid_python}. Run the denovo setup script or pass --frigid-python.")
     if not frigid_dir.exists():
         raise FileNotFoundError(
             f"frigid_src not found: {frigid_dir}\n"
@@ -293,6 +330,7 @@ def main() -> None:
 
         candidates = run_frigid(
             data_dir=data_dir,
+            frigid_python=frigid_python,
             frigid_dir=frigid_dir,
             cfg=cfg,
             project_root=project_root,

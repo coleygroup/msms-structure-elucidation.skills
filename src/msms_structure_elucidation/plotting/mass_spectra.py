@@ -7,7 +7,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import Draw
 
-from snowmageddon.plotting.style import FIGSIZE, make_fig, spec_colors
+from msms_structure_elucidation.plotting.style import FIGSIZE, make_fig, spec_colors
 
 
 def create_spectrum_figure(

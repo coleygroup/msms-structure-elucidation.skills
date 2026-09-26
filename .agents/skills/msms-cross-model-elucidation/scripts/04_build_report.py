@@ -12,13 +12,13 @@ The notebook is emitted as executed-on-open source (it carries no stored
 outputs); it is executed here with nbconvert so the committed copy renders with
 real figures and tables.
 
-Runs in the `preprocess` pixi env, which is this project's env carrying
+Runs in the `preprocess` Python env, which is this project's env carrying
 matplotlib, pandas, rdkit and nbconvert; the `default` agent env has none of
 those.
 
 Usage:
     # Env: preprocess
-    pixi run --environment preprocess python \\
+    python \\
         .agents/skills/msms-cross-model-elucidation/scripts/04_build_report.py \\
         --results-dir results/<timestamp> \\
         --notebook notebooks/msms_cross_model_cascade.ipynb

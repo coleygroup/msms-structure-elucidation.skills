@@ -1,7 +1,6 @@
 ---
 name: msms-cross-model-elucidation
 description: Chain the GLACIER simulator, JAM fingerprint predictor and FRIGID decoder into a three-stage cascade that turns a list of SMILES into ranked candidate structures with per-stage accuracy metrics.
-category: general
 ---
 
 # MS/MS Cross-Model Elucidation
@@ -34,16 +33,18 @@ script shells out to the matching interpreter by absolute path:
 
 | Model | Repository | Interpreter |
 | --- | --- | --- |
-| GLACIER | `/mnt/home/magled/ms-pred` (uv) | `/mnt/home/magled/ms-pred/.venv/bin/python` |
-| JAM | `/mnt/home/magled/jam` (pixi) | `pixi run --manifest-path /mnt/home/magled/jam/pixi.toml python` |
-| FRIGID | `/mnt/home/magled/FRIGID` (conda env `frigid`) | `/mnt/home/magled/miniconda3/envs/masskit_ai/envs/frigid/bin/python` |
+| GLACIER | `$MS_PRED_DIR` | `$MS_PRED_PYTHON` |
+| JAM | `$JAM_DIR` | `$JAM_PYTHON` |
+| FRIGID | `$FRIGID_DIR` | `$FRIGID_PYTHON` |
+
+For a missing ms-pred or FRIGID checkout, clone the corresponding official repository ([ms-pred](https://github.com/coleygroup/ms-pred), [FRIGID](https://github.com/coleygroup/FRIGID) with submodules). Read each cloned checkout's `README.md` installation section and follow its environment instructions before setting the interpreter paths above. For existing checkouts, read their own README and verify the environment rather than assuming a named venv is ready.
 
 Download the two remote checkpoints into the gitignored resources directory
-(FRIGID's checkpoint is already local at `/mnt/home/magled/FRIGID/30000.ckpt`):
+(FRIGID's checkpoint is already local at `$FRIGID_CHECKPOINT`):
 
 ```bash
 # Env: default
-pixi run --environment default python -c "
+python -c "
 from huggingface_hub import hf_hub_download
 import shutil, pathlib
 base = pathlib.Path('.agents/skills/msms-cross-model-elucidation/resources/checkpoints')
@@ -59,7 +60,7 @@ for repo, sub, dest in [
 
 If `huggingface_hub` is not importable in the `default` env, run the same
 snippet with the JAM project's interpreter
-(`pixi run --manifest-path /mnt/home/magled/jam/pixi.toml python`), which ships
+(`$JAM_PYTHON`), which ships
 it.
 
 ## Instructions
@@ -74,6 +75,8 @@ mkdir -p "$CASCADE_RESULTS"
 
 ### 2. Simulate spectra with GLACIER
 
+Supply collision energies as rounded integer eV. If they come from experimental NCE, confirm the unit with the provider, convert using precursor m/z, and round before setting `--collision-energies`.
+
 Builds `labels.tsv` (one row per molecule, `ionization` fixed to `[M+H]+`,
 `collision_energies` as a Python-literal list) and `split.tsv`, runs
 `ms_pred.glacier.predict_smis_joint` with `--sparse-out --frag-form-vecs`, then
@@ -82,7 +85,7 @@ energy).
 
 ```bash
 # Env: default
-pixi run --environment default python \
+python \
     .agents/skills/msms-cross-model-elucidation/scripts/01_simulate_glacier.py \
     --smiles-file data/oprd_experiments_260904/rxn_7/rxn_7.txt \
     --output-dir "$CASCADE_RESULTS/01_glacier" \
@@ -102,8 +105,8 @@ plus `cand_form` and `cand_ion`), featurizes it, runs `MistNet.encode_spectra`,
 binarizes, and scores against an RDKit Morgan fingerprint of the input SMILES.
 
 ```bash
-# Env: external jam pixi project (not a snowmageddon pixi env)
-pixi run --manifest-path /mnt/home/magled/jam/pixi.toml python \
+# Env: JAM environment (not a msms-structure-elucidation Python env)
+$JAM_PYTHON \
     .agents/skills/msms-cross-model-elucidation/scripts/02_predict_jam_fingerprint.py \
     --spectra-dir "$CASCADE_RESULTS/01_glacier/spectra" \
     --manifest "$CASCADE_RESULTS/01_glacier/manifest.json" \
@@ -124,8 +127,8 @@ truth) and filters candidates to the target molecular formula, reusing
 own `scripts/eval_dlm_pred_fp.py`.
 
 ```bash
-# Env: external FRIGID conda env (not a snowmageddon pixi env)
-/mnt/home/magled/miniconda3/envs/masskit_ai/envs/frigid/bin/python \
+# Env: external FRIGID conda env (not a msms-structure-elucidation Python env)
+$FRIGID_PYTHON \
     .agents/skills/msms-cross-model-elucidation/scripts/03_decode_frigid.py \
     --jam-metrics "$CASCADE_RESULTS/02_jam/metrics.json" \
     --jam-fingerprints "$CASCADE_RESULTS/02_jam/predicted_fingerprints.npz" \
@@ -140,7 +143,7 @@ resumes), `summary.json`, `input_configs.yaml`.
 
 ```bash
 # Env: preprocess
-pixi run --environment preprocess python \
+python \
     .agents/skills/msms-cross-model-elucidation/scripts/04_build_report.py \
     --results-dir "$CASCADE_RESULTS" \
     --notebook notebooks/msms_cross_model_cascade.ipynb
@@ -158,17 +161,17 @@ computed by FRIGID's own code path.
 
 ```bash
 # Env: preprocess
-pixi run --environment preprocess python \
+python \
     .agents/skills/msms-cross-model-elucidation/test_cascade_outputs.py \
     "$CASCADE_RESULTS"
 ```
 
 ## Constraints
 
-- **Environment**: stages 1 and 5 use this project's pixi envs (`default` for
+- **Environment**: stages 1 and 5 use this project's Python envs (`default` for
   orchestration, `preprocess` for plotting/notebook rendering). Stages 2 and 3
   run under the sibling repositories' own environments and cannot be run from a
-  snowmageddon env.
+  msms-structure-elucidation env.
 - **Input format**: a plain text file of SMILES, one per line, no header and no
   index column. Per-molecule ids are generated as `<prefix>_<0-based index>`.
 - **Adduct**: `[M+H]+` only. Stage 2's featurizer requires an adduct present in
@@ -206,7 +209,7 @@ pixi run --environment preprocess python \
   doi:10.1038/s42256-023-00708-3. Checkpoint: `CRG-MIT/MIST-JAM`
   (`mist_jam_all_maxtrain_random_split`).
 - **FRIGID** — masked diffusion language model decoding fingerprints to SAFE
-  molecular strings. Checkpoint: `/mnt/home/magled/FRIGID/30000.ckpt`.
+  molecular strings. Checkpoint: `$FRIGID_CHECKPOINT`.
 - **SAFE** — Noutahi et al., "Gotta be SAFE: a new framework for molecular
   design", *Digital Discovery* 3 (2024) 796–804. doi:10.1039/D4DD00019F.
 - **Morgan fingerprints** — Rogers & Hahn, "Extended-Connectivity Fingerprints",

@@ -1,7 +1,6 @@
 ---
 name: msms-inspect
 description: Interactive TIC/MS1/MS2 chromatogram viewer for mzML files; lets you browse retention time, inspect precursor masses, and export individual spectra as .ms files.
-category: preprocessing
 ---
 
 # msms-inspect
@@ -14,14 +13,14 @@ Visually explore an LC-MS/MS run: browse the total ion chromatogram (TIC), inspe
 1. **Launch the inspector**:
 ```bash
 # Env: preprocess
-pixi run --environment preprocess python .agents/skills/msms-inspect/scripts/run.py \
+python .agents/skills/msms-inspect/scripts/run.py \
     --input results/sample.mzML
 ```
 
 2. **With export enabled** (press `E` on a selected MS2 to save it as `.ms`):
 ```bash
 # Env: preprocess
-pixi run --environment preprocess python .agents/skills/msms-inspect/scripts/run.py \
+python .agents/skills/msms-inspect/scripts/run.py \
     --input results/sample.mzML \
     --export-dir results/precursors/
 ```
@@ -37,7 +36,7 @@ The viewer has three panels stacked vertically:
 | MS2 | Fragmentation spectrum for the selected precursor | Press `E` to export as `.ms` |
 
 ## Constraints
-- **Environment**: `preprocess` (`pixi run --environment preprocess python ...`)
+- **Environment**: `preprocess` (`python ...`)
 - **Input**: `.mzML` file (convert from `.raw` first using `msms-preprocess`)
 - **Display**: requires a display (X11/Wayland). On headless servers, forward X11 via `ssh -X` or use a Jupyter notebook.
 - **Export tolerance**: MS2 scans within ±0.01 Da of the clicked precursor m/z are merged into one `.ms` file.

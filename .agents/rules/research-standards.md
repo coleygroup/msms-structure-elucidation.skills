@@ -27,7 +27,7 @@ Before starting, classify the user's request:
 
 2. **Plan before running**: Write a brief plan (inputs, which models to run, orchestration mode, expected outputs). Get user confirmation before running models.
 
-3. **Run models**: Use the appropriate skills. Always specify the pixi environment.
+3. **Run models**: Use the appropriate skills. Always specify the Python environment.
 
 4. **Fuse results**: In parallel mode, rank candidates across all three models. In cascade mode, document which model produced the final answer and why earlier models were insufficient.
 

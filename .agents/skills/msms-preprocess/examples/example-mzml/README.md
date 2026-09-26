@@ -11,7 +11,7 @@ docker pull proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses
 
 ## Steps
 ```bash
-pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+python .agents/skills/msms-preprocess/scripts/run.py \
     --input examples/example-mzml/input.raw \
     --output examples/example-mzml/output.mzML
 ```

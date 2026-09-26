@@ -8,13 +8,13 @@ then reads the resulting PredSpecDB HDF5 back into one JSON per
 formula strings.
 
 GLACIER lives in a sibling repo with its own uv-managed venv, so it is invoked
-with an absolute interpreter path rather than through this project's pixi envs.
+with an absolute interpreter path rather than through this project's Python envs.
 The read-back also runs under that interpreter, since `ms_pred` is only
 importable there.
 
 Usage:
     # Env: default
-    pixi run --environment default python \\
+    python \\
         .agents/skills/msms-cross-model-elucidation/scripts/01_simulate_glacier.py \\
         --smiles-file data/oprd_experiments_260904/rxn_7/rxn_7.txt \\
         --output-dir results/<timestamp>/01_glacier \\
@@ -28,11 +28,12 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+import os
 
 import yaml
 
-MS_PRED_ROOT = Path("/mnt/home/magled/ms-pred")
-MS_PRED_PYTHON = MS_PRED_ROOT / ".venv/bin/python"
+MS_PRED_ROOT = Path(os.environ.get("MS_PRED_DIR", "../ms-pred")).resolve()
+MS_PRED_PYTHON = Path(os.environ.get("MS_PRED_PYTHON", str(MS_PRED_ROOT / ".venv/bin/python")))
 DEFAULT_CHECKPOINT = Path(
     ".agents/skills/msms-cross-model-elucidation/resources/checkpoints/glacier/best.ckpt"
 )
@@ -275,7 +276,7 @@ def main() -> None:
 # ponytail: self-check
 # Run with --help to confirm the argparse surface, then verify that the input
 # parser yields 11 molecules and 3 collision energies for the rxn_7 input:
-#   pixi run --environment default python .agents/skills/.../01_simulate_glacier.py --help
+#   python .agents/skills/.../01_simulate_glacier.py --help
 #   python -c "from pathlib import Path; \
 #       import importlib.util as u; \
 #       s=u.spec_from_file_location('m','01_simulate_glacier.py'); \

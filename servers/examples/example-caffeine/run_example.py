@@ -6,7 +6,7 @@ Demonstrates both tools in servers/pubchem.py without starting the MCP server.
 
 Run from project root:
     # Env: default
-    pixi run --environment default python servers/examples/example-caffeine/run_example.py
+    python servers/examples/example-caffeine/run_example.py
 """
 
 import asyncio
