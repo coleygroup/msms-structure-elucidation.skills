@@ -1,14 +1,15 @@
 """
 MCP server — spectral database retrieval.
 
-Runs in the `retrieval` pixi environment.
+Runs in the `retrieval` Python environment.
 
 Start manually:
-    pixi run --environment retrieval python servers/retrieval.py
+    python servers/retrieval.py
 """
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from mcp.server import Server
@@ -27,31 +28,32 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="retrieve_candidates",
             description=(
-                "Search a spectral reference database for candidate structures matching "
-                "an experimental MS/MS spectrum using cosine similarity or learned embeddings. "
-                "Best suited for: known compound identification where the molecule (or a close "
-                "analogue) is likely present in spectral libraries such as NIST, MassBank, or "
-                "GNPS. Excels at metabolomics, food safety, environmental monitoring, and "
-                "pharmaceutical QC. Less useful for truly novel compounds or natural product "
-                "unknowns not covered by public libraries. "
-                "Returns top-k candidate structures with SMILES, similarity scores, and DB IDs."
+                "Rank candidates from the public ICEBERG PubChem atlas for an experimental .ms "
+                "spectrum, using ms-pred entropy similarity. Public NIST structures are excluded."
             ),
             inputSchema={
                 "type": "object",
-                "required": ["spectrum", "output"],
+                "required": ["spectrum", "output", "collision_unit"],
                 "properties": {
                     "spectrum": {
                         "type": "string",
-                        "description": "Path to query spectrum file (mzML or MGF)",
+                        "description": "Path to query spectrum file in ms-pred .ms format",
                     },
                     "output": {
                         "type": "string",
                         "description": "Path for output JSON file with ranked candidates",
                     },
-                    "db_path": {
+                    "collision_unit": {
+                        "type": "string", "enum": ["NCE", "eV"],
+                        "description": "User-confirmed unit of experimental collision-energy labels",
+                    },
+                    "formula": {
                         "type": "string",
-                        "description": "Path to spectral database (overrides config)",
-                        "default": "",
+                        "description": "Neutral molecular formula; inferred with MSBuddy when omitted",
+                    },
+                    "atlas_mgf": {
+                        "type": "string",
+                        "description": "Optional local formula MGF for offline retrieval",
                     },
                     "top_k": {
                         "type": "integer",
@@ -70,21 +72,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         raise ValueError(f"Unknown tool: {name}")
 
     cmd = [
-        "pixi",
-        "run",
-        "--environment",
-        "retrieval",
-        "python",
+        sys.executable,
         str(SCRIPT),
         "--spectrum",
         arguments["spectrum"],
+        "--collision-unit",
+        arguments["collision_unit"],
         "--output",
         arguments["output"],
-        "--top_k",
+        "--top-k",
         str(arguments.get("top_k", 10)),
     ]
-    if arguments.get("db_path"):
-        cmd += ["--db_path", arguments["db_path"]]
+    if arguments.get("formula"):
+        cmd += ["--formula", arguments["formula"]]
+    if arguments.get("atlas_mgf"):
+        cmd += ["--atlas-mgf", arguments["atlas_mgf"]]
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
 

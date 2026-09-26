@@ -1,11 +1,11 @@
 """Plotting utilities: colors, fonts, sizes, save helper.
 
 Ported from icicle-dev's ``icicle.utils.visualization.style`` so
-snowmageddon figures match icicle's manuscript style.
+msms-structure-elucidation figures match icicle's manuscript style.
 
 Usage::
 
-    from snowmageddon.plotting.style import set_style, get_palette, make_fig, save_fig
+    from msms_structure_elucidation.plotting.style import set_style, get_palette, make_fig, save_fig
 
     set_style("manuscript")          # call once at top of notebook/script
     fig, ax = make_fig("default")

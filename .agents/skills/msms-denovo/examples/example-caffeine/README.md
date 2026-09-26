@@ -11,14 +11,14 @@ verify that the top candidate recovers the correct structure.
 
 ```bash
 # Step 1 — assign subformulae
-pixi run --environment denovo python .agents/skills/msms-subformulae/scripts/run.py \
+python .agents/skills/msms-subformulae/scripts/run.py \
     --spectrum .agents/skills/msms-denovo/examples/example-caffeine/caffeine.ms \
     --formula C8H10N4O2 \
     --adduct "[M+H]+" \
     --output-dir .agents/test/example-caffeine/subformulae/
 
 # Step 2 — de novo prediction
-pixi run --environment denovo python .agents/skills/msms-denovo/scripts/run.py \
+python .agents/skills/msms-denovo/scripts/run.py \
     --spectrum .agents/skills/msms-denovo/examples/example-caffeine/caffeine.ms \
     --formula C8H10N4O2 \
     --adduct "[M+H]+" \

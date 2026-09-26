@@ -1,10 +1,10 @@
 """
 MCP server — PubChem structure lookup.
 
-Runs in the `default` pixi environment (no extra deps needed beyond requests).
+Runs in the `default` Python environment (no extra deps needed beyond requests).
 
 Start manually:
-    pixi run python servers/pubchem.py
+    python servers/pubchem.py
 """
 
 import json

@@ -1,14 +1,15 @@
 """
 MCP server — ICEBERG MS/MS simulator (ms-pred, coleygroup).
 
-Runs in the `simulator-iceberg` pixi environment. The CLI launches this as a
+Runs in the `simulator-iceberg` Python environment. The CLI launches this as a
 subprocess and connects to it via stdio MCP transport.
 
 Start manually:
-    pixi run --environment simulator-iceberg python servers/simulator_iceberg.py
+    python servers/simulator_iceberg.py
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -113,11 +114,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     cuda_devices = arguments.get("cuda_devices")
 
     cmd = [
-        "pixi",
-        "run",
-        "--environment",
-        "simulator-iceberg",
-        "python",
+        os.environ.get("MS_PRED_PYTHON", sys.executable),
         str(SCRIPT),
         "--smiles",
         smiles,

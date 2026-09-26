@@ -9,7 +9,7 @@ These rules apply across all code in this project. Follow them without exception
 ## 1. Global Guidelines
 1. **Language**: All code and comments must be in **English**.
 2. **No separator comments**: Never write decorative separator lines like `# ---`, `# ===`, `# -- Section name --`, or any comment whose sole purpose is visual dividing. Use a blank line or a section header instead.
-3. **Temporary Files**: All temporary log, validation, and testing files go under `<project_root>/.agents/test/`.
+3. **Temporary Files**: Temporary files may be kept under the system temporary directory or a configured output directory.
 4. **Error Handling**: Avoid `try/except` unless the failure mode is genuinely recoverable.
 5. **Cleanup**: Remove temporary test code and deprecated functions after implementation changes.
 6. **Reusability**: Search existing dependencies before writing a new function.
@@ -17,10 +17,10 @@ These rules apply across all code in this project. Follow them without exception
 8. **Secrets**: All credentials and paths go in `.env` or `configs/`. Never hardcode.
 
 ## 2. Environment and Dependency Management
-- Use the appropriate **pixi environment** for each model (see `mcp-environments.md`).
-- The `default` environment is the fallback for orchestration and shared utilities.
-- Never globally pin PyTorch or similar packages across environments — each feature set in `pyproject.toml` manages its own deps.
-- If a tool requires an old Python version or conda-only packages, add it as a `conda-forge` dependency in the relevant pixi feature block.
+- Use the appropriate **Python environment** for each model (see `mcp-environments.md`).
+- The CLI uses the standard library; model-specific interpreters are passed explicitly.
+- Keep model dependencies in their own environments and follow upstream installation instructions.
+- If a model requires a specific Python or package build, create an isolated environment for that model.
 - Do **not** implement import fallbacks when a package is missing — fix the environment.
 
 ## 3. Documentation and Testing

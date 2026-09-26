@@ -1,7 +1,6 @@
 ---
 name: msms-preprocess
 description: Convert raw instrument files (.raw, .d, etc.) to mzML or MGF for downstream model input; no-op if the file is already in a supported format.
-category: preprocessing
 ---
 
 # msms-preprocess
@@ -25,14 +24,14 @@ Docker must be available on the machine. The script checks for a system `msconve
 
 2. **Convert to mzML**:
 ```bash
-pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+python .agents/skills/msms-preprocess/scripts/run.py \
     --input path/to/sample.raw \
     --output results/sample.mzML
 ```
 
 3. **Or convert to MGF**:
 ```bash
-pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+python .agents/skills/msms-preprocess/scripts/run.py \
     --input path/to/sample.raw \
     --output results/sample.mgf \
     --format MGF
@@ -40,15 +39,15 @@ pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/
 
 4. **Mixed-polarity `.raw` files** — most instrument methods acquire positive and negative ESI in one run. Splitting can be done either here (msconvert) or in `msms-feature-detect` itself (MZmine's chromatogram builder, via `--polarity "+"` / `--polarity "-"` — see its SKILL.md, this is now the preferred path since it avoids an extra conversion pass). To split here instead:
 ```bash
-pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+python .agents/skills/msms-preprocess/scripts/run.py \
     --input path/to/sample.raw --output results/sample_pos.mzML --polarity positive
-pixi run --environment preprocess python .agents/skills/msms-preprocess/scripts/run.py \
+python .agents/skills/msms-preprocess/scripts/run.py \
     --input path/to/sample.raw --output results/sample_neg.mzML --polarity negative
 ```
 `--polarity` defaults to `any` (no filtering) — safe to omit for files already acquired in a single polarity, or if you plan to split downstream in `msms-feature-detect` instead.
 
 ## Constraints
-- **Environment**: `preprocess` (`pixi run --environment preprocess python ...`)
+- **Environment**: `preprocess` (`python ...`)
 - **Supported input formats**: `.raw` (Thermo), `.d` (Bruker) — extend as needed
 - **Supported output formats**: `mzML`, `MGF`
 - **Converter**: msconvert (ProteoWizard) via Docker (`proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses`) or system binary

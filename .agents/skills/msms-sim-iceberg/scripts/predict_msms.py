@@ -45,7 +45,7 @@ def run_iceberg(
     threshold: float,
 ) -> tuple:
     """Run ICEBERG two-stage inference. Returns (save_dir, precursor_mass)."""
-    from ms_pred.dag_pred.iceberg_elucidation import iceberg_prediction
+    from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction
 
     save_dir, precursor_mass = iceberg_prediction(
         candidate_smiles=[smiles],
@@ -59,7 +59,8 @@ def run_iceberg(
         inten_ckpt=str(inten_ckpt),
         cuda_devices=cuda_devices,
         batch_size=batch_size,
-        num_workers=num_workers,
+        num_cpu_workers=num_workers,
+        num_gpu_workers=1,
         sparse_k=sparse_k,
         max_nodes=max_nodes,
         threshold=threshold,
@@ -98,7 +99,7 @@ def load_predictions(save_dir: Path) -> tuple:
         frag_dict: {collision_energy_str -> list of fragment SMILES or None}
         canonical_smi: SMILES as stored in HDF5
     """
-    from ms_pred.dag_pred.iceberg_elucidation import load_pred_spec
+    from ms_pred.iceberg.iceberg_elucidation import load_pred_spec
     from ms_pred.magma.fragmentation import FragmentEngine
     from rdkit.Chem import MolFromSmiles
 

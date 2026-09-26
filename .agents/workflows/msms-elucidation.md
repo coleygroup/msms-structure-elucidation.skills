@@ -1,71 +1,12 @@
 ---
-description: Workflow for end-to-end MS/MS structure elucidation using simulator, retrieval, and de novo models in parallel or cascade mode.
+description: Portable MS/MS structure elucidation from experimental spectra using public atlas retrieval and optional model review.
 ---
+# MS/MS structure elucidation
 
-# MS/MS Structure Elucidation
-
-This workflow guides you through elucidating the structure of an unknown compound from a raw or pre-processed MS/MS spectrum.
-
-**Scientific Problem:** Untargeted metabolomics and natural product discovery routinely produce MS/MS spectra for compounds absent from reference libraries. This workflow addresses that gap by combining three complementary in-house models: a fragmentation simulator (for candidate confirmation), a spectral database retrieval model (for known-compound matching), and a de novo structure generator (for truly unknown compounds). Results are fused into a ranked candidate list.
-
----
-
-## Inputs
-- A spectrum file: `.raw`, `.d`, mzML, or MGF
-- (Optional) a candidate SMILES for the simulator
-- `configs/default.yaml` with model checkpoints and database paths
-
-## Step 1 — Preprocess
-
-If the input is a raw instrument file, convert it first:
-
-```bash
-# Env: preprocess
-python .agents/skills/msms-preprocess/scripts/run.py \
-    --input <input_file> \
-    --output results/<name>.mzML \
-    --format mzML
-```
-
-Skip this step if the input is already mzML or MGF.
-
-## Step 2 — Run the agent
-
-```bash
-snowmageddon run --input results/<name>.mzML
-```
-
-The agent (`claude-opus-4-8` with adaptive thinking) decides which MCP tools to call and in what order. It has four tools available:
-
-- `retrieve_candidates` — spectral database search (best for known compounds in libraries)
-- `simulate_spectrum_iceberg` — ICEBERG forward simulation (verify a candidate SMILES)
-- `predict_structure_denovo` — de novo structure generation (best for novel unknowns)
-- `pubchem_isomers` / `pubchem_compound` — PubChem lookup for formula expansion or metadata
-
-Default strategy (encoded in the system prompt):
-1. Run `retrieve_candidates` first. If score ≥ 0.8, verify with `simulate_spectrum_iceberg`.
-2. If retrieval confidence is low, run `predict_structure_denovo`.
-3. Use PubChem tools to expand or validate the final candidate.
-
-Pass `--mode cascade` or `--mode parallel` as a hint to the agent; it does not force hard control.
-
-## Step 3 — Review outputs
-
-All outputs land in `results/<timestamp>/`:
-- `trace.jsonl` — full reasoning trace (thinking blocks, tool calls, tool results, final answer)
-- Model output files written by each tool (e.g. `spectrum.png`, `fragments.json`, `retrieval.json`)
-
-## Step 4 — Report
-
-The agent prints a ranked summary to stdout. The full trace in `trace.jsonl` documents which model produced each candidate, confidence scores, and the agent's reasoning.
-
----
-
-## Configuration
-
-Set `mode: parallel` or `mode: cascade` in `configs/default.yaml` as an orchestration hint. The CLI reads this automatically and passes it to the agent's context.
-
----
-
-## References
-- TODO: add references for each model once implemented.
+1. For raw files, use `msms-preprocess`, `msms-inspect`, or `msms-feature-detect` to export a selected MS/MS feature in ms-pred `.ms` format. For an existing `.ms` file, proceed directly.
+2. Ask the user what collision energies they supplied and whether the labels are NCE or absolute eV. Do not infer the unit from the `.ms` headers, instrument, or numeric values; report any conflict between the user answer and headers. Run `msms-structure-elucidation run --input sample.ms --collision-unit NCE --output-dir results/sample` (or `--collision-unit eV` when confirmed). Supply `--formula` when known. Otherwise MSBuddy proposes formula hypotheses, recorded as inferred.
+3. Read `retrieval.json` and the offline `report.html`. Public atlas entries are precomputed ICEBERG 2.1 predictions for PubChem structures and omit licensed NIST structures. Atlas energies are in eV. Convert confirmed NCE using ms-pred's precursor m/z conversion, pair every experimental energy with a nearby atlas energy within 2 eV, and average ms-pred entropy similarity across all paired energies. Inspect the recorded energy pairs and unmatched energies; do not silently score one energy. Similarity near or below 0.5 is a review trigger, not a calibrated confidence threshold.
+4. When evidence is weak or important peaks remain unexplained, use `msms-structure-review` to propose novel SMILES from explicit matched/unmatched peaks. Validate formulas and duplicates, then check atlas matches before running GLACIER (default) or ICEBERG with supplied public or licensed checkpoints. For model calls, convert every confirmed NCE value to eV using precursor m/z, round eV to an integer, and pass those integers with `nce=False`. If several experimental energies round to the same model eV, predict that eV once and compare it with each experimental spectrum.
+5. If no satisfactory candidate emerges, run `msms-subformulae` then `msms-denovo` with FRIGID. Keep FRIGID's interpreter and checkpoint paths separate from ms-pred; the setup script clones and installs FRIGID without modifying an existing checkout.
+6. For interactive fragment inspection and human review, run `msms-visualize` on the saved `retrieval.json`. Its localhost webpage displays ranked candidates, all paired collision energies, mirror spectra, and annotated fragments. Save candidate decisions and fragment comments on the page to a separate `review_notes.json`.
+7. Report candidate source, formula source, score, matched peaks, unexplained peaks, model asset provenance, and limitations. Preserve all candidate evidence in the JSON and HTML output.

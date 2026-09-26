@@ -1,7 +1,6 @@
 ---
 name: msms-atlas-to-ms
 description: Convert atlas-lookup spectra (HDF5 from msms-atlas-lookup) into ms-pred's native .ms format, one file per molecule.
-category: preprocessing
 ---
 
 # msms-atlas-to-ms
@@ -26,7 +25,7 @@ by any skill that expects `.ms` input, e.g. `msms-subformulae` and
 
 ## Prerequisites
 
-Uses the `retrieval` pixi env (rdkit, h5py — no GPU).
+Uses the `retrieval` Python env (rdkit, h5py — no GPU).
 
 ## Instructions
 
@@ -51,7 +50,7 @@ python .agents/skills/msms-atlas-to-ms/scripts/run.py \
 
 ## Constraints
 
-- **Environment**: `retrieval` (`pixi run --environment retrieval python ...`)
+- **Environment**: `retrieval` (`python ...`)
 - **Input**: HDF5 must have `smiles`, `inchikey14`, `formula`,
   `collision_energy`, `mz`, `intensity` datasets (as produced by
   `msms-atlas-lookup`)

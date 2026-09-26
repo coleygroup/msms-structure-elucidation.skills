@@ -1,7 +1,6 @@
 ---
 name: msms-subformulae
 description: Assign per-peak molecular subformulae to an MS/MS spectrum, producing the peakformula features required by FRIGID's MIST encoder.
-category: preprocessing
 ---
 
 # msms-subformulae
@@ -19,17 +18,14 @@ In de novo mode (structure unknown), pass no `--smiles` — the script uses `--u
 
 ## Prerequisites
 
-Requires the `denovo` environment with FRIGID installed. Run once:
-```bash
-bash .agents/skills/msms-denovo/scripts/setup_env.sh
-```
+Requires an interpreter with an editable ms-pred source checkout, including `data_scripts/forms`. If no suitable checkout exists, clone [coleygroup/ms-pred](https://github.com/coleygroup/ms-pred), read its `README.md` **Install & setup** section, and follow the environment instructions for that checkout. A prepared FRIGID environment can also supply its pinned ms-pred submodule; set it up by following `msms-denovo` and FRIGID's own README.
 
 ## Instructions
 
 ### Step 1 — Assign subformulae (de novo mode, no SMILES needed)
 
 ```bash
-pixi run --environment denovo python .agents/skills/msms-subformulae/scripts/run.py \
+python .agents/skills/msms-subformulae/scripts/run.py \
     --spectrum results/sample.ms \
     --formula C12H17NO3 \
     --adduct "[M+H]+" \
@@ -39,7 +35,7 @@ pixi run --environment denovo python .agents/skills/msms-subformulae/scripts/run
 ### Step 1b — Assign subformulae (known structure, more precise)
 
 ```bash
-pixi run --environment denovo python .agents/skills/msms-subformulae/scripts/run.py \
+python .agents/skills/msms-subformulae/scripts/run.py \
     --spectrum results/sample.ms \
     --formula C12H17NO3 \
     --adduct "[M+H]+" \

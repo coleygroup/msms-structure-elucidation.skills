@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- Copyright (c) 2026 Coley Group. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MS/MS fragment review</title>
+  <link rel="stylesheet" href="/assets/viewer.css">
+</head>
+<body>
+  <header>
+    <div><p class="eyebrow">MS/MS structure elucidation</p><h1>Interactive fragment review</h1>
+      <p id="summary">Loading retrieval result…</p></div>
+    <div class="header-actions"><span id="source-warning"></span><a href="/api/state" target="_blank" rel="noopener">Result data</a></div>
+  </header>
+  <main>
+    <aside><h2>Ranked candidates</h2><div id="candidate-list"></div></aside>
+    <section id="detail">
+      <div id="error" role="alert"></div>
+      <div class="panel candidate-top"><img id="structure" alt="Selected candidate structure"><div>
+        <h2 id="candidate-title"></h2><p id="candidate-meta"></p><code id="smiles"></code>
+        <div class="metrics" id="metrics"></div>
+      </div></div>
+      <div class="panel">
+        <div class="controls"><label>Experimental collision energy <select id="energy"></select></label>
+          <label>m/z minimum <input id="mz-min" type="number" min="0" step="any"></label>
+          <label>m/z maximum <input id="mz-max" type="number" min="0" step="any"></label>
+          <button id="zoom-apply" type="button">Apply zoom</button><button id="zoom-reset" type="button">Reset</button></div>
+        <p class="legend"><span class="pred-key">Predicted ↑</span><span class="exp-key">Experimental ↓</span><span class="match-key">Matched experimental peak</span></p>
+        <svg id="mirror" viewBox="0 0 1000 430" role="img" aria-label="Interactive mirror mass spectrum"></svg>
+        <p class="hint" id="energy-note"></p>
+      </div>
+      <div class="panel">
+        <div class="controls"><h3>Predicted fragments</h3><label>Top fragments <input id="top-fragments" type="range" min="0" max="20" value="5"></label><span id="top-count">5</span></div>
+        <div id="fragment-strip" class="fragment-strip"></div>
+        <p class="hint" id="annotation-note"></p>
+      </div>
+      <div class="panel review-layout">
+        <div><h3>Selected fragment</h3><div id="fragment-detail" class="fragment-detail">Click an annotated predicted peak or a matched experimental peak.</div></div>
+        <div><h3>Review on this page</h3>
+          <label>Candidate decision <select id="decision"><option value="unreviewed">Unreviewed</option><option value="keep">Keep</option><option value="uncertain">Uncertain</option><option value="reject">Reject</option></select></label>
+          <label>Candidate comment <textarea id="candidate-comment" maxlength="2000" rows="3"></textarea></label>
+          <label>Selected fragment comment <textarea id="fragment-comment" maxlength="2000" rows="3" disabled></textarea></label>
+          <button id="save-review" type="button">Save review</button><span id="save-status" role="status"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="/assets/viewer.js" defer></script>
+</body>
+</html>

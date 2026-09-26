@@ -134,7 +134,7 @@ def convert_to_ms(input_path: Path, output_dir: Path) -> None:
     try:
         from pyteomics import mzml
     except ImportError:
-        sys.exit("pyteomics not installed. Run: pixi install --environment preprocess")
+        sys.exit("pyteomics not installed. Run: python -m pip install pyteomics")
 
     # best scan per precursor m/z: highest total fragment intensity
     best: dict[float, dict] = {}

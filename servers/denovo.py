@@ -1,14 +1,15 @@
 """
 MCP server — de novo structure prediction.
 
-Runs in the `denovo` pixi environment.
+Runs in the `denovo` Python environment.
 
 Start manually:
-    pixi run --environment denovo python servers/denovo.py
+    python servers/denovo.py
 """
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from mcp.server import Server
@@ -40,7 +41,7 @@ async def list_tools() -> list[Tool]:
             ),
             inputSchema={
                 "type": "object",
-                "required": ["spectrum", "output"],
+                "required": ["spectrum", "formula", "subform_dir", "frigid_dir", "frigid_python", "mist_ckpt", "dlm_ckpt", "output"],
                 "properties": {
                     "spectrum": {
                         "type": "string",
@@ -50,15 +51,19 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Path for output JSON file with ranked candidate SMILES",
                     },
+                    "formula": {"type": "string", "description": "Neutral molecular formula"},
+                    "subform_dir": {"type": "string", "description": "Directory with default_subformulae"},
+                    "frigid_dir": {"type": "string", "description": "FRIGID checkout"},
+                    "frigid_python": {"type": "string", "description": "FRIGID environment Python"},
+                    "mist_ckpt": {"type": "string", "description": "MIST checkpoint path"},
                     "top_k": {
                         "type": "integer",
                         "description": "Number of candidate structures to generate (default: 10)",
                         "default": 10,
                     },
-                    "checkpoint": {
+                    "dlm_ckpt": {
                         "type": "string",
-                        "description": "Model checkpoint path (overrides config)",
-                        "default": "",
+                        "description": "DLM checkpoint path",
                     },
                 },
             },
@@ -72,21 +77,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         raise ValueError(f"Unknown tool: {name}")
 
     cmd = [
-        "pixi",
-        "run",
-        "--environment",
-        "denovo",
-        "python",
+        arguments["frigid_python"],
         str(SCRIPT),
         "--spectrum",
         arguments["spectrum"],
+        "--formula",
+        arguments["formula"],
+        "--subform-dir",
+        arguments["subform_dir"],
+        "--frigid-dir",
+        arguments["frigid_dir"],
+        "--frigid-python",
+        arguments["frigid_python"],
+        "--mist-ckpt",
+        arguments["mist_ckpt"],
+        "--dlm-ckpt",
+        arguments["dlm_ckpt"],
         "--output",
         arguments["output"],
-        "--top_k",
+        "--top-k",
         str(arguments.get("top_k", 10)),
     ]
-    if arguments.get("checkpoint"):
-        cmd += ["--checkpoint", arguments["checkpoint"]]
 
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
 

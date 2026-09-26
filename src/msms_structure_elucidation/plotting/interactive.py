@@ -1,5 +1,5 @@
 """Interactive plotly mass spectrum plotting, styled to match the static
-icicle-derived look in ``snowmageddon.plotting.mass_spectra``."""
+icicle-derived look in ``msms_structure_elucidation.plotting.mass_spectra``."""
 
 import base64
 import io
@@ -9,7 +9,7 @@ from typing import Callable, Optional, Sequence
 import numpy as np
 import plotly.graph_objects as go
 
-from snowmageddon.plotting.style import spec_colors
+from msms_structure_elucidation.plotting.style import spec_colors
 
 # plotly's color validator rejects 8-digit (RGBA) hex strings that pypalettes emits.
 _PRED_COLOR = spec_colors["pred_spec"][:7]

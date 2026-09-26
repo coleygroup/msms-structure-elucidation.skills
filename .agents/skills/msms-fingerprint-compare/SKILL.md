@@ -1,7 +1,6 @@
 ---
 name: msms-fingerprint-compare
 description: Compare MIST-predicted fingerprints against deterministic Morgan fingerprints for the same molecules via Tanimoto similarity.
-category: general
 ---
 
 # msms-fingerprint-compare
@@ -24,7 +23,7 @@ statistics, to evaluate MIST's fingerprint-prediction accuracy.
 
 ## Prerequisites
 
-Uses the `retrieval` pixi env (rdkit, h5py, numpy — no GPU).
+Uses the `retrieval` Python env (rdkit, h5py, numpy — no GPU).
 
 ## Instructions
 
@@ -50,7 +49,7 @@ Summary statistics (mean/median/min/max Tanimoto) are printed to stdout.
 
 ## Constraints
 
-- **Environment**: `retrieval` (`pixi run --environment retrieval python ...`)
+- **Environment**: `retrieval` (`python ...`)
 - **Fingerprint parameters**: 4096-bit, radius-2 Morgan — matches FRIGID's
   `fingerprint.bits`/`fingerprint.radius` defaults so both sides are
   comparable

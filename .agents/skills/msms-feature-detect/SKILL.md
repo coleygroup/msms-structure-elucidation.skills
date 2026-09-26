@@ -1,7 +1,6 @@
 ---
 name: msms-feature-detect
 description: Automatically detect LC-MS features in an mzML file and export per-feature averaged MS2 spectra, replacing manual precursor/scan picking.
-category: preprocessing
 ---
 
 # msms-feature-detect
@@ -98,7 +97,7 @@ This replaces the old manual notebook workflow (`msms-inspect/examples/explore.i
 
 ## Constraints
 
-- **Environment**: `preprocess` for the Python wrapper (`pixi run --environment preprocess python ...`). MZmine itself is a separately-installed Java binary, not a pixi dependency.
+- **Environment**: `preprocess` for the Python wrapper (`python ...`). MZmine itself is a separately-installed Java binary, not a an external environment manager dependency.
 - **Input format**: `.mzML` or `.mgf` — run `msms-preprocess` first if starting from `.raw`.
 - **`--ignore-parameter-warnings` is used internally.** The batch template was authored against MZmine 3 semantics; MZmine 4 warns that some parameter defaults changed (SIRIUS export intensity normalization, MS2 merge/select) and refuses to run without this flag. We verified end-to-end (see below) that the resulting defaults produce correct, sane output on the sample file — MZmine's own docs call this flag "not recommended," so if a run's output looks wrong, this is the first thing to revisit.
 - **Mixed polarity: pass `--polarity + ` and `--polarity -` (run twice), not `--polarity Any`.** Most instrument methods acquire both polarities in one `.raw`/`.mzML` file, and chromatogram building must not mix them — a compound's positive- and negative-mode signals are different physical events. The `Polarity` scan-filter parameter **must be the literal symbol `+`/`-`**: the word forms `Positive`/`Negative` and `POSITIVE`/`NEGATIVE` silently fall back to "Any" in this MZmine build with no error (verified — this was the actual bug in earlier testing, not a fundamental MZmine limitation). Verified end-to-end on `data/QE_SN01781L_150430-04.mzML`: `--polarity "+"` produced 314 features, all `IONMODE=POSITIVE`; `--polarity "-"` produced 200 features, all `IONMODE=NEGATIVE` — clean separation, no cross-contamination. Always cross-check the `IONMODE` field in the output `.mgf` after any change to this pipeline or MZmine version, since this class of bug fails silently.
