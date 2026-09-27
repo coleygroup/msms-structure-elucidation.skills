@@ -210,7 +210,7 @@ def candidate_payload(candidate: dict, adduct: str) -> dict:
         return payload
     engine = _fragment_engine(smiles)
     for alignment in candidate.get('energy_alignment', []):
-        ce = alignment['atlas_key']
+        ce = alignment.get('prediction_key') or alignment['atlas_key']
         spectrum = candidate.get('predicted_spectra', {}).get(ce) or []
         ids = candidate.get('predicted_fragment_ids', {}).get(ce) or []
         if len(ids) != len(spectrum):
@@ -235,12 +235,12 @@ def candidate_payload(candidate: dict, adduct: str) -> dict:
 def client_result(result: dict, top_k: int | None = None, max_exp_peaks: int | None = None) -> dict:
     """What the page needs: paired-energy predictions only, optionally fewer candidates/peaks."""
     keep = ('smiles', 'canonical_smiles', 'inchikey', 'formula', 'source', 'entropy_similarity',
-            'explained_intensity', 'energy_alignment', 'matched_peaks', 'review_key',
+            'explained_intensity', 'energy_alignment', 'matched_peaks', 'review_key', 'rank', 'ambiguity',
             'model_collision_energies_ev', 'model_instrument', 'model_name', 'model_version',
             'ms_pred_version', 'model_checkpoint')
     candidates = []
     for candidate in result['candidates'][:top_k]:
-        ces = [a['atlas_key'] for a in candidate.get('energy_alignment', [])]
+        ces = [a.get('prediction_key') or a['atlas_key'] for a in candidate.get('energy_alignment', [])]
         slim = {k: candidate[k] for k in keep if k in candidate}
         slim['predicted_spectra'] = {ce: candidate['predicted_spectra'][ce]
                                      for ce in ces if ce in candidate.get('predicted_spectra', {})}
@@ -256,7 +256,7 @@ def client_result(result: dict, top_k: int | None = None, max_exp_peaks: int | N
             spectra[ce] = [p for p in peaks if tuple(p) in top or (ce, round(float(p[0]), 5)) in matched]
     fields = ('input', 'parentmass', 'adduct', 'peaks', 'formula', 'formula_source', 'formula_hypotheses',
               'collision_unit', 'energy_mapping', 'warnings', 'library_structures', 'review_evidence', 'review',
-              'next_step')
+              'next_step', 'status', 'formula_results', 'instrument', 'mass_tolerance')
     return {**{k: result[k] for k in fields if k in result}, 'spectra': spectra, 'candidates': candidates}
 
 
@@ -275,10 +275,15 @@ def model_label(candidate: dict) -> str | None:
 
 
 def _outcome(result: dict) -> str:
+    """Viewer outcome from the retrieval status; results without a status use the older fields."""
     candidates = result.get('candidates') or []
     if candidates:
         return 'atlas' if str(candidates[0].get('source', '')).startswith('public') else 'model'
-    step = result.get('next_step')
+    step, status = result.get('next_step'), result.get('status')
+    if status:
+        return {'needs_formula': 'no-pubchem-formula' if step == 'review-frigid' else 'no-formula',
+                'no_atlas_coverage': 'not-in-atlas', 'no_candidates': 'no-candidates',
+                'blocked_model_assets': 'blocked-model-assets'}.get(status, 'atlas-failed')
     if not result.get('formula'):
         return 'no-pubchem-formula' if step == 'review-frigid' else 'no-formula'
     if step == 'retry-retrieval' or any(str(w).startswith('Atlas retrieval failed') for w in result.get('warnings', [])):

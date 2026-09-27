@@ -5,7 +5,6 @@ import argparse
 import base64
 import json
 import math
-import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -62,6 +61,8 @@ def _experimental_spectra(spectrum: str, unit: str):
     for key, spec in spectra.items():
         raw = float(key)
         ev = common.nce_to_ev(raw, precursor) if unit == 'NCE' else raw
+        if not math.isfinite(float(ev)) or int(round(float(ev))) <= 0:
+            raise ValueError(f'Invalid experimental collision energy: {raw} {unit}')
         ev_key = str(round(float(ev), 8))
         if ev_key in mapped:
             raise ValueError(f'Experimental energy labels collapse to {ev_key} eV')
@@ -71,19 +72,20 @@ def _experimental_spectra(spectrum: str, unit: str):
 
 
 def align_energies(experimental: dict, predicted: dict, source: dict,
-                   unit: str, max_gap_ev: float = 2.0) -> list[dict]:
-    """Match every experimental energy to its nearest available eV spectrum."""
+                   unit: str) -> list[dict]:
+    """Match only equal integer eV labels after rounding both sides."""
     matched = []
+    indexed = {int(round(float(key))): key for key in predicted.keys()}
     for exp_key in sorted(experimental.keys(), key=float):
         ev = float(exp_key)
-        if not predicted.keys():
-            break
-        atlas_key = min(predicted.keys(), key=lambda key: (abs(ev-float(key)), float(key)))
+        model_ev = int(round(ev))
+        if model_ev not in indexed:
+            continue
+        atlas_key = indexed[model_ev]
         atlas_ev = float(atlas_key)
         gap = abs(ev-atlas_ev)
-        if gap > max_gap_ev:
-            continue
         matched.append({'experimental_key': exp_key, 'atlas_key': atlas_key,
+            'prediction_key': atlas_key, 'model_energy_ev': model_ev,
             'input_value': source[exp_key], 'input_unit': unit,
             'experimental_ev': ev, 'atlas_ev': atlas_ev, 'delta_ev': gap})
     return matched
@@ -108,6 +110,27 @@ def _score(experimental, predicted, alignment, precursor):
         pair['entropy_similarity'] = score
         scores.append(score)
     return sum(scores) / len(scores)
+
+
+def sort_candidates(candidates: list[dict], tie_band: float = 0.03) -> list[dict]:
+    """Keep entropy primary and use coverage within narrow score bands."""
+    ordered = sorted(candidates, key=lambda c: c['entropy_similarity'], reverse=True)
+    result = []
+    while ordered:
+        anchor = ordered[0]['entropy_similarity']
+        band = [c for c in ordered if anchor - c['entropy_similarity'] <= tie_band]
+        ordered = ordered[len(band):]
+        result.extend(sorted(band, key=lambda c: (c['explained_intensity'], c['entropy_similarity']), reverse=True))
+    for index, a in enumerate(result):
+        a['rank'] = index + 1
+        a['ambiguity'] = []
+        a_peaks = {(p['ce'], round(p['mz'], 4)) for p in a.get('matched_peaks', [])}
+        for b in result[:index]:
+            b_peaks = {(p['ce'], round(p['mz'], 4)) for p in b.get('matched_peaks', [])}
+            if a.get('formula') == b.get('formula') and a_peaks == b_peaks and abs(a['entropy_similarity'] - b['entropy_similarity']) <= tie_band:
+                a['ambiguity'].append(f"No diagnostic matched peaks versus rank {b['rank']}; positional isomers may be indistinguishable")
+                break
+    return result
 
 
 def _explained(experimental, predicted, alignment, ppm=10):
@@ -161,11 +184,16 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
                                      intens=peaks[:, 1], root_canonical_smiles=smiles))
         info[key] = meta
     results = []
+    expected_energies = set(model_collision_energies_ev(experimental))
+    missing_energies = set()
+    errors = []
     for key, spectra in grouped.items():
         try:
             predicted = CompositeMassSpec(spectra)
             alignment = align_energies(experimental, predicted, source, experimental_unit)
-            if not alignment:
+            paired = {pair['model_energy_ev'] for pair in alignment}
+            missing_energies.update(expected_energies - paired)
+            if len(alignment) != len(experimental):
                 continue
             similarity = _score(experimental, predicted, alignment, precursor)
             if not math.isfinite(float(similarity)):
@@ -178,9 +206,12 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
                 'energy_alignment': alignment, 'matched_peaks': matched,
                 'predicted_spectra': _serial_spec(predicted),
                 'predicted_fragment_ids': _serial_fragment_ids(predicted, fragment_ids[key])})
-        except (ValueError, AssertionError, KeyError, ZeroDivisionError):
+        except (ValueError, AssertionError, KeyError, ZeroDivisionError) as exc:
+            errors.append(str(exc))
             continue
-    results.sort(key=lambda c: (c['entropy_similarity'], c['explained_intensity']), reverse=True)
+    if grouped and not results and not missing_energies and errors:
+        raise RuntimeError(f'All {len(grouped)} atlas structures failed scoring; first error: {errors[0]}')
+    results = sort_candidates(results)
     top = results[:top_k]
     from rdkit import Chem
     for candidate in top:
@@ -188,7 +219,8 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
         mol = Chem.MolFromSmiles(candidate['smiles'])
         candidate['canonical_smiles'] = Chem.MolToSmiles(mol) if mol else candidate['smiles']
     return {'library_structures': len(grouped), 'scored_structures': len(results),
-            'candidates': top}
+            'candidates': top, 'atlas_energies_ev': sorted({int(round(float(s.collision_energy))) for spectra in grouped.values() for s in spectra}),
+            'missing_energies_ev': sorted(missing_energies)}
 
 
 def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: int = 3,
@@ -254,53 +286,117 @@ def validate_smiles(smiles: list[str], formula: str) -> list[dict]:
     return out
 
 
+def atlas_smiles(mgf: str) -> list[str]:
+    """Return every distinct atlas structure for a formula, without a candidate cap."""
+    from ms_pred import common
+    seen = set()
+    result = []
+    for meta, _ in common.parse_spectra_mgf(mgf):
+        smiles = meta.get('SMILES')
+        key = meta.get('INCHIKEY') or smiles
+        if smiles and key not in seen:
+            seen.add(key)
+            result.append(smiles)
+    return result
+
+
+def atlas_info(mgf: str, expected_energies: list[int], spectrum: str, formula: str,
+               experimental_unit: str) -> dict:
+    """Scan atlas coverage without retaining its spectra in memory."""
+    from ms_pred import common
+    metadata, _, _ = _experimental_spectra(spectrum, experimental_unit)
+    precursor = float(metadata['parentmass'])
+    expected_mass = common.formula_mass(formula) + common.ion2mass[metadata.get('ionization', '[M+H]+')]
+    if abs(expected_mass - precursor) > max(0.01, precursor * 20e-6):
+        raise ValueError(f'Formula/adduct precursor mismatch: {formula} predicts {expected_mass:.4f}, observed {precursor:.4f}')
+    by_structure = {}
+    for meta, _ in common.parse_spectra_mgf(mgf):
+        smiles = meta.get('SMILES')
+        label = meta.get('COLLISION_ENERGY')
+        if not smiles or not label:
+            continue
+        try:
+            ev = int(round(float(str(label).split()[0])))
+        except ValueError:
+            continue
+        key = meta.get('INCHIKEY') or smiles
+        if key not in by_structure:
+            by_structure[key] = [smiles, set()]
+        by_structure[key][1].add(ev)
+    expected = set(expected_energies)
+    missing = set()
+    for _, energies in by_structure.values():
+        missing.update(expected - energies)
+    return {'library_structures': len(by_structure),
+        'missing_energies_ev': sorted(missing),
+        'smiles': [row[0] for row in by_structure.values()]}
+
+
+def _check_glacier_features(checkpoint: str) -> None:
+    """Reject known incompatible atom feature widths before costly inference."""
+    import torch
+    from ms_pred.glacier.dataset import TreeProcessor
+    raw = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    hparams = raw.get('hyper_parameters', {})
+    expected = hparams.get('node_feats')
+    if expected is None:
+        raise RuntimeError('GLACIER checkpoint has no node_feats metadata; compatibility cannot be verified')
+    processor = TreeProcessor(root_encode=hparams.get('root_encode') or 'graphormer',
+        embed_elem_group=hparams.get('embed_elem_group', False),
+        pe_embed_k=hparams.get('pe_embed_k', 0),
+        multi_hop_max_dist=hparams.get('multi_hop_max_dist', 5))
+    actual = processor.get_node_feats()
+    if int(expected) != actual:
+        raise RuntimeError(f'GLACIER checkpoint expects {expected} atom features, but this ms-pred checkout produces {actual}. Use a compatible ms-pred commit or checkpoint.')
+
+
 def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              checkpoint: str | None, gen_checkpoint: str | None,
              inten_checkpoint: str | None, output_dir: str,
-             experimental_unit: str) -> list[dict]:
+             experimental_unit: str, instrument: str | None = None,
+             cuda_devices: str | None = None, batch_size: int = 1) -> list[dict]:
     """Run ms-pred only for structures unavailable in the precomputed atlas."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
-    # GPU ids for ms-pred (e.g. "0"); unset runs on CPU.
-    cuda_devices = os.environ.get('MSMS_CUDA_DEVICES') or None
-    device_kwargs = (dict(cuda_devices=cuda_devices, num_gpu_workers=1, num_cpu_workers=4, batch_size=8)
-                     if cuda_devices else dict(cuda_devices=None, num_gpu_workers=1, num_cpu_workers=1, batch_size=1))
-    instrument = 'QTOF' if 'tof' in metadata.get('instrumentation', '').lower() else 'Orbitrap'
-    # ms-pred launches its prediction scripts by paths relative to the checkout root.
-    import ms_pred
-    package_file = getattr(ms_pred, '__file__', None)
-    checkout = Path(package_file).resolve().parents[2] if package_file else None
-    if checkout and (checkout / 'src' / 'ms_pred').is_dir():
-        os.chdir(checkout)
     if model == 'glacier':
         if not checkpoint or not Path(checkpoint).is_file():
             raise FileNotFoundError('GLACIER checkpoint required; see ms-pred README for public MassSpecGym weights or provide licensed NIST weights')
-        from ms_pred.glacier.glacier_elucidation import glacier_prediction, load_pred_spec
+        _check_glacier_features(checkpoint)
+        from ms_pred.glacier.glacier_elucidation import glacier_prediction
         prediction = glacier_prediction(candidate_smiles=smiles, collision_energies=model_energies,
             nce=False, adduct=metadata.get('ionization', '[M+H]+'),
-            instrument=instrument, python_path=sys.executable, ckpt=checkpoint, **device_kwargs)
+            instrument=instrument, python_path=sys.executable, ckpt=checkpoint,
+            cuda_devices=cuda_devices, num_gpu_workers=1, num_cpu_workers=1, batch_size=batch_size)
     else:
         if not gen_checkpoint or not inten_checkpoint or not Path(gen_checkpoint).is_file() or not Path(inten_checkpoint).is_file():
             raise FileNotFoundError('ICEBERG generation and intensity checkpoints required; see ms-pred README for public MassSpecGym weights')
-        from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction, load_pred_spec
+        from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction
         prediction = iceberg_prediction(candidate_smiles=smiles, collision_energies=model_energies,
             nce=False, adduct=metadata.get('ionization', '[M+H]+'),
             instrument=instrument, python_path=sys.executable, gen_ckpt=gen_checkpoint,
-            inten_ckpt=inten_checkpoint, **device_kwargs)
-    save_dir = prediction[0]
+            inten_ckpt=inten_checkpoint, cuda_devices=cuda_devices, num_gpu_workers=1,
+            num_cpu_workers=1, batch_size=batch_size)
+    save_dir = Path(prediction[0])
+    marker = save_dir / f'{model}_run_successful'
+    if not marker.is_file() or not list(save_dir.glob('preds*.hdf5')):
+        raise RuntimeError(f'{model.upper()} subprocess failed or produced no spectra at {save_dir}; check model logs and checkpoint compatibility')
+    import ms_pred
+    from ms_pred import common
     try:  # model versions are tracked separately from the ms-pred package version
         from ms_pred.model_registry import MODEL_REGISTRY
         model_version = MODEL_REGISTRY.get(model, {}).get('version')
     except ImportError:
         model_version = None
     ms_pred_version = getattr(ms_pred, '__version__', None)
-    predicted_smiles, predicted_spectra = load_pred_spec(save_dir)
+    pred_db = common.PredSpecDB(save_dir / 'preds.hdf5')
     results = []
-    for smi, pred in zip(predicted_smiles, predicted_spectra):
-        try:
+    try:
+        for item in pred_db.get_all_specs():
+            pred = item[-1]
+            smi = pred.root_canonical_smiles
             alignment = align_energies(experimental, pred, source, experimental_unit)
-            if not alignment:
-                continue
+            if len(alignment) != len(experimental):
+                raise RuntimeError(f'{model.upper()} output for {smi} lacks one or more requested energies')
             score = _score(experimental, pred, alignment, float(metadata['parentmass']))
             explained, matched = _explained(experimental, pred, alignment)
             results.append({'smiles': smi, 'formula': formula, 'source': model.upper(),
@@ -313,14 +409,16 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
                 'model_name': model.upper(), 'model_version': model_version, 'ms_pred_version': ms_pred_version,
                 'model_checkpoint': checkpoint if model == 'glacier' else [gen_checkpoint, inten_checkpoint],
                 'structure_image': _structure_image(smi)})
-        except ValueError:
-            continue
-    return results
+    finally:
+        pred_db.close()
+    if len(results) != len(smiles):
+        raise RuntimeError(f'{model.upper()} returned {len(results)} spectra for {len(smiles)} structures')
+    return sort_candidates(results)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['rank', 'formula', 'validate', 'simulate'])
+    parser.add_argument('action', choices=['rank', 'formula', 'validate', 'simulate', 'atlas-smiles', 'atlas-info'])
     parser.add_argument('--spectrum')
     parser.add_argument('--mgf')
     parser.add_argument('--formula')
@@ -332,6 +430,10 @@ def main():
     parser.add_argument('--inten-checkpoint')
     parser.add_argument('--output-dir')
     parser.add_argument('--experimental-unit', choices=['NCE', 'eV'])
+    parser.add_argument('--instrument')
+    parser.add_argument('--cuda-devices')
+    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--energies')
     parser.add_argument('--ms1-ppm', type=float, default=5.0)
     parser.add_argument('--ms2-ppm', type=float, default=10.0)
     args = parser.parse_args()
@@ -339,6 +441,11 @@ def main():
         parser.error('--experimental-unit is required for experimental spectra')
     if args.action == 'rank':
         result = rank(args.spectrum, args.mgf, args.formula, args.top_k, args.experimental_unit)
+    elif args.action == 'atlas-smiles':
+        result = atlas_smiles(args.mgf)
+    elif args.action == 'atlas-info':
+        result = atlas_info(args.mgf, [int(value) for value in args.energies.split(',')],
+            args.spectrum, args.formula, args.experimental_unit)
     elif args.action == 'formula':
         result = formula_candidates(args.spectrum, args.experimental_unit,
                                     ms1_ppm=args.ms1_ppm, ms2_ppm=args.ms2_ppm)
@@ -347,7 +454,8 @@ def main():
     else:
         result = simulate(args.spectrum, json.loads(Path(args.smiles_json).read_text()),
             args.formula, args.model, args.checkpoint, args.gen_checkpoint,
-            args.inten_checkpoint, args.output_dir, args.experimental_unit)
+            args.inten_checkpoint, args.output_dir, args.experimental_unit,
+            args.instrument, args.cuda_devices, args.batch_size)
     print('RESULT_JSON=' + json.dumps(result, allow_nan=False))
 
 if __name__ == '__main__':

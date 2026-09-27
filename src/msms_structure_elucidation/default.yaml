@@ -1,14 +1,14 @@
-# Shared defaults. Paths are relative to this file; override with CLI or environment.
+# Packaged snapshot of configs/default.yaml for installations without a checkout.
 models:
   simulator:
-    ms_pred_src: ''  # clone ms-pred, then set this checkout path
+    ms_pred_src: ''
     model: iceberg
-    glacier_ckpt: ''  # Public MassSpecGym weights: see ms-pred README; licensed NIST weights can be supplied locally
-    gen_ckpt: ''      # ICEBERG generator, when --model iceberg
-    inten_ckpt: ''    # ICEBERG intensity, when --model iceberg
+    glacier_ckpt: ''
+    gen_ckpt: ''
+    inten_ckpt: ''
     collision_energies: [10, 20, 30, 40, 50]
     adduct: '[M+H]+'
-    instrument: null  # use >instrumentation in .ms or --instrument
+    instrument: null
     cuda_devices: null
     batch_size: 1
     shard_size: 256
@@ -26,7 +26,7 @@ models:
     iceberg_gen_ckpt: ''
     iceberg_inten_ckpt: ''
     top_k: 10
-    num_rounds: 0   # FRIGID-base; set >0 when ICEBERG weights and GPU are available
+    num_rounds: 0
     batch_size: 128
     cuda_devices: null
 preprocessing:
