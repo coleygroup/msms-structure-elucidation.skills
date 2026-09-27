@@ -5,6 +5,7 @@ import argparse
 import base64
 import json
 import math
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -190,8 +191,8 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
             'candidates': top}
 
 
-def formula_candidates(spectrum: str, experimental_unit: str,
-                       max_candidates: int = 3) -> list[dict]:
+def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: int = 3,
+                       ms1_ppm: float = 5.0, ms2_ppm: float = 10.0) -> list[dict]:
     """Use ms-pred's MSBuddy bridge, retaining evidence that formula is inferred."""
     from ms_pred import common
     metadata, _ = common.parse_spectra(spectrum)
@@ -212,7 +213,7 @@ def formula_candidates(spectrum: str, experimental_unit: str,
         try:
             import msbuddy
             # Use MSBuddy's own annotated MGF importer and formula ranking.
-            engine = msbuddy.Msbuddy()
+            engine = msbuddy.Msbuddy(msbuddy.MsbuddyConfig(ppm=True, ms1_tol=ms1_ppm, ms2_tol=ms2_ppm))
             engine.load_mgf(str(mgf))
             engine.annotate_formula()
             formulas = []
@@ -244,7 +245,12 @@ def validate_smiles(smiles: list[str], formula: str) -> list[dict]:
             continue
         seen.add(canonical)
         found = rdMolDescriptors.CalcMolFormula(mol)
-        out.append({'smiles': canonical, 'formula': found, 'formula_match': found == formula})
+        try:  # connectivity block of the InChIKey: matches atlas entries stored without stereochemistry
+            connectivity = Chem.MolToInchiKey(mol)[:14] or None
+        except Exception:
+            connectivity = None
+        out.append({'smiles': canonical, 'formula': found, 'formula_match': found == formula,
+                    'connectivity': connectivity})
     return out
 
 
@@ -255,24 +261,39 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
     """Run ms-pred only for structures unavailable in the precomputed atlas."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
+    # GPU ids for ms-pred (e.g. "0"); unset runs on CPU.
+    cuda_devices = os.environ.get('MSMS_CUDA_DEVICES') or None
+    device_kwargs = (dict(cuda_devices=cuda_devices, num_gpu_workers=1, num_cpu_workers=4, batch_size=8)
+                     if cuda_devices else dict(cuda_devices=None, num_gpu_workers=1, num_cpu_workers=1, batch_size=1))
+    instrument = 'QTOF' if 'tof' in metadata.get('instrumentation', '').lower() else 'Orbitrap'
+    # ms-pred launches its prediction scripts by paths relative to the checkout root.
+    import ms_pred
+    package_file = getattr(ms_pred, '__file__', None)
+    checkout = Path(package_file).resolve().parents[2] if package_file else None
+    if checkout and (checkout / 'src' / 'ms_pred').is_dir():
+        os.chdir(checkout)
     if model == 'glacier':
         if not checkpoint or not Path(checkpoint).is_file():
             raise FileNotFoundError('GLACIER checkpoint required; see ms-pred README for public MassSpecGym weights or provide licensed NIST weights')
         from ms_pred.glacier.glacier_elucidation import glacier_prediction, load_pred_spec
         prediction = glacier_prediction(candidate_smiles=smiles, collision_energies=model_energies,
             nce=False, adduct=metadata.get('ionization', '[M+H]+'),
-            instrument='Orbitrap', python_path=sys.executable, ckpt=checkpoint,
-            cuda_devices=None, num_gpu_workers=1, num_cpu_workers=1, batch_size=1)
+            instrument=instrument, python_path=sys.executable, ckpt=checkpoint, **device_kwargs)
     else:
         if not gen_checkpoint or not inten_checkpoint or not Path(gen_checkpoint).is_file() or not Path(inten_checkpoint).is_file():
             raise FileNotFoundError('ICEBERG generation and intensity checkpoints required; see ms-pred README for public MassSpecGym weights')
         from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction, load_pred_spec
         prediction = iceberg_prediction(candidate_smiles=smiles, collision_energies=model_energies,
             nce=False, adduct=metadata.get('ionization', '[M+H]+'),
-            instrument='Orbitrap', python_path=sys.executable, gen_ckpt=gen_checkpoint,
-            inten_ckpt=inten_checkpoint, cuda_devices=None, num_gpu_workers=1,
-            num_cpu_workers=1, batch_size=1)
+            instrument=instrument, python_path=sys.executable, gen_ckpt=gen_checkpoint,
+            inten_ckpt=inten_checkpoint, **device_kwargs)
     save_dir = prediction[0]
+    try:  # model versions are tracked separately from the ms-pred package version
+        from ms_pred.model_registry import MODEL_REGISTRY
+        model_version = MODEL_REGISTRY.get(model, {}).get('version')
+    except ImportError:
+        model_version = None
+    ms_pred_version = getattr(ms_pred, '__version__', None)
     predicted_smiles, predicted_spectra = load_pred_spec(save_dir)
     results = []
     for smi, pred in zip(predicted_smiles, predicted_spectra):
@@ -288,7 +309,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
                 'energy_alignment': alignment, 'matched_peaks': matched,
                 'predicted_spectra': _serial_spec(pred),
                 'predicted_fragment_ids': _serial_fragment_ids(pred),
-                'model_collision_energies_ev': model_energies,
+                'model_collision_energies_ev': model_energies, 'model_instrument': instrument,
+                'model_name': model.upper(), 'model_version': model_version, 'ms_pred_version': ms_pred_version,
                 'model_checkpoint': checkpoint if model == 'glacier' else [gen_checkpoint, inten_checkpoint],
                 'structure_image': _structure_image(smi)})
         except ValueError:
@@ -310,13 +332,16 @@ def main():
     parser.add_argument('--inten-checkpoint')
     parser.add_argument('--output-dir')
     parser.add_argument('--experimental-unit', choices=['NCE', 'eV'])
+    parser.add_argument('--ms1-ppm', type=float, default=5.0)
+    parser.add_argument('--ms2-ppm', type=float, default=10.0)
     args = parser.parse_args()
     if args.action in ('rank', 'formula', 'simulate') and not args.experimental_unit:
         parser.error('--experimental-unit is required for experimental spectra')
     if args.action == 'rank':
         result = rank(args.spectrum, args.mgf, args.formula, args.top_k, args.experimental_unit)
     elif args.action == 'formula':
-        result = formula_candidates(args.spectrum, args.experimental_unit)
+        result = formula_candidates(args.spectrum, args.experimental_unit,
+                                    ms1_ppm=args.ms1_ppm, ms2_ppm=args.ms2_ppm)
     elif args.action == 'validate':
         result = validate_smiles(json.loads(Path(args.smiles_json).read_text()), args.formula)
     else:

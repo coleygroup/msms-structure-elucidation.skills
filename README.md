@@ -43,6 +43,8 @@ After retrieval or candidate review, open the separate `msms-visualize` skill:
 ```bash
 "${MS_PRED_PYTHON:-python}" -m pip install -e '.[visualize]'
 msms-structure-elucidation visualize --result results/sample/retrieval.json
+# Several unknowns: one page with a searchable list of all of them
+msms-structure-elucidation visualize --result results/*/retrieval.json
 ```
 
-Open the printed localhost URL to select candidates and collision energies, inspect annotated predicted fragments against experimental peaks, and save candidate decisions and fragment comments on the webpage. Notes are written to `review_notes.json` beside the result; `retrieval.json` remains the computed record. The viewer uses cached atlas predictions and makes no model or network calls. Existing results can recover fragment IDs from their cached atlas MGF; pass `--atlas-mgf` if that file was moved.
+Open the printed localhost URL for an overview of every unknown and a review workspace: hover or click peaks in the mirror plot to highlight predicted fragments on the structure, compare candidates, and record decisions and fragment comments, which autosave. Add `--export review_report.html` to write one self-contained read-only report instead of serving. Notes are written to `review_notes.json` beside the result; `retrieval.json` remains the computed record. The viewer uses cached atlas predictions and makes no model or network calls. Existing results can recover fragment IDs from their cached atlas MGF; pass `--atlas-mgf` if that file was moved.
