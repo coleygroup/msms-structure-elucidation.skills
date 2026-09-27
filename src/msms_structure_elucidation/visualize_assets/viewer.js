@@ -7,7 +7,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (v, d) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d));
 const pct = v => (v == null ? '—' : `${(100 * Number(v)).toFixed(0)}%`);
-const OUTCOME = { atlas: 'ICEBERG Atlas', model: 'Model prediction', 'no-energy-pair': 'No Atlas energy within 2 eV',
+const OUTCOME = { atlas: 'ICEBERG Atlas', model: 'Model prediction', 'no-energy-pair': 'No exact Atlas energy',
   'not-in-atlas': 'Not in ICEBERG Atlas', 'atlas-failed': 'Atlas retrieval failed', 'no-formula': 'No formula',
   'no-pubchem-formula': 'No PubChem formula', 'no-candidates': 'No comparable candidates',
   'blocked-model-assets': 'Model assets missing' };
@@ -284,7 +284,7 @@ function renderEmpty() {
     'no-formula': 'MSBuddy proposed no molecular formula and PubChem was not searched. Rerun retrieval without <code>--no-pubchem</code> so formulas of PubChem structures matching the precursor mass are tried.',
     'no-pubchem-formula': 'Neither MSBuddy nor a PubChem mass search found a formula for this precursor. Review the spectrum (adduct, in-source fragment, isotope, noise) and decide whether to generate structures de novo with FRIGID (<code>msms-denovo</code>).',
     'not-in-atlas': `${fhtml(res.formula)} has PubChem structures but no ICEBERG Atlas entry. Predict them with ICEBERG:<br><code>${cmd('pubchem')}</code>`,
-    'no-energy-pair': `The ICEBERG Atlas has ${res.library_structures} structures for ${fhtml(res.formula)}, but none at a collision energy within 2 eV of the experiment. Predict them at the experimental energy with ICEBERG:<br><code>${cmd('atlas')}</code>`,
+    'no-energy-pair': `The ICEBERG Atlas has ${res.library_structures} structures for ${fhtml(res.formula)}, but an exact rounded-eV energy is missing. Rerun retrieval with an ms-pred checkout and ICEBERG checkpoints to predict every atlas structure at all supplied energies.`,
     'atlas-failed': 'Retrieval did not complete (download, ranking or model error). Check the error in retrieval.json and rerun retrieval for this unknown.',
     'no-candidates': 'Atlas or model predictions were available but none could be compared with this spectrum. Check the formula results below.',
     'blocked-model-assets': 'The ICEBERG Atlas lacks an exact collision energy for this formula, so every atlas structure must be predicted with local ICEBERG, but the ms-pred checkout or checkpoints were not available. Set <code>--ms-pred-dir</code> and the ICEBERG checkpoints (or <code>configs/default.yaml</code>) and rerun retrieval.',
@@ -876,6 +876,10 @@ async function init() {
     }
     if (DEMO()) {
       $('demo-note').hidden = false;
+      $('demo-guide').hidden = false;
+      for (const [id, url] of [['demo-source', STATIC.demo_source_url], ['demo-install', STATIC.demo_install_url]]) {
+        if (url && /^https:\/\//.test(url)) { $(id).href = url; $(id).hidden = false; }
+      }
       const store = demoStore();  // reflect this browser's demo reviews in the overview
       for (const [i, notes] of Object.entries(store)) {
         if (!S.index[i]) continue;

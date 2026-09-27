@@ -1,0 +1,30 @@
+{
+  "source_spectrum": "https://github.com/coleygroup/ms-pred/blob/main/data/exp_specs/clinical/plasma_unknown_583.ms",
+  "source_sha256_lf": "54a2b505a2a9e3918d0dcf2a4ae25c638b396bdc29d9087db0f5b8955454c445",
+  "user_confirmed_collision_unit": "NCE",
+  "input_energies_nce": [
+    10,
+    20,
+    30,
+    40,
+    50
+  ],
+  "model_energies_ev": [
+    11,
+    22,
+    32,
+    43,
+    54
+  ],
+  "formula_source": "MSBuddy inferred",
+  "formula_hypotheses": [
+    "C27H56NO7P",
+    "C29H51N3O6",
+    "C30H47N7O2"
+  ],
+  "candidate_source": "public ICEBERG 2.1 PubChem atlas",
+  "scored_structures": 158,
+  "ranked_candidates": 20,
+  "demo_reviews": "browser localStorage only",
+  "html_sha256": "8f24a5a413b306749cb3ee73d9f2e2bc561ce59ded074f97dd04ce69552975c6"
+}
