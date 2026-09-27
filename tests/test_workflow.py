@@ -47,6 +47,150 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('Download PNG', report)
             self.assertIn('50.0', report)
 
+    def _run_args(self, root, **extra):
+        spec = root / 'query.ms'
+        spec.write_text('>compound unknown\n>parentmass 17.0386\n>ionization [M+H]+\n\n>collision 20 eV\n15.0 12\n')
+        mgf = root / 'library.mgf'
+        mgf.write_text('BEGIN IONS\nSMILES=C\nCOLLISION_ENERGY=30\n15.0 12\nEND IONS\n')
+        args = dict(input=str(spec), output_dir=str(root / 'output'), formula=None, ms_pred_python='python',
+                    atlas_mgf=str(mgf), atlas_url='https://example.test', top_k=10, no_report=True,
+                    collision_unit='eV', ms1_ppm=None, ms2_ppm=None, formula_elements='CHNOPS', no_pubchem=False)
+        args.update(extra)
+        return SimpleNamespace(**args)
+
+    def test_pubchem_formula_fallback_when_msbuddy_finds_none(self):
+        from msms_structure_elucidation import pubchem
+        found = [{'formula': f, 'structures': n, 'ppm': 1.2, 'source': 'PubChem mass match (±10 ppm, CHNOPS)'}
+                 for f, n in (('CH4', 3), ('C2H4', 1))]
+        searched = []
+        def fake(python, action, **kw):
+            if action == 'formula':
+                return []
+            if action == 'atlas-info':
+                searched.append(kw['formula'])
+                return {'library_structures': 1, 'missing_energies_ev': [], 'smiles': ['C']}
+            return {'library_structures': 1, 'scored_structures': 0, 'candidates': []}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (patch.object(cli, 'worker', side_effect=fake), patch.object(cli, 'download_mgf', return_value=root / 'x.mgf'),
+                  patch.object(pubchem, 'formulas_by_mass', return_value=found) as search):
+                self.assertEqual(cli.run(self._run_args(root, atlas_mgf=None)), 0)
+            self.assertEqual(search.call_args.args[2], 10.0)  # unknown instrument: Q-TOF tolerance
+            self.assertEqual(searched, ['CH4', 'C2H4'])
+            data = json.loads((root / 'output/retrieval.json').read_text())
+            self.assertTrue(data['formula_source'].startswith('PubChem mass match'))
+            self.assertEqual(data['status'], 'no_candidates')
+
+    def test_mass_tolerance_follows_instrument(self):
+        from msms_structure_elucidation.spectrum import mass_tolerance
+        self.assertEqual(mass_tolerance('Bruker maXis impact Q-TOF (LCMS)')['ms1_ppm'], 10.0)
+        self.assertEqual(mass_tolerance('QTOF')['ms2_ppm'], 20.0)
+        self.assertEqual(mass_tolerance('Orbitrap')['ms1_ppm'], 5.0)
+        self.assertEqual(mass_tolerance('IT-FT')['ms2_ppm'], 10.0)
+        self.assertEqual(mass_tolerance(None), {'instrument': 'unknown', 'ms1_ppm': 10.0, 'ms2_ppm': 20.0})
+        from msms_structure_elucidation import pubchem
+        calls = []
+        def fake(python, action, **kw):
+            calls.append((action, kw.get('ms1_ppm'), kw.get('ms2_ppm')))
+            return []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self._run_args(root)
+            spec = Path(args.input)
+            spec.write_text(spec.read_text().replace('>ionization', '>instrumentation Orbitrap (LCMS)\n>ionization'))
+            with (patch.object(cli, 'worker', side_effect=fake),
+                  patch.object(pubchem, 'formulas_by_mass', return_value=[]) as search):
+                cli.run(args)
+            self.assertEqual(calls, [('formula', 5.0, 10.0)])
+            self.assertEqual(search.call_args.args[2], 5.0)
+            data = json.loads((root / 'output/retrieval.json').read_text())
+            self.assertEqual(data['mass_tolerance'], {'instrument': 'Orbitrap', 'ms1_ppm': 5.0, 'ms2_ppm': 10.0,
+                                                      'source': 'instrument default'})
+            calls.clear()
+            with (patch.object(cli, 'worker', side_effect=fake), patch.object(pubchem, 'formulas_by_mass', return_value=[])):
+                cli.run(self._run_args(root, ms1_ppm=3.0))
+            self.assertEqual(calls, [('formula', 3.0, 20.0)])
+
+    def test_no_pubchem_formula_asks_for_review_and_frigid(self):
+        from msms_structure_elucidation import pubchem
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (patch.object(cli, 'worker', return_value=[]), patch.object(pubchem, 'formulas_by_mass', return_value=[])):
+                self.assertEqual(cli.run(self._run_args(root)), 0)
+            data = json.loads((root / 'output/retrieval.json').read_text())
+            self.assertEqual((data['status'], data['next_step']), ('needs_formula', 'review-frigid'))
+            self.assertTrue(any('FRIGID' in w for w in data['warnings']))
+
+    def test_formula_missing_from_atlas_points_to_pubchem_structures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(cli, 'download_mgf', side_effect=AtlasNoEntry('no public entry')):
+                self.assertEqual(cli.run(self._run_args(root, formula='CH4', atlas_mgf=None)), 0)
+            data = json.loads((root / 'output/retrieval.json').read_text())
+            self.assertEqual((data['status'], data['next_step']), ('no_atlas_coverage', 'iceberg-pubchem'))
+            self.assertTrue(any('--proposals pubchem' in w for w in data['warnings']))
+
+    def test_review_reuses_atlas_entries_regardless_of_stereochemistry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mgf = root / 'atlas.mgf'
+            mgf.write_text('BEGIN IONS\nSMILES=CC(N)C(=O)O\nEND IONS\n')
+            result = root / 'retrieval.json'
+            result.write_text(json.dumps({'input': str(root / 'q.ms'), 'formula': 'C3H7NO2', 'collision_unit': 'eV',
+                                          'atlas_mgf': str(mgf), 'candidates': [], 'warnings': [],
+                                          'next_step': 'iceberg-pubchem'}))
+            proposals = root / 'p.json'
+            proposals.write_text(json.dumps(['C[C@H](N)C(=O)O', 'NCCC(=O)O']))
+            atlas_hit = {'smiles': 'CC(N)C(=O)O', 'inchikey': 'QNAYBMKLOCPYGJ-UHFFFAOYSA-N', 'formula': 'C3H7NO2',
+                         'source': 'public ICEBERG 2.1 PubChem atlas', 'entropy_similarity': 0.6, 'explained_intensity': 0.5}
+            simulated = []
+            def fake(python, action, **kw):
+                if action == 'validate':
+                    return [{'smiles': 'C[C@H](N)C(=O)O', 'formula': 'C3H7NO2', 'formula_match': True, 'connectivity': 'QNAYBMKLOCPYGJ'},
+                            {'smiles': 'NCCC(=O)O', 'formula': 'C3H7NO2', 'formula_match': True, 'connectivity': 'UCMIRNVEIXFBKS'}]
+                if action == 'rank':
+                    return {'candidates': [atlas_hit]}
+                simulated.append(json.loads(Path(kw['smiles_json']).read_text()))
+                return []
+            args = SimpleNamespace(result=str(result), smiles_json=str(proposals), proposals=None, max_structures=500,
+                                   ms_pred_python='python', ms_pred_dir=str(root), model='iceberg', checkpoint=None,
+                                   gen_checkpoint=None, inten_checkpoint=None)
+            with patch.object(cli, 'worker', side_effect=fake), patch.object(cli, 'write_report'):
+                cli.review(args)
+            data = json.loads(result.read_text())
+            self.assertEqual([c['smiles'] for c in data['candidates']], ['CC(N)C(=O)O'])
+            self.assertEqual(simulated, [['NCCC(=O)O']])
+            self.assertEqual(data['review']['atlas_reused'], 1)
+            self.assertNotIn('next_step', data)
+
+    def test_review_proposals_from_pubchem(self):
+        from msms_structure_elucidation import pubchem
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = SimpleNamespace(smiles_json=None, proposals='pubchem', max_structures=2)
+            with patch.object(pubchem, 'structures_for_formula', return_value=['CCO', 'COC']) as fetch:
+                path = cli.proposal_file(args, {}, root / 'retrieval.json', 'C2H6O')
+            fetch.assert_called_once_with('C2H6O', 2)
+            self.assertEqual(json.loads(path.read_text()), ['CCO', 'COC'])
+
+    def test_pubchem_mass_search_keeps_neutral_single_component_chnops(self):
+        from msms_structure_elucidation import pubchem
+        props = [
+            {'MolecularFormula': 'C2H6O', 'MonoisotopicMass': '46.0419', 'Charge': 0, 'SMILES': 'CCO'},
+            {'MolecularFormula': 'C2H6O', 'MonoisotopicMass': '46.0419', 'Charge': 0, 'SMILES': 'COC'},
+            {'MolecularFormula': 'CH2O2', 'MonoisotopicMass': '46.0055', 'Charge': 0, 'SMILES': 'OC=O'},
+            {'MolecularFormula': 'C2H6O', 'MonoisotopicMass': '46.0419', 'Charge': 0, 'SMILES': 'CCO.O'},
+            {'MolecularFormula': 'C2H5Si', 'MonoisotopicMass': '46.0419', 'Charge': 0, 'SMILES': 'C[SiH2]C'},
+            {'MolecularFormula': 'C2H7O+', 'MonoisotopicMass': '46.0419', 'Charge': 1, 'SMILES': 'CC[OH2+]'},
+            {'MolecularFormula': 'C2H5O', 'MonoisotopicMass': '46.0419', 'Charge': 0, 'SMILES': 'C[CH2]O'},
+            {'MolecularFormula': 'CH4O', 'MonoisotopicMass': '46.0419', 'Charge': 0, 'SMILES': '[2H]C([2H])([2H])O'}]
+        def fake(path, data=None):
+            return {'IdentifierList': {'CID': [1, 2, 3, 4, 5, 6, 7, 8]}} if 'monoisotopic_mass' in path else {'PropertyTable': {'Properties': props}}
+        with patch.object(pubchem, '_get', side_effect=fake):
+            found = pubchem.formulas_by_mass(47.0492, '[M+H]+', ppm=10)
+        self.assertEqual([(f['formula'], f['structures']) for f in found], [('C2H6O', 2), ('CH2O2', 1)])
+        self.assertLess(abs(found[0]['ppm']), 10)
+
     def test_reject_html_atlas_response(self):
         with tempfile.TemporaryDirectory() as tmp:
             class FakeResponse:

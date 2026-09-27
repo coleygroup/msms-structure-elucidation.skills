@@ -17,7 +17,7 @@ from pathlib import Path
 from msms_structure_elucidation.atlas import AtlasNoEntry, download_mgf
 from msms_structure_elucidation.config import asset, choice, settings
 from msms_structure_elucidation.report import write_report
-from msms_structure_elucidation.spectrum import inspect_ms
+from msms_structure_elucidation.spectrum import inspect_ms, mass_tolerance
 
 _MODEL_SEMAPHORE = None
 
@@ -66,7 +66,8 @@ def worker(python: str, action: str, **kwargs):
             return science.rank(str(kwargs['spectrum']), str(kwargs['mgf']), kwargs['formula'],
                 int(kwargs['top_k']), kwargs['experimental_unit'])
         if action == 'formula':
-            return science.formula_candidates(str(kwargs['spectrum']), kwargs['experimental_unit'])
+            return science.formula_candidates(str(kwargs['spectrum']), kwargs['experimental_unit'],
+                ms1_ppm=float(kwargs.get('ms1_ppm') or 5.0), ms2_ppm=float(kwargs.get('ms2_ppm') or 10.0))
         if action == 'validate':
             return science.validate_smiles(json.loads(Path(kwargs['smiles_json']).read_text()), kwargs['formula'])
         if action == 'atlas-smiles':
@@ -184,6 +185,15 @@ def run(args):
     if data['header_units'] and data['header_units'] != [args.collision_unit]:
         result['warnings'].append(
             f"Collision headers say {', '.join(data['header_units'])}; using user-supplied {args.collision_unit}.")
+    tolerance = mass_tolerance(result['instrument'])
+    overrides = {k: getattr(args, k, None) for k in ('ms1_ppm', 'ms2_ppm')}
+    tolerance.update({k: v for k, v in overrides.items() if v is not None})
+    tolerance['source'] = 'user' if any(v is not None for v in overrides.values()) else 'instrument default'
+    result['mass_tolerance'] = tolerance
+    if tolerance['instrument'] == 'unknown' and tolerance['source'] != 'user':
+        result['warnings'].append(
+            f"Instrument not recognised; using Q-TOF mass tolerances ({tolerance['ms1_ppm']:g}/{tolerance['ms2_ppm']:g} ppm). "
+            'Pass --instrument or --ms1-ppm/--ms2-ppm (Orbitrap: 5/10).')
     python = model_python(getattr(args, 'ms_pred_python', None))
     formulas = []
     if getattr(args, 'formulas_file', None):
@@ -194,18 +204,22 @@ def run(args):
         result['formula_source'] = 'provided' if args.formula else 'input'
     else:
         try:
-            inferred = worker(python, 'formula', spectrum=path,
-                              experimental_unit=args.collision_unit)
+            inferred = worker(python, 'formula', spectrum=path, experimental_unit=args.collision_unit,
+                              ms1_ppm=tolerance['ms1_ppm'], ms2_ppm=tolerance['ms2_ppm'])
             formulas = [x['formula'] for x in inferred[:3]]
             result['formula_hypotheses'] = inferred
             result['formula_source'] = 'MSBuddy inferred'
         except Exception as exc:
             result['warnings'].append(f'Formula inference unavailable: {exc}')
+        if not formulas and not getattr(args, 'no_pubchem', False):
+            formulas = pubchem_formulas(result, data, getattr(args, 'formula_elements', None) or 'CHNOPS')
     formulas = list(dict.fromkeys(formulas))
     result['formula'] = formulas[0] if formulas else None
     if not formulas:
         result['status'] = 'needs_formula'
         result['warnings'].append('No formula available. Supply --formula or --formulas-file, or obtain formula hypotheses from isotope/MS1 evidence. FRIGID also requires a formula.')
+        if result.get('pubchem_formula_search') == 'none':
+            result['next_step'] = 'review-frigid'
     candidates = []
     operational_error = None
     for formula in formulas:
@@ -277,6 +291,11 @@ def run(args):
         'error' if operational_error else 'ranked' if candidates else
         result['status'] if result['status'] == 'needs_formula' else 'no_atlas_coverage' if
         all(r['status'] == 'no_atlas_coverage' for r in result['formula_results']) else 'no_candidates')
+    if result['status'] == 'no_atlas_coverage':
+        result['next_step'] = 'iceberg-pubchem'
+        result['warnings'].append(
+            'No ICEBERG Atlas entry for the searched formulas. Predict their PubChem structures with ICEBERG: '
+            f'review --result {out / "retrieval.json"} --proposals pubchem --model iceberg (add --formula to pick one).')
     _save(result, out, args.no_report)
     print(json.dumps({'output_dir': str(out), 'status': result['status'], 'formula': result['formula'],
         'candidates': len(result['candidates']), 'formula_results': result['formula_results'],
@@ -284,6 +303,40 @@ def run(args):
     if operational_error:
         raise RuntimeError(f'{operational_error} (result: {out / "retrieval.json"})') from operational_error
     return 0
+
+
+def pubchem_formulas(result: dict, data: dict, elements: str, limit: int = 3) -> list[str]:
+    """When MSBuddy proposes nothing, take formulas of PubChem structures matching the precursor mass."""
+    from msms_structure_elucidation import pubchem
+    ppm = result['mass_tolerance']['ms1_ppm']
+    try:
+        found = pubchem.formulas_by_mass(data['parentmass'], data['adduct'], ppm, elements, limit=limit)
+    except Exception as exc:
+        result['warnings'].append(f'PubChem mass search failed: {exc}')
+        return []
+    if not found:
+        result['pubchem_formula_search'] = 'none'
+        result['warnings'].append(
+            f'No {elements} formula of a PubChem structure lies within ±{ppm:g} ppm of the precursor. '
+            'Review the spectrum (adduct, in-source fragment, isotope, noise) and decide whether to generate '
+            'structures de novo with FRIGID (msms-denovo).')
+        return []
+    result['formula_hypotheses'] = found
+    result['formula_source'] = found[0]['source']
+    result['warnings'].append(
+        f'MSBuddy proposed no formula; using PubChem mass matches ({", ".join(f["formula"] for f in found)}).')
+    return [f['formula'] for f in found]
+
+
+def proposal_file(args, result: dict, result_path: Path, formula: str) -> Path:
+    """SMILES to review: an agent/user JSON list, or PubChem structures of the formula."""
+    if args.smiles_json:
+        return Path(args.smiles_json).resolve()
+    from msms_structure_elucidation import pubchem
+    smiles = pubchem.structures_for_formula(formula, args.max_structures)
+    path = result_path.with_name(f'proposals_{args.proposals}_{formula}.json')
+    path.write_text(json.dumps(smiles, indent=0))
+    return path
 
 
 def review(args):
@@ -295,11 +348,14 @@ def review(args):
     formula = getattr(args, 'formula', None) or result.get('formula')
     if not formula:
         raise ValueError('Review needs a molecular formula; rerun retrieval with --formula')
-    proposals = json.loads(Path(args.smiles_json).read_text())
+    smiles_json = proposal_file(args, result, result_path, formula)
+    proposals = json.loads(smiles_json.read_text())
     if not isinstance(proposals, list) or not all(isinstance(x, str) for x in proposals):
         raise ValueError('--smiles-json must contain a JSON array of SMILES strings')
+    if not proposals:
+        raise ValueError(f'No {getattr(args, "proposals", None) or "proposed"} structures found for {formula}')
     python = model_python(args.ms_pred_python)
-    validated = worker(python, 'validate', smiles_json=Path(args.smiles_json).resolve(), formula=formula)
+    validated = worker(python, 'validate', smiles_json=smiles_json, formula=formula)
     valid = [c['smiles'] for c in validated if c['formula_match']]
     rejected = [c for c in validated if not c['formula_match']]
     if not valid:
@@ -311,15 +367,26 @@ def review(args):
         atlas = worker(python, 'rank', spectrum=result['input'], mgf=atlas_mgf,
                        formula=formula, top_k=100000,
                        experimental_unit=result['collision_unit'])
-        by_smiles = {c.get('canonical_smiles', c['smiles']): c for c in atlas['candidates']}
+        atlas_candidates = atlas['candidates']
     else:
-        by_smiles = {}
-    seen = {c.get('canonical_smiles', c['smiles']) for c in existing}
+        atlas_candidates = []
+
+    def key(candidate):
+        # Stereo-insensitive identity: the public atlas stores SMILES without stereochemistry.
+        inchikey = candidate.get('inchikey') or ''
+        return inchikey[:14] if inchikey else candidate.get('canonical_smiles', candidate['smiles'])
+    by_key = {key(c): c for c in atlas_candidates}
+    connectivity = {c['smiles']: c.get('connectivity') or c['smiles'] for c in validated if c['formula_match']}
+    seen = {key(c) for c in existing}
     added = []
     for smiles in valid:
-        if smiles in by_smiles and smiles not in seen:
-            added.append(by_smiles[smiles]); seen.add(smiles)
-    missing = [s for s in valid if s not in seen]
+        k = connectivity[smiles]
+        if k in by_key and k not in seen:
+            added.append(by_key[k]); seen.add(k)
+    missing = []
+    for smiles in valid:
+        if connectivity[smiles] not in seen:
+            missing.append(smiles); seen.add(connectivity[smiles])
     if missing:
         if not options['ms_pred_dir']:
             raise FileNotFoundError('Review simulation requires --ms-pred-dir or models.simulator.ms_pred_src')
@@ -330,7 +397,12 @@ def review(args):
             experimental_unit=result['collision_unit'],
             instrument=_instrument(getattr(args, 'instrument', None) or result.get('instrument') or config.get('models', {}).get('simulator', {}).get('instrument')),
             **options))
-    result['review'] = {'proposed': len(proposals), 'formula_valid': len(valid),
+    if added and result.get('next_step') == 'iceberg-pubchem':
+        # The retrieval-time hint about missing atlas coverage is resolved now.
+        result.pop('next_step', None)
+        result['warnings'] = [w for w in result.get('warnings', []) if not w.startswith('No ICEBERG Atlas entry')]
+    result['review'] = {'proposed': len(proposals), 'proposal_source': getattr(args, 'proposals', None) or 'smiles-json',
+                        'formula_valid': len(valid),
                         'formula_rejected': rejected, 'atlas_reused': sum(c['source'].startswith('public') for c in added),
                         'simulated': sum(c['source'] in ('GLACIER', 'ICEBERG') for c in added),
                         'model_settings': options}
@@ -525,10 +597,18 @@ def visualize(args):
     """Open the separate, localhost-only fragment review skill."""
     python = model_python(args.ms_pred_python)
     command = [python, '-m', 'msms_structure_elucidation.visualize',
-               '--result', str(Path(args.result).expanduser().resolve()),
+               '--result', *[str(Path(r).expanduser().resolve())
+                             for r in ([args.result] if isinstance(args.result, str) else args.result)],
                '--port', str(args.port)]
     if args.atlas_mgf:
         command.extend(['--atlas-mgf', str(Path(args.atlas_mgf).expanduser().resolve())])
+    if getattr(args, 'export', None):
+        command.extend(['--export', str(Path(args.export).expanduser().resolve())])
+        for flag in ('split_data', 'demo_reviews'):
+            if getattr(args, flag, False):
+                command.append('--' + flag.replace('_', '-'))
+        if getattr(args, 'title', None):
+            command.extend(['--title', args.title])
     env = os.environ.copy()
     env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get('PYTHONPATH', '')
     try:
@@ -563,9 +643,23 @@ def main(argv=None):
     command.add_argument('--atlas-url')
     command.add_argument('--top-k', type=int)
     command.add_argument('--no-report', action='store_true')
+    command.add_argument('--ms1-ppm', type=float,
+                         help='precursor tolerance for MSBuddy and the PubChem fallback '
+                              '(default from the instrument: Q-TOF 10, Orbitrap 5 ppm)')
+    command.add_argument('--ms2-ppm', type=float,
+                         help='fragment tolerance for MSBuddy (default: Q-TOF 20, Orbitrap 10 ppm)')
+    command.add_argument('--formula-elements', default='CHNOPS',
+                         help='elements allowed in PubChem fallback formulas (default CHNOPS)')
+    command.add_argument('--no-pubchem', action='store_true',
+                         help='do not search PubChem by mass when MSBuddy proposes no formula')
     reviewer = sub.add_parser('review', help='validate candidate SMILES and rerank via atlas or a local model')
     reviewer.add_argument('--result', required=True, help='retrieval.json from run')
-    reviewer.add_argument('--smiles-json', required=True, help='JSON array of proposed SMILES')
+    proposal_source = reviewer.add_mutually_exclusive_group(required=True)
+    proposal_source.add_argument('--smiles-json', help='JSON array of proposed SMILES')
+    proposal_source.add_argument('--proposals', choices=['pubchem'],
+                                 help='predict PubChem structures of the formula (formula not in the ICEBERG Atlas)')
+    reviewer.add_argument('--max-structures', type=int, default=500,
+                          help='cap on --proposals structures (default 500)')
     reviewer.add_argument('--ms-pred-python')
     reviewer.add_argument('--ms-pred-dir')
     reviewer.add_argument('--config')
@@ -618,10 +712,17 @@ def main(argv=None):
     generator.add_argument('--num-rounds', type=int, default=0)
     generator.add_argument('--top-k', type=int, default=10)
     viewer = sub.add_parser('visualize', help='open a local interactive fragment review webpage')
-    viewer.add_argument('--result', required=True, help='retrieval.json produced by run or review')
+    viewer.add_argument('--result', required=True, nargs='+',
+                        help='retrieval.json produced by run or review; pass several to review all unknowns on one page')
     viewer.add_argument('--atlas-mgf', help='atlas MGF for legacy results without saved fragment IDs')
     viewer.add_argument('--ms-pred-python', help='Python with ms_pred, RDKit, and Flask')
     viewer.add_argument('--port', type=int, default=0, help='localhost port; 0 chooses a free port')
+    viewer.add_argument('--export', help='write one self-contained read-only review page (HTML) and exit')
+    viewer.add_argument('--split-data', action='store_true',
+                        help='with --export: put the data in <name>.data.json.gz beside the page (for hosts with size limits)')
+    viewer.add_argument('--demo-reviews', action='store_true',
+                        help='with --export: let viewers try the review controls; notes stay in their browser')
+    viewer.add_argument('--title', help='with --export: page title')
     args = parser.parse_args(argv)
     try:
         return {'run': run, 'review': review, 'denovo': denovo,
