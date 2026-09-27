@@ -6,13 +6,13 @@ Give an AI coding agent an experimental tandem mass spectrum and ask it to inves
 
 Open Codex or Claude Code in your project and type:
 
-> Install the skill for me: https://github.com/coleygroup/msms-structure-elucidation.skills
+> Install the skills from https://github.com/coleygroup/msms-structure-elucidation.skills. Check which required environments, repository checkouts, and model assets are already available, and tell me what is ready or missing. I am not providing a spectrum yet.
 
-Then attach your spectrum or give its path and ask the agent to analyze it. The agent should ask you to confirm the collision energies and whether their numbers are **NCE or absolute eV** before scoring. The file header alone is not enough to establish the unit.
+Installation does not require collision-energy information. When you are ready to analyze a spectrum, attach it or give its path and ask the agent to run the workflow. At that point, the agent should confirm the supplied collision energies and whether their values are **NCE or absolute eV** before scoring; a file header alone does not establish the unit.
 
 ## Explore a completed example
 
-The [plasma unknown 583 demo](demo/msms-structure-elucidation/index.html) is a self-contained interactive result. Download the HTML file and open it in a browser. It uses the public [plasma_unknown_583.ms](https://github.com/coleygroup/ms-pred/blob/main/data/exp_specs/clinical/plasma_unknown_583.ms) spectrum from ms-pred. Its provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE**, despite the file's eV labels.
+The [plasma unknown 583 demo](demo/README.md) is a self-contained interactive result generated from a verified analysis snapshot. The GitHub Pages workflow rebuilds its HTML on every commit; you can also [build it locally](demo/README.md). It uses the public [plasma_unknown_583.ms](https://github.com/coleygroup/ms-pred/blob/main/data/exp_specs/clinical/plasma_unknown_583.ms) spectrum from ms-pred. Its provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE**, despite the file's eV labels.
 
 In the demo, switch between collision energies, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Entropy similarity and explained intensity help rank candidates; explained intensity breaks close score ties. Neither is a probability of identification.
 
@@ -49,6 +49,6 @@ The public atlas does not contain licensed NIST structures. A good spectral matc
 3. Open the result URL the agent provides. Select a candidate and energy, click a peak, compare another candidate, and inspect the unexplained peaks.
 4. Add a candidate or fragment note in the local viewer, then tell the agent: **“Please review my saved notes and refine the candidates.”**
 
-For this example, the workflow inferred three formulas and scored 158 public-atlas structures. The public demo shows the top 20 candidates with all five energy pairs; the leading candidate has 0.615 entropy similarity and 86.7% explained intensity. Those numbers describe the match to this spectrum, not identification confidence. See the [demo provenance](demo/msms-structure-elucidation/manifest.json) for the source spectrum and energy mapping.
+For this example, the workflow inferred three formulas and scored 158 public-atlas structures. The demo shows the top 20 candidates with all five energy pairs; the leading candidate has 0.615 entropy similarity and 86.7% explained intensity. Those numbers describe the match to this spectrum, not identification confidence. See the [demo provenance and build instructions](demo/README.md) for the source spectrum and energy mapping.
 
 For manual installation, batch processing, model checkpoints, and command line options, see the [technical guide](docs/technical-guide.md). The [scientific workflow](.agents/workflows/msms-elucidation.md) and [skills](.agents/skills) contain the agent procedures.
