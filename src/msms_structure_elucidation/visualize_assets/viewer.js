@@ -9,7 +9,8 @@ const fmt = (v, d) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).
 const pct = v => (v == null ? '—' : `${(100 * Number(v)).toFixed(0)}%`);
 const OUTCOME = { atlas: 'ICEBERG Atlas', model: 'Model prediction', 'no-energy-pair': 'No Atlas energy within 2 eV',
   'not-in-atlas': 'Not in ICEBERG Atlas', 'atlas-failed': 'Atlas retrieval failed', 'no-formula': 'No formula',
-  'no-pubchem-formula': 'No PubChem formula' };
+  'no-pubchem-formula': 'No PubChem formula', 'no-candidates': 'No comparable candidates',
+  'blocked-model-assets': 'Model assets missing' };
 const outcomeLabel = r => (r.outcome === 'model' ? `${r.top_model || 'Model'} prediction` : OUTCOME[r.outcome]);
 const modelLabel = c => (String(c.source).startsWith('public') ? null : `${c.model_name || c.source}${c.model_version ? ' ' + c.model_version : ''}`);
 const DECISION = { keep: 'Kept', uncertain: 'Uncertain', reject: 'Rejected' };
@@ -219,8 +220,9 @@ function nearest(peaks, mz) {
 function spectraFor(c) {
   const pair = pairOf(c);
   if (!pair) return null;
-  const exp = S.result.spectra[pair.experimental_key] || [], pred = c.predicted_spectra?.[pair.atlas_key] || [];
-  const ids = c.predicted_fragment_ids?.[pair.atlas_key] || [];
+  const key = pair.prediction_key ?? pair.atlas_key;
+  const exp = S.result.spectra[pair.experimental_key] || [], pred = c.predicted_spectra?.[key] || [];
+  const ids = c.predicted_fragment_ids?.[key] || [];
   const precursor = Number(S.result.parentmass) || Infinity;
   const expMax = Math.max(1e-9, ...exp.filter(p => p[0] <= precursor + 2).map(p => p[1]));
   const predMax = Math.max(1e-9, ...pred.map(p => p[1]));
@@ -229,7 +231,7 @@ function spectraFor(c) {
     const ei = nearest(exp, m.mz), pi = nearest(pred, m.predicted_mz);
     if (ei >= 0 && pi >= 0) { e2p.set(ei, pi); if (!p2e.has(pi) || exp[ei][1] > exp[p2e.get(pi)][1]) p2e.set(pi, ei); }
   }
-  return { pair, exp, pred, ids, expMax, predMax, e2p, p2e, precursor };
+  return { pair, key, exp, pred, ids, expMax, predMax, e2p, p2e, precursor };
 }
 function defaultRange(sp) {
   const mzs = [...sp.pred.map(p => p[0]), ...sp.exp.filter(p => p[0] <= sp.precursor + 2).map(p => p[0])];
@@ -283,10 +285,12 @@ function renderEmpty() {
     'no-pubchem-formula': 'Neither MSBuddy nor a PubChem mass search found a formula for this precursor. Review the spectrum (adduct, in-source fragment, isotope, noise) and decide whether to generate structures de novo with FRIGID (<code>msms-denovo</code>).',
     'not-in-atlas': `${fhtml(res.formula)} has PubChem structures but no ICEBERG Atlas entry. Predict them with ICEBERG:<br><code>${cmd('pubchem')}</code>`,
     'no-energy-pair': `The ICEBERG Atlas has ${res.library_structures} structures for ${fhtml(res.formula)}, but none at a collision energy within 2 eV of the experiment. Predict them at the experimental energy with ICEBERG:<br><code>${cmd('atlas')}</code>`,
-    'atlas-failed': 'Atlas retrieval did not complete (download or ranking error). Rerun retrieval for this unknown.',
+    'atlas-failed': 'Retrieval did not complete (download, ranking or model error). Check the error in retrieval.json and rerun retrieval for this unknown.',
+    'no-candidates': 'Atlas or model predictions were available but none could be compared with this spectrum. Check the formula results below.',
+    'blocked-model-assets': 'The ICEBERG Atlas lacks an exact collision energy for this formula, so every atlas structure must be predicted with local ICEBERG, but the ms-pred checkout or checkpoints were not available. Set <code>--ms-pred-dir</code> and the ICEBERG checkpoints (or <code>configs/default.yaml</code>) and rerun retrieval.',
   }[r.outcome] || 'No ranked candidates are available.';
   const hyps = (res.formula_hypotheses || []).map(h => h.formula).filter(f => f && f !== res.formula);
-  $('ws-empty').innerHTML = `<h2>No ranked candidates</h2><p>${why}</p>
+  $('ws-empty').innerHTML = `<h2>No ranked candidates</h2><p>${why}</p>${formulaResults(res)}
     ${hyps.length ? `<p>Other formula hypotheses — rerun retrieval with one of them:</p>${hypList(hyps)}` : ''}
     ${(res.warnings || []).map(w => `<p class="warn">⚠ ${esc(String(w).split('\n')[0])}</p>`).join('')}`;
 }
@@ -297,6 +301,11 @@ function weightsLabel(checkpoint) {
   for (let i = 0; parts.every(p => i < p.length - 1 && p[i] === parts[0][i]); i++) common.push(parts[0][i]);
   const dir = (common.length ? common : parts[0].slice(0, -1)).filter(x => x && x !== 'ckpt');
   return dir.slice(-3).join('/');
+}
+function formulaResults(res) {
+  const rows = res.formula_results || [];
+  if (!rows.length) return '';
+  return `<p>Formulas searched: ${rows.map(r => `<span class="chip" title="${esc(r.reason || r.error || '')}"><span>${fhtml(r.formula)}</span> · ${esc(String(r.status).replace(/_/g, ' '))}</span>`).join(' ')}</p>`;
 }
 function hypList(hyps) {
   return `<div class="hyps">${hyps.map(f => `<div class="hyp"><span class="chip"><span>${fhtml(f)}</span></span><button class="copy" type="button" data-copy-formula="${esc(f)}" title="Copy a retrieval command that uses this formula">Copy run command</button></div>`).join('')}</div>`;
@@ -315,14 +324,14 @@ function renderRail() {
       <span class="bars">
         <span class="row">sim <span class="minibar"><i style="width:${100 * c.entropy_similarity}%"></i></span><b>${fmt(c.entropy_similarity, 3)}</b></span>
         <span class="row">expl <span class="minibar"><i style="width:${100 * c.explained_intensity}%"></i></span><b>${pct(c.explained_intensity)}</b></span>
-        <span class="tags">${modelLabel(c) ? `<span class="chip" title="${esc(modelLabel(c))} prediction">${esc(modelLabel(c))}</span>` : ''}${ICON[d] ? `<span class="chip"><span class="ico ${d}">${ICON[d]}</span>${DECISION[d]}</span>` : ''}${S.compare === k ? '<span class="chip">compared</span>' : ''}</span>
+        <span class="tags">${modelLabel(c) ? `<span class="chip" title="${esc(modelLabel(c))} prediction">${esc(modelLabel(c))}</span>` : ''}${ICON[d] ? `<span class="chip"><span class="ico ${d}">${ICON[d]}</span>${DECISION[d]}</span>` : ''}${c.ambiguity?.length ? `<span class="chip" title="${esc(c.ambiguity.join('; '))}">isomer tie</span>` : ''}${S.compare === k ? '<span class="chip">compared</span>' : ''}</span>
       </span></button></li>`;
   }).join('');
   res.candidates.forEach((_, k) => { const p = S.payloads.get(`${S.r}:${k}`); if (p) p.then(v => fillMini(k, v)); });
 }
 function renderEnergy() {
   const c = cand(), sel = $('energy');
-  sel.innerHTML = (c.energy_alignment || []).map((a, i) => `<option value="${i}">${fmt(a.input_value, 0)} ${esc(a.input_unit)} ↔ ${fmt(a.atlas_ev, 0)} eV predicted</option>`).join('');
+  sel.innerHTML = (c.energy_alignment || []).map((a, i) => `<option value="${i}">${fmt(a.input_value, 0)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}</option>`).join('');
   sel.value = String(Math.min(S.pairIdx, Math.max(0, (c.energy_alignment || []).length - 1)));
   sel.disabled = (c.energy_alignment || []).length < 2;
   $('compare').setAttribute('aria-pressed', String(S.compare != null));
@@ -397,7 +406,7 @@ function drawMirror(el, k, compact) {
     s += `<circle class="peak-cap exp" cx="${x(sp.exp[selExp][0])}" cy="${mid - Math.max(1, h)}" r="4"/>`;
   }
   if (selPred != null && inRange(sp.pred[selPred][0])) {
-    const px = x(sp.pred[selPred][0]), h = (sp.pred[selPred][1] / sp.predMax) * half, formula = S.formulaCache[`${k}:${sp.pair.atlas_key}:${selPred}`];
+    const px = x(sp.pred[selPred][0]), h = (sp.pred[selPred][1] / sp.predMax) * half, formula = S.formulaCache[`${k}:${sp.key}:${selPred}`];
     const text = `${sp.pred[selPred][0].toFixed(3)}${formula ? ' · ' + esc(hill(formula)) : ''}`;
     s += `<circle class="peak-cap pred" cx="${px}" cy="${mid + Math.max(1, h)}" r="4"/>`;
     if (h > half - 24) {  // tall peak: label beside the tip so it clears the caption and axis
@@ -407,7 +416,7 @@ function drawMirror(el, k, compact) {
   }
   s += `<line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${mid}" y2="${mid}"/>`;
   s += `<text class="side-label" x="${m.l + 6}" y="${m.t + 10}">Experimental · ${fmt(sp.pair.input_value, 0)} ${esc(sp.pair.input_unit)}</text>`;
-  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${fmt(sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}</text>`;
+  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${fmt(sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}</text>`;
   s += '</svg>';
   el.innerHTML = s;
   wirePlot(el, k, sp, { m, iw, ih, mid, x, lo, hi });
@@ -470,10 +479,10 @@ function peakTip(k, sp, h) {
     const [mz, it] = sp.exp[h.i], pi = sp.e2p.get(h.i);
     const rel = `${(100 * it / sp.expMax).toFixed(1)}% of base peak`;
     if (pi == null) return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br><span class="muted">Not explained by #${k + 1}</span>`;
-    const f = S.formulaCache[`${k}:${sp.pair.atlas_key}:${pi}`];
+    const f = S.formulaCache[`${k}:${sp.key}:${pi}`];
     return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br>Matched predicted ${sp.pred[pi][0].toFixed(4)} (${ppm(mz, sp.pred[pi][0]).toFixed(1)} ppm)${f ? `<br>${fhtml(f)}` : ''}`;
   }
-  const [mz, it] = sp.pred[h.i], ei = sp.p2e.get(h.i), f = S.formulaCache[`${k}:${sp.pair.atlas_key}:${h.i}`];
+  const [mz, it] = sp.pred[h.i], ei = sp.p2e.get(h.i), f = S.formulaCache[`${k}:${sp.key}:${h.i}`];
   return `<b>Predicted m/z ${mz.toFixed(4)}</b>${f ? ` · ${fhtml(f)}` : ''}<br>${(100 * it / sp.predMax).toFixed(1)}% of predicted base peak<br>` +
     (ei != null ? `Matches experimental ${sp.exp[ei][0].toFixed(4)} (${ppm(sp.exp[ei][0], mz).toFixed(1)} ppm)` : '<span class="muted">No experimental match</span>') +
     (sp.ids[h.i] == null ? '<br><span class="muted">No fragment ID</span>' : '');
@@ -541,7 +550,7 @@ function fragmentFor(pl, sp, pi) {
   if (!pl || pi == null || !sp) return null;
   const id = sp.ids[pi];
   if (id == null) return null;
-  return { id: String(id), formula: pl.peaks?.[sp.pair.atlas_key]?.[pi] || '', shape: pl.fragments?.[String(id)] || null };
+  return { id: String(id), formula: pl.peaks?.[sp.key]?.[pi] || '', shape: pl.fragments?.[String(id)] || null };
 }
 function previewFragment(pi, sp) {
   if (!currentPayload) return;
@@ -594,7 +603,7 @@ function renderPeakInfo(sp, pl) {
     <div>Predicted m/z <b>${mz.toFixed(4)}</b> · ${(100 * it / sp.predMax).toFixed(1)}%${f ? ` · fragment <span class="mono">${esc(f.id)}</span>` : ''}</div>
     <div>${ei != null ? `Experimental <b>${sp.exp[ei][0].toFixed(4)}</b> · ${(100 * sp.exp[ei][1] / sp.expMax).toFixed(1)}% · ${ppm(sp.exp[ei][0], mz).toFixed(1)} ppm` : '<span class="sub">No experimental peak within tolerance</span>'}</div>`;
   if (sp.ids[i] != null) {
-    const key = `${sp.pair.atlas_key}:${i}`, draft = S.drafts.get(`${S.r}|${cand().review_key}|${key}`);
+    const key = `${sp.key}:${i}`, draft = S.drafts.get(`${S.r}|${cand().review_key}|${key}`);
     note.disabled = READONLY();
     note.value = draft ?? noteFor(cand()).fragments?.[key]?.comment ?? '';
   }
@@ -607,7 +616,7 @@ function renderFragList(sp, pl) {
     if (seen.has(String(sp.ids[i])) || rows.length >= 8) return; seen.add(String(sp.ids[i])); rows.push(i);
   });
   $('frag-list').innerHTML = rows.length ? rows.map(i => {
-    const f = fragmentFor(pl, sp, i), key = `${sp.pair.atlas_key}:${i}`;
+    const f = fragmentFor(pl, sp, i), key = `${sp.key}:${i}`;
     return `<button class="frag-row" type="button" data-peak="${i}" aria-current="${S.peak?.kind === 'p' && S.peak.i === i}">
       <span>${f?.formula ? fhtml(f.formula) : '<span class="sub">—</span>'} <span class="sub">${sp.pred[i][0].toFixed(3)}</span>${notes[key] ? ' <span class="note-dot" title="Has a note">●</span>' : ''}</span>
       <span class="sub">${sp.p2e.has(i) ? 'matched' : 'unmatched'}</span>
@@ -625,12 +634,14 @@ function renderEvidence() {
   $('evidence').innerHTML = `<div class="ev-grid">
     <div class="ev-item"><h3>Match</h3>
       <p>Entropy similarity <b>${fmt(pair.entropy_similarity ?? c.entropy_similarity, 3)}</b> · explained intensity <b>${pct(c.explained_intensity)}</b></p>
-      <p>Experimental <b>${fmt(pair.input_value, 0)} ${esc(pair.input_unit)}</b> paired with the prediction at <b>${fmt(pair.atlas_ev, 0)} eV</b>${pair.delta_ev != null ? ` (Δ ${fmt(pair.delta_ev, 1)} eV)` : ''}</p>
+      <p>Experimental <b>${fmt(pair.input_value, 0)} ${esc(pair.input_unit)}</b> paired with the prediction at <b>${fmt(pair.model_energy_ev ?? pair.atlas_ev, 0)} eV</b>${pair.delta_ev != null ? ` (Δ ${fmt(pair.delta_ev, 1)} eV)` : ''}</p>
+      ${(c.ambiguity || []).map(a => `<p class="warn">${esc(a)}</p>`).join('')}
       <p class="sub">Similarity ranks candidates for this spectrum; it is not identification confidence.</p></div>
     <div class="ev-item"><h3>Provenance</h3>
       <p>${model ? `<b>${esc(modelLabel(c))} prediction</b> at ${esc((c.model_collision_energies_ev || []).join(', '))} eV${c.model_instrument ? ` as ${esc(c.model_instrument)}` : ''}${res.review?.proposal_source === 'pubchem' ? ' for PubChem structures' : res.review?.proposal_source === 'atlas' ? ' for ICEBERG Atlas structures' : ''}` : `<b>ICEBERG Atlas</b> (precomputed ${esc(String(c.source).match(/ICEBERG [\d.]+/)?.[0] || 'ICEBERG')} prediction for a PubChem structure)`}</p>
       ${model && c.model_checkpoint ? `<p class="sub" title="${esc([].concat(c.model_checkpoint).join('\n'))}">Weights: ${esc(weightsLabel(c.model_checkpoint))}${c.ms_pred_version ? ` · ms-pred ${esc(c.ms_pred_version)}` : ''}</p>` : ''}
       <p>Formula <b>${fhtml(res.formula)}</b> <span class="sub">${esc(res.formula_source || '')}</span></p>
+      ${formulaResults(res)}
       ${hyps.length ? `<p>Other formula hypotheses:</p>${hypList(hyps)}` : ''}</div>
     <div class="ev-item"><h3>Strongest unexplained peaks</h3>
       ${unexplained.length ? `<div class="chips">${unexplained.map(i => `<button class="chip" type="button" data-unexplained="${i}">${sp.exp[i][0].toFixed(3)} · ${(100 * sp.exp[i][1] / sp.expMax).toFixed(0)}%</button>`).join('')}</div>` : '<p class="sub">Every peak above 3% is explained by this candidate.</p>'}</div>
@@ -658,12 +669,12 @@ function setDraft(patch) { S.drafts.set(`${S.r}|${cand().review_key}`, { ...curr
 function rememberFragmentDraft() {
   if (!S.result?.candidates.length || S.peak?.kind !== 'p' || $('frag-note').disabled) return;
   const sp = spectraFor(cand());
-  S.drafts.set(`${S.r}|${cand().review_key}|${sp.pair.atlas_key}:${S.peak.i}`, $('frag-note').value);
+  S.drafts.set(`${S.r}|${cand().review_key}|${sp.key}:${S.peak.i}`, $('frag-note').value);
 }
 function scheduleSave(kind, delay) {
   if (READONLY()) return;
   const r = S.r, k = S.cand, c = cand(), sp = spectraFor(c), peak = S.peak;
-  const fragKey = kind === 'fragment' && peak?.kind === 'p' && sp ? `${sp.pair.atlas_key}:${peak.i}` : null;
+  const fragKey = kind === 'fragment' && peak?.kind === 'p' && sp ? `${sp.key}:${peak.i}` : null;
   const timerKey = `${r}|${c.review_key}|${fragKey || kind}`;
   clearTimeout(S.saveTimers[timerKey]);
   $('save-state').textContent = 'Editing…';
@@ -671,7 +682,7 @@ function scheduleSave(kind, delay) {
     const rv = S.drafts.get(`${r}|${c.review_key}`) || {};
     const note = S.r === r ? noteFor(c) : {};
     const body = { result: r, candidate_key: c.review_key, decision: rv.decision || note.decision || 'unreviewed', comment: rv.comment ?? note.comment ?? '' };
-    if (fragKey) body.fragment = { ce: sp.pair.atlas_key, peak_index: peak.i, comment: S.drafts.get(`${r}|${c.review_key}|${fragKey}`) ?? '' };
+    if (fragKey) body.fragment = { ce: sp.key, peak_index: peak.i, comment: S.drafts.get(`${r}|${c.review_key}|${fragKey}`) ?? '' };
     if (S.r === r) $('save-state').textContent = 'Saving…';
     try {
       const data = await api.save(body);

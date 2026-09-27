@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from msms_structure_elucidation import cli
 from msms_structure_elucidation.atlas import download_mgf
+from msms_structure_elucidation.atlas import AtlasNoEntry
 from msms_structure_elucidation.spectrum import inspect_ms
 
 
@@ -32,8 +33,11 @@ class WorkflowTests(unittest.TestCase):
             args = SimpleNamespace(input=str(spec), output_dir=str(root / 'output'), formula='CH4',
                 ms_pred_python='python', atlas_mgf=str(mgf), atlas_url='https://example.test',
                 top_k=10, no_report=False, collision_unit='eV')
-            with patch.object(cli, 'worker', return_value={'library_structures': 1,
-                    'scored_structures': 1, 'candidates': [candidate]}):
+            def fake_worker(_, action, **kw):
+                if action == 'atlas-info':
+                    return {'library_structures': 1, 'missing_energies_ev': [], 'smiles': ['C']}
+                return {'library_structures': 1, 'scored_structures': 1, 'candidates': [candidate]}
+            with patch.object(cli, 'worker', side_effect=fake_worker):
                 self.assertEqual(cli.run(args), 0)
             data = json.loads((root / 'output/retrieval.json').read_text())
             self.assertEqual(data['review_evidence']['strongest_unexplained_peaks'][0]['mz'], 75.0)
@@ -56,25 +60,33 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pubchem_formula_fallback_when_msbuddy_finds_none(self):
         from msms_structure_elucidation import pubchem
-        found = [{'formula': 'CH4', 'structures': 3, 'ppm': 1.2, 'source': 'PubChem mass match (±10 ppm, CHNOPS)'}]
-        ranked = {'library_structures': 1, 'scored_structures': 0, 'candidates': []}
+        found = [{'formula': f, 'structures': n, 'ppm': 1.2, 'source': 'PubChem mass match (±10 ppm, CHNOPS)'}
+                 for f, n in (('CH4', 3), ('C2H4', 1))]
+        searched = []
+        def fake(python, action, **kw):
+            if action == 'formula':
+                return []
+            if action == 'atlas-info':
+                searched.append(kw['formula'])
+                return {'library_structures': 1, 'missing_energies_ev': [], 'smiles': ['C']}
+            return {'library_structures': 1, 'scored_structures': 0, 'candidates': []}
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with (patch.object(cli, 'worker', side_effect=lambda python, action, **kw: [] if action == 'formula' else ranked),
+            with (patch.object(cli, 'worker', side_effect=fake), patch.object(cli, 'download_mgf', return_value=root / 'x.mgf'),
                   patch.object(pubchem, 'formulas_by_mass', return_value=found) as search):
-                self.assertEqual(cli.run(self._run_args(root)), 2)
-            search.assert_called_once()
+                self.assertEqual(cli.run(self._run_args(root, atlas_mgf=None)), 0)
+            self.assertEqual(search.call_args.args[2], 10.0)  # unknown instrument: Q-TOF tolerance
+            self.assertEqual(searched, ['CH4', 'C2H4'])
             data = json.loads((root / 'output/retrieval.json').read_text())
-            self.assertEqual(data['formula'], 'CH4')
             self.assertTrue(data['formula_source'].startswith('PubChem mass match'))
-            self.assertEqual(data['next_step'], 'iceberg-atlas')
-            self.assertTrue(any('--proposals atlas' in w for w in data['warnings']))
+            self.assertEqual(data['status'], 'no_candidates')
 
     def test_mass_tolerance_follows_instrument(self):
         from msms_structure_elucidation.spectrum import mass_tolerance
         self.assertEqual(mass_tolerance('Bruker maXis impact Q-TOF (LCMS)')['ms1_ppm'], 10.0)
-        self.assertEqual(mass_tolerance('Orbitrap (LCMS)')[ 'ms2_ppm'], 10.0)
-        self.assertEqual(mass_tolerance('Orbitrap (LCMS)')['ms1_ppm'], 5.0)
+        self.assertEqual(mass_tolerance('QTOF')['ms2_ppm'], 20.0)
+        self.assertEqual(mass_tolerance('Orbitrap')['ms1_ppm'], 5.0)
+        self.assertEqual(mass_tolerance('IT-FT')['ms2_ppm'], 10.0)
         self.assertEqual(mass_tolerance(None), {'instrument': 'unknown', 'ms1_ppm': 10.0, 'ms2_ppm': 20.0})
         from msms_structure_elucidation import pubchem
         calls = []
@@ -104,24 +116,19 @@ class WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with (patch.object(cli, 'worker', return_value=[]), patch.object(pubchem, 'formulas_by_mass', return_value=[])):
-                self.assertEqual(cli.run(self._run_args(root)), 2)
+                self.assertEqual(cli.run(self._run_args(root)), 0)
             data = json.loads((root / 'output/retrieval.json').read_text())
-            self.assertIsNone(data['formula'])
-            self.assertEqual(data['next_step'], 'review-frigid')
+            self.assertEqual((data['status'], data['next_step']), ('needs_formula', 'review-frigid'))
             self.assertTrue(any('FRIGID' in w for w in data['warnings']))
 
-    def test_formula_missing_from_atlas_or_failed_retrieval_sets_next_step(self):
+    def test_formula_missing_from_atlas_points_to_pubchem_structures(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.object(cli, 'download_mgf', side_effect=ValueError('Atlas returned no MGF')):
-                self.assertEqual(cli.run(self._run_args(root, formula='CH4', atlas_mgf=None)), 2)
+            with patch.object(cli, 'download_mgf', side_effect=AtlasNoEntry('no public entry')):
+                self.assertEqual(cli.run(self._run_args(root, formula='CH4', atlas_mgf=None)), 0)
             data = json.loads((root / 'output/retrieval.json').read_text())
-            self.assertEqual((data['next_step'], data['library_structures']), ('iceberg-pubchem', 0))
-            with patch.object(cli, 'worker', side_effect=RuntimeError('worker crashed\nMemoryError')):
-                cli.run(self._run_args(root, formula='CH4'))
-            data = json.loads((root / 'output/retrieval.json').read_text())
-            self.assertEqual(data['next_step'], 'retry-retrieval')
-            self.assertIn('MemoryError', data['warnings'][-1])
+            self.assertEqual((data['status'], data['next_step']), ('no_atlas_coverage', 'iceberg-pubchem'))
+            self.assertTrue(any('--proposals pubchem' in w for w in data['warnings']))
 
     def test_review_reuses_atlas_entries_regardless_of_stereochemistry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,10 +137,11 @@ class WorkflowTests(unittest.TestCase):
             mgf.write_text('BEGIN IONS\nSMILES=CC(N)C(=O)O\nEND IONS\n')
             result = root / 'retrieval.json'
             result.write_text(json.dumps({'input': str(root / 'q.ms'), 'formula': 'C3H7NO2', 'collision_unit': 'eV',
-                                          'atlas_mgf': str(mgf), 'candidates': [], 'warnings': []}))
+                                          'atlas_mgf': str(mgf), 'candidates': [], 'warnings': [],
+                                          'next_step': 'iceberg-pubchem'}))
             proposals = root / 'p.json'
             proposals.write_text(json.dumps(['C[C@H](N)C(=O)O', 'NCCC(=O)O']))
-            atlas_hit = {'smiles': 'CC(N)C(=O)O', 'inchikey': 'QNAYBMKLOCPYGJ-UHFFFAOYSA-N',
+            atlas_hit = {'smiles': 'CC(N)C(=O)O', 'inchikey': 'QNAYBMKLOCPYGJ-UHFFFAOYSA-N', 'formula': 'C3H7NO2',
                          'source': 'public ICEBERG 2.1 PubChem atlas', 'entropy_similarity': 0.6, 'explained_intensity': 0.5}
             simulated = []
             def fake(python, action, **kw):
@@ -145,7 +153,7 @@ class WorkflowTests(unittest.TestCase):
                 simulated.append(json.loads(Path(kw['smiles_json']).read_text()))
                 return []
             args = SimpleNamespace(result=str(result), smiles_json=str(proposals), proposals=None, max_structures=500,
-                                   ms_pred_python='python', model='iceberg', checkpoint=None,
+                                   ms_pred_python='python', ms_pred_dir=str(root), model='iceberg', checkpoint=None,
                                    gen_checkpoint=None, inten_checkpoint=None)
             with patch.object(cli, 'worker', side_effect=fake), patch.object(cli, 'write_report'):
                 cli.review(args)
@@ -153,18 +161,17 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([c['smiles'] for c in data['candidates']], ['CC(N)C(=O)O'])
             self.assertEqual(simulated, [['NCCC(=O)O']])
             self.assertEqual(data['review']['atlas_reused'], 1)
+            self.assertNotIn('next_step', data)
 
-    def test_review_proposals_from_cached_atlas(self):
+    def test_review_proposals_from_pubchem(self):
+        from msms_structure_elucidation import pubchem
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            mgf = root / 'atlas.mgf'
-            mgf.write_text('BEGIN IONS\nSMILES=CCO\nEND IONS\nBEGIN IONS\nSMILES=CCO\nEND IONS\n'
-                           'BEGIN IONS\nSMILES=COC\nEND IONS\nBEGIN IONS\nSMILES=CCC\nEND IONS\n')
-            args = SimpleNamespace(smiles_json=None, proposals='atlas', max_structures=2)
-            path = cli.proposal_file(args, {'atlas_mgf': str(mgf)}, root / 'retrieval.json', 'C2H6O')
+            args = SimpleNamespace(smiles_json=None, proposals='pubchem', max_structures=2)
+            with patch.object(pubchem, 'structures_for_formula', return_value=['CCO', 'COC']) as fetch:
+                path = cli.proposal_file(args, {}, root / 'retrieval.json', 'C2H6O')
+            fetch.assert_called_once_with('C2H6O', 2)
             self.assertEqual(json.loads(path.read_text()), ['CCO', 'COC'])
-            with self.assertRaisesRegex(ValueError, 'No cached atlas MGF'):
-                cli.proposal_file(args, {}, root / 'retrieval.json', 'C2H6O')
 
     def test_pubchem_mass_search_keeps_neutral_single_component_chnops(self):
         from msms_structure_elucidation import pubchem
@@ -191,7 +198,7 @@ class WorkflowTests(unittest.TestCase):
                 def __exit__(self, *args): pass
                 def read(self, size): return b'<html>formula absent</html>'
             with patch('msms_structure_elucidation.atlas.urlopen', return_value=FakeResponse()):
-                with self.assertRaisesRegex(ValueError, 'no MGF'):
+                with self.assertRaisesRegex(RuntimeError, 'non-MGF'):
                     download_mgf('C2H6O', '[M+H]+', Path(tmp) / 'atlas.mgf')
             self.assertFalse((Path(tmp) / 'atlas.mgf').exists())
 
@@ -201,6 +208,14 @@ class WorkflowTests(unittest.TestCase):
             path.write_text('>parentmass 100\n>collision 20 eV\n50 nan\n')
             with self.assertRaisesRegex(ValueError, 'invalid peak'):
                 inspect_ms(path, 'eV')
+
+    def test_packaged_default_config_matches_checkout(self):
+        from msms_structure_elucidation.config import settings
+        import msms_structure_elucidation.config as config_module
+        checkout = settings(str(config_module.REPO_CONFIG))
+        bundled = settings(str(Path(config_module.__file__).with_name('default.yaml')))
+        checkout.pop('_config_path'); bundled.pop('_config_path')
+        self.assertEqual(checkout, bundled)
 
     def test_user_confirmed_nce_overrides_incorrect_header(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,6 +235,7 @@ class WorkflowTests(unittest.TestCase):
         pairs = align_energies(experimental, predicted, source, 'NCE')
         self.assertEqual([p['atlas_ev'] for p in pairs], [5, 10, 16, 21, 26])
         self.assertEqual(len(pairs), 5)
+        self.assertEqual(align_energies({'20.1': None}, {'22': None}, {'20.1': 20.1}, 'eV'), [])
 
     def test_model_uses_integer_ev_for_both_simulators(self):
         from msms_structure_elucidation import worker
@@ -235,31 +251,41 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(duplicate_pairs), 2)
         captured = []
         modules = {}
-        for name in ('ms_pred', 'ms_pred.glacier', 'ms_pred.iceberg'):
+        for name in ('ms_pred', 'ms_pred.common', 'ms_pred.glacier', 'ms_pred.iceberg'):
             module = types.ModuleType(name)
             module.__path__ = []
             modules[name] = module
+        class EmptyPredDB:
+            def __init__(self, *_): pass
+            def get_all_specs(self): return []
+            def close(self): pass
+        modules['ms_pred.common'].PredSpecDB = EmptyPredDB
         for model in ('glacier', 'iceberg'):
             module = types.ModuleType(f'ms_pred.{model}.{model}_elucidation')
             def predict(**kwargs):
                 captured.append(kwargs)
-                return ('unused', None)
+                model_name = 'glacier' if 'ckpt' in kwargs else 'iceberg'
+                (Path(tmp) / f'{model_name}_run_successful').touch()
+                (Path(tmp) / 'preds.hdf5').touch()
+                return (tmp, None)
             setattr(module, f'{model}_prediction', predict)
-            module.load_pred_spec = lambda _: ([], [])
             modules[module.__name__] = module
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / 'weights.ckpt'
             checkpoint.touch()
-            with patch.dict(sys.modules, modules), patch.object(worker, '_experimental_spectra',
+            with patch.dict(sys.modules, modules), patch.object(worker, '_check_glacier_features'), patch.object(worker, '_experimental_spectra',
                     return_value=({'parentmass': str(precursor), 'ionization': '[M+H]+'},
                                   converted, source)):
                 for model in ('glacier', 'iceberg'):
-                    self.assertEqual(worker.simulate('unused.ms', ['C'], 'CH4', model,
-                        str(checkpoint), str(checkpoint), str(checkpoint), tmp, 'NCE'), [])
+                    self.assertEqual(worker.simulate('unused.ms', [], 'CH4', model,
+                        str(checkpoint), str(checkpoint), str(checkpoint), tmp, 'NCE',
+                        instrument='QTOF', cuda_devices='0'), [])
         self.assertEqual(len(captured), 2)
         for call in captured:
             self.assertEqual(call['collision_energies'], [5, 10, 16, 21, 26])
             self.assertIs(call['nce'], False)
+            self.assertEqual(call['instrument'], 'QTOF')
+            self.assertEqual(call['cuda_devices'], '0')
             self.assertTrue(all(type(value) is int for value in call['collision_energies']))
 
     def test_viewer_stops_cleanly_on_interrupt(self):
@@ -268,6 +294,144 @@ class WorkflowTests(unittest.TestCase):
         with (patch.object(cli, 'model_python', return_value='/path/to/model/python'),
               patch.object(cli.subprocess, 'run', side_effect=KeyboardInterrupt)):
             self.assertEqual(cli.visualize(args), 0)
+
+    def test_three_formula_hypotheses_are_all_scored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / 'query.ms'
+            spec.write_text('>parentmass 100\n>collision 20 eV\n50 10\n')
+            mgf = root / 'atlas.mgf'; mgf.write_text('BEGIN IONS\nEND IONS\n')
+            ranked = []
+            def fake_worker(_, action, **kw):
+                if action == 'formula':
+                    return [{'formula': f'F{i}'} for i in range(3)]
+                if action == 'atlas-info':
+                    return {'library_structures': 1, 'missing_energies_ev': [], 'smiles': ['C']}
+                if action == 'rank':
+                    ranked.append(kw['formula'])
+                    i = int(kw['formula'][1])
+                    return {'library_structures': 1, 'scored_structures': 1,
+                        'missing_energies_ev': [], 'candidates': [{'smiles': f'C{i}',
+                        'formula': kw['formula'], 'source': 'public ICEBERG 2.1 PubChem atlas',
+                        'entropy_similarity': [0.1, 0.63, 0.2][i], 'explained_intensity': 0.5,
+                        'matched_peaks': [], 'energy_alignment': [], 'predicted_spectra': {}}]}
+                raise AssertionError(action)
+            args = SimpleNamespace(input=str(spec), collision_unit='eV', output_dir=str(root / 'out'),
+                formula=None, formulas_file=None, ms_pred_python='python', atlas_mgf=None,
+                atlas_url=None, top_k=10, no_report=True)
+            with patch.object(cli, 'worker', side_effect=fake_worker), patch.object(cli, 'download_mgf', return_value=mgf):
+                self.assertEqual(cli.run(args), 0)
+            result = json.loads((root / 'out/retrieval.json').read_text())
+            self.assertEqual(ranked, ['F0', 'F1', 'F2'])
+            self.assertEqual(result['formula'], 'F1')
+            self.assertEqual(len(result['formula_results']), 3)
+
+    def test_model_asset_block_is_fatal_and_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / 'query.ms'; spec.write_text('>parentmass 100\n>collision 20 eV\n50 10\n')
+            mgf = root / 'atlas.mgf'; mgf.write_text('BEGIN IONS\nEND IONS\n')
+            args = SimpleNamespace(input=str(spec), collision_unit='eV', output_dir=str(root / 'out'),
+                formula='C2H4', formulas_file=None, ms_pred_python='python', atlas_mgf=str(mgf),
+                atlas_url=None, top_k=10, no_report=True)
+            with patch.object(cli, 'worker', return_value={'library_structures': 1,
+                    'missing_energies_ev': [20], 'smiles': ['C']}):
+                with self.assertRaisesRegex(RuntimeError, 'ms-pred checkout'):
+                    cli.run(args)
+            result = json.loads((root / 'out/retrieval.json').read_text())
+            self.assertEqual(result['formula_results'][0]['status'], 'blocked_model_assets')
+            self.assertEqual(result['status'], 'blocked_model_assets')
+
+    def test_absent_atlas_is_valid_empty_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / 'query.ms'; spec.write_text('>parentmass 100\n>collision 20 eV\n50 10\n')
+            args = SimpleNamespace(input=str(spec), collision_unit='eV', output_dir=str(root / 'out'),
+                formula='C2H4', formulas_file=None, ms_pred_python='python', atlas_mgf=None,
+                atlas_url=None, top_k=10, no_report=True)
+            with patch.object(cli, 'download_mgf', side_effect=AtlasNoEntry('no public entry')):
+                self.assertEqual(cli.run(args), 0)
+            result = json.loads((root / 'out/retrieval.json').read_text())
+            self.assertEqual(result['status'], 'no_atlas_coverage')
+
+    def test_mgf_uses_ms2_scan_not_ms1_apex(self):
+        from msms_structure_elucidation.mgf import convert_mgf
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mgf = root / 'features.mgf'
+            mgf.write_text('BEGIN IONS\nFEATURE_ID=1\nMSLEVEL=1\nSCANS=919\nPEPMASS=100\n50 1\nEND IONS\n'
+                'BEGIN IONS\nFEATURE_ID=1\nMSLEVEL=2\nSCANS=919\nMERGED_SCANS=1280\nPEPMASS=100\n50 10\nEND IONS\n')
+            raw = root / 'raw.mzXML'
+            raw.write_text('<mzXML><msRun><scan num="919" msLevel="1"/><scan num="1280" msLevel="2" collisionEnergy="35"/></msRun></mzXML>')
+            rows = convert_mgf(mgf, root / 'converted', 'eV', raw_mzxml=raw)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['collision_energy'], 35)
+            self.assertEqual(rows[0]['source_scan'], '919')
+            self.assertEqual(rows[0]['ms2_scans'], '1280')
+            self.assertIn('>collision 35.0 eV', Path(rows[0]['ms_path']).read_text())
+
+    def test_mgf_missing_energy_is_manifest_status(self):
+        from msms_structure_elucidation.mgf import convert_mgf
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mgf = root / 'features.mgf'
+            mgf.write_text('BEGIN IONS\nFEATURE_ID=188\nMSLEVEL=2\nSOURCE_SCAN=919\nPEPMASS=300\n50 10\nEND IONS\n')
+            rows = convert_mgf(mgf, root / 'converted', 'eV')
+            self.assertEqual(rows[0]['status'], 'needs_energy')
+            self.assertFalse(list((root / 'converted').glob('*.ms')))
+
+    def test_review_model_failure_leaves_result_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result_path = root / 'retrieval.json'
+            original = {'input': str(root / 'query.ms'), 'formula': 'CH4', 'collision_unit': 'eV',
+                'candidates': [], 'spectra': {'20.0': [[10, 1]]}}
+            result_path.write_text(json.dumps(original))
+            proposals = root / 'proposals.json'; proposals.write_text('["C"]')
+            checkout = root / 'ms-pred'; (checkout / 'src/ms_pred').mkdir(parents=True)
+            def fake_worker(_, action, **kw):
+                if action == 'validate':
+                    return [{'smiles': 'C', 'formula_match': True}]
+                raise RuntimeError('model subprocess crashed: incompatible features')
+            args = SimpleNamespace(result=str(result_path), smiles_json=str(proposals),
+                ms_pred_python='python', ms_pred_dir=str(checkout), model='glacier',
+                checkpoint=None, gen_checkpoint=None, inten_checkpoint=None,
+                instrument=None, cuda_devices=None, model_batch_size=None, formula=None, config=None)
+            with patch.object(cli, 'worker', side_effect=fake_worker):
+                with self.assertRaisesRegex(RuntimeError, 'incompatible features'):
+                    cli.review(args)
+            self.assertEqual(json.loads(result_path.read_text()), original)
+
+    def test_energy_gap_simulates_every_structure_in_resumable_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / 'query.ms'; spec.write_text('>parentmass 700\n>collision 20 eV\n50 1\n')
+            mgf = root / 'atlas.mgf'; mgf.write_text('BEGIN IONS\nEND IONS\n')
+            checkout = root / 'ms-pred'; (checkout / 'src/ms_pred').mkdir(parents=True)
+            gen = root / 'gen.ckpt'; gen.touch()
+            inten = root / 'inten.ckpt'; inten.touch()
+            options = {'model': 'iceberg', 'ms_pred_dir': str(checkout), 'checkpoint': None,
+                'gen_checkpoint': str(gen), 'inten_checkpoint': str(inten),
+                'cuda_devices': None, 'batch_size': 1}
+            calls = []
+            def fake_worker(_, action, **kwargs):
+                if action == 'atlas-smiles':
+                    return ['C', 'CC', 'CCC']
+                self.assertEqual(action, 'simulate')
+                chunk = json.loads(Path(kwargs['smiles_json']).read_text())
+                calls.extend(chunk)
+                self.assertEqual(kwargs['instrument'], 'QTOF')
+                return [{'smiles': s, 'formula': 'C3H8', 'entropy_similarity': 0.1 * len(s),
+                    'explained_intensity': 0.5, 'matched_peaks': []} for s in chunk]
+            with patch.object(cli, 'worker', side_effect=fake_worker):
+                first, count = cli._simulate_shards('python', spec, mgf, 'C3H8', 'eV', root,
+                    options, 'QTOF', 2, 2)
+                second, count2 = cli._simulate_shards('python', spec, mgf, 'C3H8', 'eV', root,
+                    options, 'QTOF', 2, 2)
+            self.assertEqual(calls, ['C', 'CC', 'CCC'])
+            self.assertEqual((count, count2), (3, 3))
+            self.assertEqual([x['smiles'] for x in first], [x['smiles'] for x in second])
+            self.assertEqual(len(list((root / 'model_shards/C3H8').glob('*.json'))), 4)
 
     def test_fragment_ids_are_peak_aligned_and_preserve_large_values(self):
         from msms_structure_elucidation.worker import _serial_fragment_ids
