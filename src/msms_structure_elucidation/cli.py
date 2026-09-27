@@ -105,7 +105,9 @@ def _model_options(args, config: dict, default_model='iceberg') -> dict:
         'gen_checkpoint': path_option(getattr(args, 'gen_checkpoint', None), None, model_cfg.get('gen_ckpt')),
         'inten_checkpoint': path_option(getattr(args, 'inten_checkpoint', None), None, model_cfg.get('inten_ckpt')),
         'cuda_devices': choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices')),
-        'batch_size': getattr(args, 'model_batch_size', None) or model_cfg.get('batch_size', 1)}
+        'batch_size': getattr(args, 'model_batch_size', None) or model_cfg.get('batch_size', 1),
+        'num_cpu_workers': getattr(args, 'model_cpu_workers', None) or model_cfg.get('num_cpu_workers', 1),
+        'num_gpu_workers': getattr(args, 'model_gpu_workers', None) or model_cfg.get('num_gpu_workers', 1)}
 
 
 def _save(result: dict, out: Path, no_report=False) -> None:
@@ -427,7 +429,7 @@ def convert_mgf_command(args):
 def batch(args):
     global _MODEL_SEMAPHORE
     config = settings(args.config)
-    config_hash = hashlib.sha256(Path(config['_config_path']).read_bytes()).hexdigest()
+    config_hash = config['_config_digest']
     formula_list_hash = hashlib.sha256(Path(args.formulas_file).read_bytes()).hexdigest() if args.formulas_file else None
     model_options = _model_options(args, config)
     asset_versions = {key: (model_options[key], Path(model_options[key]).stat().st_size,
@@ -499,6 +501,7 @@ def batch(args):
             cuda_devices=args.cuda_devices, model=args.model, checkpoint=args.checkpoint,
             gen_checkpoint=args.gen_checkpoint, inten_checkpoint=args.inten_checkpoint,
             model_batch_size=args.model_batch_size, model_shard_size=args.model_shard_size,
+            model_cpu_workers=args.model_cpu_workers, model_gpu_workers=args.model_gpu_workers,
             atlas_mgf=None, atlas_cache_dir=str(cache), atlas_url=args.atlas_url,
             top_k=args.top_k, no_report=args.no_report)
         try:
@@ -617,6 +620,17 @@ def visualize(args):
         return 0
 
 
+def setup_command(args):
+    from msms_structure_elucidation.hostsetup import setup
+    options = {} if args.remote else _model_options(args, settings(None))
+    report = setup(args, options, model_python)
+    if args.json:
+        print('SETUP_JSON=' + json.dumps(report, allow_nan=False))
+    else:
+        print(json.dumps(report, indent=2))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='msms-structure-elucidation')
     sub = parser.add_subparsers(dest='command', required=True)
@@ -637,6 +651,8 @@ def main(argv=None):
     command.add_argument('--gen-checkpoint')
     command.add_argument('--inten-checkpoint')
     command.add_argument('--model-batch-size', type=int)
+    command.add_argument('--model-cpu-workers', type=int, help='ms-pred num_cpu_workers')
+    command.add_argument('--model-gpu-workers', type=int, help='ms-pred num_gpu_workers (ICEBERG model copies per job)')
     command.add_argument('--model-shard-size', type=int)
     command.add_argument('--atlas-mgf', help='local formula MGF for offline use')
     command.add_argument('--atlas-cache-dir', help='shared atlas cache, useful in batch runs')
@@ -667,6 +683,8 @@ def main(argv=None):
     reviewer.add_argument('--instrument')
     reviewer.add_argument('--cuda-devices')
     reviewer.add_argument('--model-batch-size', type=int)
+    reviewer.add_argument('--model-cpu-workers', type=int, help='ms-pred num_cpu_workers')
+    reviewer.add_argument('--model-gpu-workers', type=int, help='ms-pred num_gpu_workers (ICEBERG model copies per job)')
     reviewer.add_argument('--model', choices=['glacier', 'iceberg'], default='glacier')
     reviewer.add_argument('--checkpoint', help='GLACIER checkpoint')
     reviewer.add_argument('--gen-checkpoint', help='ICEBERG generation checkpoint')
@@ -693,6 +711,8 @@ def main(argv=None):
     batcher.add_argument('--gen-checkpoint')
     batcher.add_argument('--inten-checkpoint')
     batcher.add_argument('--model-batch-size', type=int)
+    batcher.add_argument('--model-cpu-workers', type=int, help='ms-pred num_cpu_workers')
+    batcher.add_argument('--model-gpu-workers', type=int, help='ms-pred num_gpu_workers (ICEBERG model copies per job)')
     batcher.add_argument('--model-shard-size', type=int)
     batcher.add_argument('--atlas-url')
     batcher.add_argument('--top-k', type=int)
@@ -711,6 +731,19 @@ def main(argv=None):
     generator.add_argument('--iceberg-inten-ckpt')
     generator.add_argument('--num-rounds', type=int, default=0)
     generator.add_argument('--top-k', type=int, default=10)
+    installer = sub.add_parser('setup', help='probe this or a remote host, tune model inference, save configs/local.yaml')
+    installer.add_argument('--ms-pred-python', help='interpreter with ms_pred for the benchmark')
+    installer.add_argument('--ms-pred-dir', help='ms-pred checkout; saved to configs/local.yaml')
+    installer.add_argument('--gen-checkpoint', help='ICEBERG generator; saved to configs/local.yaml')
+    installer.add_argument('--inten-checkpoint', help='ICEBERG intensity model; saved to configs/local.yaml')
+    installer.add_argument('--no-benchmark', action='store_true', help='save heuristic settings without timing ICEBERG')
+    installer.add_argument('--json', action='store_true', help='print one SETUP_JSON= line')
+    installer.add_argument('--remote', help='ssh destination (user@host or ~/.ssh/config alias) that runs the models')
+    installer.add_argument('--remote-repo', help='this repository checked out on the remote host')
+    installer.add_argument('--remote-python', help='remote interpreter with this package installed (default python3)')
+    installer.add_argument('--remote-prefix', help='shell text run before remote commands, for example '
+                           '"source ~/miniforge3/bin/activate ms-pred &&" or "srun --gres=gpu:1"')
+    installer.add_argument('--ssh-option', action='append', help='extra ssh -o option; repeatable')
     viewer = sub.add_parser('visualize', help='open a local interactive fragment review webpage')
     viewer.add_argument('--result', required=True, nargs='+',
                         help='retrieval.json produced by run or review; pass several to review all unknowns on one page')
@@ -727,7 +760,7 @@ def main(argv=None):
     try:
         return {'run': run, 'review': review, 'denovo': denovo,
                 'visualize': visualize, 'convert-mgf': convert_mgf_command,
-                'batch': batch}[args.command](args)
+                'batch': batch, 'setup': setup_command}[args.command](args)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 

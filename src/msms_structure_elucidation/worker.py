@@ -354,7 +354,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              checkpoint: str | None, gen_checkpoint: str | None,
              inten_checkpoint: str | None, output_dir: str,
              experimental_unit: str, instrument: str | None = None,
-             cuda_devices: str | None = None, batch_size: int = 1) -> list[dict]:
+             cuda_devices: str | None = None, batch_size: int = 1,
+             num_cpu_workers: int = 1, num_gpu_workers: int = 1) -> list[dict]:
     """Run ms-pred only for structures unavailable in the precomputed atlas."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
@@ -366,7 +367,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
         prediction = glacier_prediction(candidate_smiles=smiles, collision_energies=model_energies,
             nce=False, adduct=metadata.get('ionization', '[M+H]+'),
             instrument=instrument, python_path=sys.executable, ckpt=checkpoint,
-            cuda_devices=cuda_devices, num_gpu_workers=1, num_cpu_workers=1, batch_size=batch_size)
+            cuda_devices=cuda_devices, num_gpu_workers=1,  # >1 shards GLACIER output across GPUs
+            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
     else:
         if not gen_checkpoint or not inten_checkpoint or not Path(gen_checkpoint).is_file() or not Path(inten_checkpoint).is_file():
             raise FileNotFoundError('ICEBERG generation and intensity checkpoints required; see ms-pred README for public MassSpecGym weights')
@@ -374,8 +376,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
         prediction = iceberg_prediction(candidate_smiles=smiles, collision_energies=model_energies,
             nce=False, adduct=metadata.get('ionization', '[M+H]+'),
             instrument=instrument, python_path=sys.executable, gen_ckpt=gen_checkpoint,
-            inten_ckpt=inten_checkpoint, cuda_devices=cuda_devices, num_gpu_workers=1,
-            num_cpu_workers=1, batch_size=batch_size)
+            inten_ckpt=inten_checkpoint, cuda_devices=cuda_devices, num_gpu_workers=num_gpu_workers,
+            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
     save_dir = Path(prediction[0])
     marker = save_dir / f'{model}_run_successful'
     if not marker.is_file() or not list(save_dir.glob('preds*.hdf5')):
@@ -433,6 +435,8 @@ def main():
     parser.add_argument('--instrument')
     parser.add_argument('--cuda-devices')
     parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--num-cpu-workers', type=int, default=1)
+    parser.add_argument('--num-gpu-workers', type=int, default=1)
     parser.add_argument('--energies')
     parser.add_argument('--ms1-ppm', type=float, default=5.0)
     parser.add_argument('--ms2-ppm', type=float, default=10.0)
@@ -455,7 +459,8 @@ def main():
         result = simulate(args.spectrum, json.loads(Path(args.smiles_json).read_text()),
             args.formula, args.model, args.checkpoint, args.gen_checkpoint,
             args.inten_checkpoint, args.output_dir, args.experimental_unit,
-            args.instrument, args.cuda_devices, args.batch_size)
+            args.instrument, args.cuda_devices, args.batch_size,
+            args.num_cpu_workers, args.num_gpu_workers)
     print('RESULT_JSON=' + json.dumps(result, allow_nan=False))
 
 if __name__ == '__main__':

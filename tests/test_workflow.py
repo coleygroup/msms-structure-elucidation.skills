@@ -11,6 +11,10 @@ from msms_structure_elucidation import cli
 from msms_structure_elucidation.atlas import download_mgf
 from msms_structure_elucidation.atlas import AtlasNoEntry
 from msms_structure_elucidation.spectrum import inspect_ms
+from msms_structure_elucidation import config as config_module
+
+# Tests must not pick up the host settings written by `setup` in configs/local.yaml.
+config_module.LOCAL_CONFIG = Path(tempfile.gettempdir()) / 'msms-tests-no-local-config.yaml'
 
 
 class WorkflowTests(unittest.TestCase):
@@ -214,7 +218,8 @@ class WorkflowTests(unittest.TestCase):
         import msms_structure_elucidation.config as config_module
         checkout = settings(str(config_module.REPO_CONFIG))
         bundled = settings(str(Path(config_module.__file__).with_name('default.yaml')))
-        checkout.pop('_config_path'); bundled.pop('_config_path')
+        for loaded in (checkout, bundled):
+            loaded.pop('_config_path'); loaded.pop('_config_digest')
         self.assertEqual(checkout, bundled)
 
     def test_user_confirmed_nce_overrides_incorrect_header(self):
@@ -396,7 +401,8 @@ class WorkflowTests(unittest.TestCase):
             args = SimpleNamespace(result=str(result_path), smiles_json=str(proposals),
                 ms_pred_python='python', ms_pred_dir=str(checkout), model='glacier',
                 checkpoint=None, gen_checkpoint=None, inten_checkpoint=None,
-                instrument=None, cuda_devices=None, model_batch_size=None, formula=None, config=None)
+                instrument=None, cuda_devices=None, model_batch_size=None, model_cpu_workers=None,
+                model_gpu_workers=None, formula=None, config=None)
             with patch.object(cli, 'worker', side_effect=fake_worker):
                 with self.assertRaisesRegex(RuntimeError, 'incompatible features'):
                     cli.review(args)
