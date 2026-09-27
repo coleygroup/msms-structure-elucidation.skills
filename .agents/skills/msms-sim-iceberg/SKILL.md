@@ -23,3 +23,21 @@ For simulation alone, run the existing ms-pred adapter with the model interprete
 ```
 
 The adapter accepts integer eV values and calls ICEBERG with `nce=False`. If the source is experimental NCE, confirm that unit with the provider, convert using precursor m/z, and round to integer eV before invoking it. For atlas energy gaps, `run` automatically calls ICEBERG on all atlas structures for that formula with no total candidate cap, using resumable shards; set both checkpoints, an ms-pred checkout, and bounded batch/model workers. Validate collision energies and adduct before comparing predicted and experimental spectra. Similarity is not calibrated confidence.
+
+## Inference configuration anchors
+
+These ms-pred settings (`models.simulator` in `configs/default.yaml`, or `--cuda-devices`, `--model-batch-size`, `--model-cpu-workers` and `--model-gpu-workers` on `run`, `review` and `batch`) were measured to work well on these hosts:
+
+| Host | GPU memory | `cuda_devices` | `batch_size` | `num_cpu_workers` | `num_gpu_workers` |
+|---|---|---|---|---|---|
+| Laptop, RTX 4070 Laptop GPU, 16 CPU threads, 16 GB RAM | 8 GB | `0` | 16 | 16 | 2 |
+| Workstation, RTX A5000 | 24 GB | `[1]` | 128 | 16 | 2 |
+
+Only `batch_size` changes between the two hosts, because GPU memory is the limit. For other hosts:
+
+- **GPU memory is the batch_size limit.** Each ICEBERG GPU worker loads its own model copy onto the GPU, so each copy gets about (free VRAM) / `num_gpu_workers`. Batch size grows faster than VRAM: 3x the memory allowed 8x the batch, because the model weights take a fixed share. Pick the nearest anchor, check `nvidia-smi` during the first shard, and double batch_size while peak use stays under about 80%. On CUDA OOM, halve batch_size before reducing `num_gpu_workers`. Large molecules or a higher `max_nodes` need smaller batches.
+- **`num_gpu_workers`: use 2 per visible GPU.** Two ICEBERG processes per GPU overlap one worker's CPU-side fragment-DAG work with the other's GPU work. Workers are assigned round-robin across `CUDA_VISIBLE_DEVICES`, so 2 GPUs means 4. GLACIER always uses 1, because more than 1 splits its output into shard files.
+- **`num_cpu_workers`: about the number of logical CPU threads, up to 16.** On GPU runs, ICEBERG uses these workers only to prepare entries. GLACIER uses them as DataLoader featurization workers. On CPU-only runs, ICEBERG runs one full model per CPU worker, so the limit is RAM, not threads. Start with 4 on a 16 GB machine.
+- **`batch` mode multiplies the workers:** the GPU runs `max_model_jobs × num_gpu_workers` model copies at once. Keep `max_model_jobs: 1` per GPU and parallelize through `num_gpu_workers`.
+- **Increase `shard_size` on large GPUs.** Every shard starts a fresh ms-pred subprocess and reloads the checkpoints. With batch_size 128, 2 GPU workers and 5 energies, a 256-SMILES shard is only 10 batches, so setup time dominates. 1024–2048 keeps an A5000 busy. Changing shard_size or batch_size changes the shard signatures, so a partial run restarts those shards instead of resuming them.
+- CPU-only: leave `cuda_devices: null` and `num_gpu_workers` has no effect. Use batch_size 1–8.
