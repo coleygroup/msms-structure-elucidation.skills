@@ -4,48 +4,147 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MS/MS fragment review</title>
+  <title>Interactive fragment review · MS/MS structure elucidation</title>
+  <script>try { const t = localStorage.getItem('msms-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
   <link rel="stylesheet" href="/assets/viewer.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='7' rx='2' fill='%232a78d6'/%3E%3Crect y='9' width='16' height='7' rx='2' fill='%23eb6834'/%3E%3C/svg%3E">
 </head>
 <body>
-  <header>
-    <div><p class="eyebrow">MS/MS structure elucidation</p><h1>Interactive fragment review</h1>
-      <p id="summary">Loading retrieval result…</p></div>
-    <div class="header-actions"><span id="source-warning"></span><a href="/api/state" target="_blank" rel="noopener">Result data</a></div>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="Overview">
+      <span class="mark" aria-hidden="true"></span>
+      <span><strong>Fragment review</strong><small id="dataset">MS/MS structure elucidation</small></span>
+    </a>
+    <div class="top-actions">
+      <button id="open-search" class="ghost" type="button" title="Search unknowns">Search unknowns <kbd>/</kbd></button>
+      <button id="export" class="ghost" type="button" title="Write one self-contained read-only HTML report">Export report</button>
+      <button id="theme" class="ghost icon" type="button" aria-label="Toggle light or dark theme" title="Theme">◐</button>
+      <button id="help" class="ghost icon" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts">?</button>
+    </div>
   </header>
-  <main>
-    <aside><h2>Ranked candidates</h2><div id="candidate-list"></div></aside>
-    <section id="detail">
-      <div id="error" role="alert"></div>
-      <div class="panel candidate-top"><img id="structure" alt="Selected candidate structure"><div>
-        <h2 id="candidate-title"></h2><p id="candidate-meta"></p><code id="smiles"></code>
-        <div class="metrics" id="metrics"></div>
-      </div></div>
-      <div class="panel">
-        <div class="controls"><label>Experimental collision energy <select id="energy"></select></label>
-          <label>m/z minimum <input id="mz-min" type="number" min="0" step="any"></label>
-          <label>m/z maximum <input id="mz-max" type="number" min="0" step="any"></label>
-          <button id="zoom-apply" type="button">Apply zoom</button><button id="zoom-reset" type="button">Reset</button></div>
-        <p class="legend"><span class="pred-key">Predicted ↑</span><span class="exp-key">Experimental ↓</span><span class="match-key">Matched experimental peak</span></p>
-        <svg id="mirror" viewBox="0 0 1000 430" role="img" aria-label="Interactive mirror mass spectrum"></svg>
-        <p class="hint" id="energy-note"></p>
+  <div id="error" class="banner error" role="alert" hidden></div>
+
+  <main id="overview" hidden>
+    <p class="notice" id="demo-note" hidden><b>Demo only:</b> the review controls (Keep, Uncertain, Reject, candidate comments and fragment notes) work here so you can try them, but reviews are saved only in this browser. They are not shared with anyone and are not added to the analysis.</p>
+    <section class="kpis" id="kpis" aria-label="Summary"></section>
+    <section class="ov-grid">
+      <div class="card">
+        <div class="card-head"><h2>Top-candidate similarity</h2><span class="sub">rank-1 entropy similarity per unknown</span></div>
+        <div id="hist" class="chart"></div>
       </div>
-      <div class="panel">
-        <div class="controls"><h3>Predicted fragments</h3><label>Top fragments <input id="top-fragments" type="range" min="0" max="20" value="5"></label><span id="top-count">5</span></div>
-        <div id="fragment-strip" class="fragment-strip"></div>
-        <p class="hint" id="annotation-note"></p>
+      <div class="card">
+        <div class="card-head"><h2>Outcome</h2><span class="sub">where the ranked candidates came from</span></div>
+        <div id="outcomes"></div>
+        <div class="card-head spaced"><h2>Review progress</h2><span class="sub" id="review-sub"></span></div>
+        <div id="review-bar"></div>
       </div>
-      <div class="panel review-layout">
-        <div><h3>Selected fragment</h3><div id="fragment-detail" class="fragment-detail">Click an annotated predicted peak or a matched experimental peak.</div></div>
-        <div><h3>Review on this page</h3>
-          <label>Candidate decision <select id="decision"><option value="unreviewed">Unreviewed</option><option value="keep">Keep</option><option value="uncertain">Uncertain</option><option value="reject">Reject</option></select></label>
-          <label>Candidate comment <textarea id="candidate-comment" maxlength="2000" rows="3"></textarea></label>
-          <label>Selected fragment comment <textarea id="fragment-comment" maxlength="2000" rows="3" disabled></textarea></label>
-          <button id="save-review" type="button">Save review</button><span id="save-status" role="status"></span>
+    </section>
+    <section class="card">
+      <div class="table-head">
+        <h2>Unknowns</h2>
+        <div class="filters">
+          <input id="f-q" type="search" placeholder="Name, formula, m/z or SMILES" aria-label="Filter unknowns">
+          <select id="f-outcome" aria-label="Outcome filter">
+            <option value="">All outcomes</option><option value="atlas">ICEBERG Atlas</option><option value="model">Model prediction</option>
+            <option value="none">No candidates</option>
+          </select>
+          <select id="f-review" aria-label="Review filter">
+            <option value="">Any review state</option><option value="todo">Not reviewed</option><option value="keep">Kept</option>
+            <option value="uncertain">Uncertain</option><option value="reject">Rejected</option>
+          </select>
+          <label class="range">Similarity ≥ <input id="f-sim" type="range" min="0" max="0.9" step="0.05" value="0"><output id="f-sim-v">0.00</output></label>
         </div>
+        <span class="count" id="ov-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="ov-table">
+          <thead><tr>
+            <th data-k="label">Unknown</th><th data-k="parentmass" class="num">m/z</th><th data-k="rt_min" class="num">RT (min)</th>
+            <th data-k="formula">Formula</th><th data-k="outcome">Outcome</th><th>Rank-1 structure</th>
+            <th data-k="top_similarity" class="num">Similarity</th><th data-k="top_explained" class="num">Explained</th><th data-k="verdict">Review</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     </section>
   </main>
+
+  <main id="workspace" hidden>
+    <div class="ws-bar">
+      <a class="back" href="#overview">← Overview</a>
+      <div class="ws-title"><h1 id="ws-name"></h1><div id="ws-meta" class="meta"></div></div>
+      <div class="ws-nav">
+        <button id="prev" type="button" class="ghost" title="Previous unknown (k)">‹ <kbd>k</kbd></button>
+        <span id="ws-pos" class="pos"></span>
+        <button id="next" type="button" class="ghost" title="Next unknown (j)"><kbd>j</kbd> ›</button>
+      </div>
+    </div>
+    <div class="ws-grid" id="ws-grid">
+      <aside class="rail" aria-label="Ranked candidates">
+        <div class="rail-head"><h2>Candidates</h2><span id="rail-count" class="sub"></span></div>
+        <ol id="cands"></ol>
+      </aside>
+      <section class="center">
+        <div class="card plot-card">
+          <div class="plot-head">
+            <div class="legend" id="legend"></div>
+            <div class="plot-tools">
+              <label class="inline">Energy <select id="energy"></select></label>
+              <button id="compare" type="button" class="ghost" aria-pressed="false" title="Compare with another candidate (c)">Compare <kbd>c</kbd></button>
+              <select id="compare-with" aria-label="Candidate to compare" hidden></select>
+              <button id="reset-zoom" type="button" class="ghost" title="Reset zoom (double-click plot)">Reset zoom</button>
+            </div>
+          </div>
+          <div id="plots"></div>
+          <p class="hint">Drag across the plot to zoom · double-click to reset · click a peak to inspect its fragment · <kbd>←</kbd><kbd>→</kbd> step through annotated peaks</p>
+        </div>
+        <div class="card" id="evidence"></div>
+      </section>
+      <aside class="inspector card" aria-label="Inspector">
+        <div class="struct" id="struct"></div>
+        <div id="cand-summary" class="cand-summary"></div>
+        <div id="peak-info" class="peak-info"></div>
+        <label class="field">Fragment note
+          <textarea id="frag-note" rows="3" maxlength="2000" disabled placeholder="Select an annotated peak to comment on its fragment"></textarea></label>
+        <div class="card-head spaced"><h3>Strongest predicted fragments</h3></div>
+        <div id="frag-list" class="frag-list"></div>
+      </aside>
+    </div>
+    <div class="ws-empty card" id="ws-empty" hidden></div>
+    <div class="verdict" id="verdict">
+      <span class="chip demo" id="demo-chip" hidden title="Reviews here are a demo: they stay in this browser and are not shared or added to the analysis.">Demo only</span>
+      <span class="vlabel">Verdict for <b id="v-rank"></b></span>
+      <div class="seg" id="decision" role="group" aria-label="Candidate decision">
+        <button type="button" data-d="keep"><span class="ico keep" aria-hidden="true">✓</span>Keep <kbd>1</kbd></button>
+        <button type="button" data-d="uncertain"><span class="ico uncertain" aria-hidden="true">?</span>Uncertain <kbd>2</kbd></button>
+        <button type="button" data-d="reject"><span class="ico reject" aria-hidden="true">✕</span>Reject <kbd>3</kbd></button>
+        <button type="button" data-d="unreviewed">Clear <kbd>0</kbd></button>
+      </div>
+      <input id="cand-comment" type="text" maxlength="2000" placeholder="Comment on this candidate…" aria-label="Candidate comment">
+      <span id="save-state" class="save-state" role="status"></span>
+    </div>
+  </main>
+
+  <dialog id="palette" aria-label="Search unknowns">
+    <input id="pal-q" type="search" placeholder="Jump to an unknown: name, formula, m/z, SMILES" aria-label="Search unknowns">
+    <ol id="pal-list"></ol>
+  </dialog>
+  <dialog id="shortcuts" aria-label="Keyboard shortcuts">
+    <h2>Keyboard shortcuts</h2>
+    <dl>
+      <dt><kbd>/</kbd></dt><dd>Search unknowns</dd>
+      <dt><kbd>j</kbd> <kbd>k</kbd></dt><dd>Next / previous unknown (in the overview's filter and sort order)</dd>
+      <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>Previous / next candidate</dd>
+      <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Previous / next annotated predicted peak</dd>
+      <dt><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>0</kbd></dt><dd>Keep / uncertain / reject / clear the current candidate</dd>
+      <dt><kbd>c</kbd></dt><dd>Compare with another candidate</dd>
+      <dt><kbd>z</kbd></dt><dd>Reset zoom</dd>
+      <dt><kbd>Esc</kbd></dt><dd>Clear peak selection · back to overview</dd>
+    </dl>
+    <form method="dialog"><button type="submit">Close</button></form>
+  </dialog>
+  <div id="tip" class="tip" role="tooltip" hidden></div>
+  <div id="toast" class="toast" role="status" hidden></div>
   <script src="/assets/viewer.js" defer></script>
 </body>
 </html>
