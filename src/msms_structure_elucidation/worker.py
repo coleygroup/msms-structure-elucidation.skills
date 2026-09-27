@@ -223,8 +223,8 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
             'missing_energies_ev': sorted(missing_energies)}
 
 
-def formula_candidates(spectrum: str, experimental_unit: str,
-                       max_candidates: int = 3) -> list[dict]:
+def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: int = 3,
+                       ms1_ppm: float = 5.0, ms2_ppm: float = 10.0) -> list[dict]:
     """Use ms-pred's MSBuddy bridge, retaining evidence that formula is inferred."""
     from ms_pred import common
     metadata, _ = common.parse_spectra(spectrum)
@@ -245,7 +245,7 @@ def formula_candidates(spectrum: str, experimental_unit: str,
         try:
             import msbuddy
             # Use MSBuddy's own annotated MGF importer and formula ranking.
-            engine = msbuddy.Msbuddy()
+            engine = msbuddy.Msbuddy(msbuddy.MsbuddyConfig(ppm=True, ms1_tol=ms1_ppm, ms2_tol=ms2_ppm))
             engine.load_mgf(str(mgf))
             engine.annotate_formula()
             formulas = []
@@ -277,7 +277,12 @@ def validate_smiles(smiles: list[str], formula: str) -> list[dict]:
             continue
         seen.add(canonical)
         found = rdMolDescriptors.CalcMolFormula(mol)
-        out.append({'smiles': canonical, 'formula': found, 'formula_match': found == formula})
+        try:  # connectivity block of the InChIKey: matches atlas entries stored without stereochemistry
+            connectivity = Chem.MolToInchiKey(mol)[:14] or None
+        except Exception:
+            connectivity = None
+        out.append({'smiles': canonical, 'formula': found, 'formula_match': found == formula,
+                    'connectivity': connectivity})
     return out
 
 
@@ -375,7 +380,14 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
     marker = save_dir / f'{model}_run_successful'
     if not marker.is_file() or not list(save_dir.glob('preds*.hdf5')):
         raise RuntimeError(f'{model.upper()} subprocess failed or produced no spectra at {save_dir}; check model logs and checkpoint compatibility')
+    import ms_pred
     from ms_pred import common
+    try:  # model versions are tracked separately from the ms-pred package version
+        from ms_pred.model_registry import MODEL_REGISTRY
+        model_version = MODEL_REGISTRY.get(model, {}).get('version')
+    except ImportError:
+        model_version = None
+    ms_pred_version = getattr(ms_pred, '__version__', None)
     pred_db = common.PredSpecDB(save_dir / 'preds.hdf5')
     results = []
     try:
@@ -393,7 +405,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
                 'energy_alignment': alignment, 'matched_peaks': matched,
                 'predicted_spectra': _serial_spec(pred),
                 'predicted_fragment_ids': _serial_fragment_ids(pred),
-                'model_collision_energies_ev': model_energies,
+                'model_collision_energies_ev': model_energies, 'model_instrument': instrument,
+                'model_name': model.upper(), 'model_version': model_version, 'ms_pred_version': ms_pred_version,
                 'model_checkpoint': checkpoint if model == 'glacier' else [gen_checkpoint, inten_checkpoint],
                 'structure_image': _structure_image(smi)})
     finally:
@@ -421,6 +434,8 @@ def main():
     parser.add_argument('--cuda-devices')
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--energies')
+    parser.add_argument('--ms1-ppm', type=float, default=5.0)
+    parser.add_argument('--ms2-ppm', type=float, default=10.0)
     args = parser.parse_args()
     if args.action in ('rank', 'formula', 'simulate') and not args.experimental_unit:
         parser.error('--experimental-unit is required for experimental spectra')
@@ -432,7 +447,8 @@ def main():
         result = atlas_info(args.mgf, [int(value) for value in args.energies.split(',')],
             args.spectrum, args.formula, args.experimental_unit)
     elif args.action == 'formula':
-        result = formula_candidates(args.spectrum, args.experimental_unit)
+        result = formula_candidates(args.spectrum, args.experimental_unit,
+                                    ms1_ppm=args.ms1_ppm, ms2_ppm=args.ms2_ppm)
     elif args.action == 'validate':
         result = validate_smiles(json.loads(Path(args.smiles_json).read_text()), args.formula)
     else:

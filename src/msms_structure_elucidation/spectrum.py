@@ -5,6 +5,23 @@ import math
 from pathlib import Path
 
 
+# Default precursor (MS1) and fragment (MS2) tolerances by mass analyzer, in ppm.
+MASS_TOLERANCE_PPM = {'Q-TOF': (10.0, 20.0), 'Orbitrap': (5.0, 10.0)}
+
+
+def mass_tolerance(instrumentation: str | None) -> dict:
+    """Tolerances for the instrument named in the .ms header; unknown analyzers get the wider Q-TOF values."""
+    text = (instrumentation or '').lower()
+    if 'tof' in text:
+        kind = 'Q-TOF'
+    elif any(key in text for key in ('orbitrap', 'fticr', 'ft-icr', 'it-ft', 'q exactive', 'exploris')):
+        kind = 'Orbitrap'
+    else:
+        kind = None
+    ms1, ms2 = MASS_TOLERANCE_PPM[kind or 'Q-TOF']
+    return {'instrument': kind or 'unknown', 'ms1_ppm': ms1, 'ms2_ppm': ms2}
+
+
 def inspect_ms(path: Path, collision_unit: str) -> dict:
     """Read a spectrum using the user-confirmed collision-energy unit."""
     if collision_unit not in ('NCE', 'eV'):

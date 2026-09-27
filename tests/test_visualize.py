@@ -70,6 +70,87 @@ class VisualizeTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/review', json=bad,
             headers={'X-Review-Token': state['review_token']}).status_code, 400)
 
+    def test_several_results_share_one_page_with_separate_notes(self):
+        from msms_structure_elucidation.visualize import create_app
+        second_dir = self.root / 'feature_2'
+        second_dir.mkdir()
+        second = second_dir / 'retrieval.json'
+        source = json.loads(self.result.read_text())
+        source['candidates'][0].update(inchikey='SECOND-KEY', entropy_similarity=0.8)
+        second.write_text(json.dumps(source))
+        empty_dir = self.root / 'feature_3'
+        empty_dir.mkdir()
+        (empty_dir / 'retrieval.json').write_text(json.dumps({**source, 'candidates': [], 'formula': None}))
+        client = create_app([self.result, second, empty_dir / 'retrieval.json']).test_client()
+        index = client.get('/api/index').json['results']
+        self.assertEqual([r['label'] for r in index], [self.root.name, 'feature_2', 'feature_3'])
+        self.assertEqual(index[1]['top_similarity'], 0.8)
+        self.assertEqual(index[2]['candidates'], 0)
+        state = client.get('/api/state?result=1').json
+        self.assertEqual(state['result']['candidates'][0]['review_key'], 'inchikey:SECOND-KEY')
+        self.assertEqual(client.get('/api/state?result=3').status_code, 404)
+        self.assertEqual(client.get('/api/fragment/1/0/10/0').status_code, 200)
+        body = {'result': 1, 'candidate_key': 'inchikey:SECOND-KEY', 'decision': 'reject', 'comment': ''}
+        response = client.post('/api/review', json=body, headers={'X-Review-Token': state['review_token']})
+        self.assertEqual(response.status_code, 200, response.json)
+        self.assertEqual(response.json['reviewed'], 1)
+        self.assertTrue((second_dir / 'review_notes.json').exists())
+        self.assertFalse((self.root / 'review_notes.json').exists())
+        wrong = {**body, 'result': 0}
+        self.assertEqual(client.post('/api/review', json=wrong,
+            headers={'X-Review-Token': state['review_token']}).status_code, 400)
+
+    def test_candidate_payload_thumbnail_and_index_fields(self):
+        payload = self.client.get('/api/candidate/0/0')
+        self.assertEqual(payload.status_code, 200, payload.json)
+        self.assertIn('<svg', payload.json['svg'])
+        self.assertNotIn('#000000', payload.json['svg'])
+        self.assertEqual(len(payload.json['peaks']['10']), 1)
+        self.assertEqual(set(payload.json['fragments']['1']), {'a', 'b'})
+        self.assertEqual(self.client.get('/api/candidate/0/1').status_code, 404)
+        thumb = self.client.get('/api/thumb/0')
+        self.assertEqual(thumb.status_code, 200)
+        self.assertIn(b'<svg', thumb.data)
+        index = self.client.get('/api/index').json
+        self.assertEqual(index['results'][0]['outcome'], 'model')
+        self.assertEqual(index['results'][0]['top_model'], 'ICEBERG')
+        from msms_structure_elucidation.visualize import model_label
+        self.assertEqual(model_label({'source': 'ICEBERG', 'model_name': 'ICEBERG', 'model_version': '2.1'}), 'ICEBERG 2.1')
+        self.assertIsNone(model_label({'source': 'public ICEBERG 2.1 PubChem atlas'}))
+        self.assertTrue(index['review_token'])
+        state = self.client.get('/api/state').json['result']
+        self.assertEqual(list(state['candidates'][0]['predicted_spectra']), ['10'])
+
+    def test_static_export_is_self_contained(self):
+        from msms_structure_elucidation.visualize import export_static
+        source = json.loads(self.result.read_text())
+        source['candidates'][0]['smiles'] = 'CC</script>O'
+        (self.root / 'odd').mkdir()
+        odd = self.root / 'odd' / 'retrieval.json'
+        odd.write_text(json.dumps(source))
+        out = export_static([self.result, odd], self.root / 'report.html')
+        page = out.read_text()
+        self.assertNotIn('/assets/viewer.js', page)
+        self.assertIn('window.MSMS_STATIC=', page)
+        data = page.split('window.MSMS_STATIC=', 1)[1].split(';</script>', 1)[0]
+        self.assertNotIn('</script>', data)
+        parsed = json.loads(data.replace('<\\/', '</'))
+        self.assertEqual([r['label'] for r in parsed['index']], [self.root.name, 'odd'])
+        self.assertEqual(parsed['results'][1]['result']['candidates'][0]['smiles'], 'CC</script>O')
+
+    def test_static_export_with_separate_data_and_demo_reviews(self):
+        import gzip
+        from msms_structure_elucidation.visualize import export_static
+        out = export_static([self.result], self.root / 'site' / 'review.html', split_data=True,
+                            demo_reviews=True, title='Demo Review')
+        page = out.read_text()
+        self.assertIn('<title>Demo Review</title>', page)
+        self.assertIn('window.MSMS_STATIC_SRC="review.data.json.gz"', page)
+        self.assertNotIn('window.MSMS_STATIC=', page)
+        data = json.loads(gzip.decompress((self.root / 'site' / 'review.data.json.gz').read_bytes()))
+        self.assertTrue(data['demo_reviews'])
+        self.assertEqual(len(data['results']), 1)
+
     def test_legacy_atlas_backfill_requires_aligned_peaks(self):
         from msms_structure_elucidation.visualize import load_result
         source = json.loads(self.result.read_text())
