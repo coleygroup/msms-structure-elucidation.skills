@@ -367,7 +367,8 @@ def _inline_page(data: dict | None, data_src: str | None = None, title: str | No
 
 def export_static(result_paths, output: Path, top_k: int = 5, max_exp_peaks: int = 250,
                   progress=None, split_data: bool = False, demo_reviews: bool = False,
-                  title: str | None = None) -> Path:
+                  title: str | None = None, demo_source_url: str | None = None,
+                  demo_install_url: str | None = None) -> Path:
     """Write one review page for every result: self-contained, or with its data in a gzip file beside it
     (split_data, for hosts with a page-size limit). Reviews are read-only unless demo_reviews, which lets
     viewers try the review controls with notes kept only in their own browser."""
@@ -377,6 +378,15 @@ def export_static(result_paths, output: Path, top_k: int = 5, max_exp_peaks: int
         summary, _ = _summarize(i, path)
         result = load_result(path)
         slim = client_result(result, top_k=top_k, max_exp_peaks=max_exp_peaks)
+        if demo_source_url:
+            # Public snapshots should not disclose the paths of the machine that ran the analysis.
+            summary['path'] = summary['label']
+            slim['input'] = Path(slim['input']).name
+            for formula_result in slim.get('formula_results', []):
+                formula_result.pop('atlas_mgf', None)
+            for candidate in slim['candidates']:
+                if candidate.get('model_checkpoint'):
+                    candidate['model_checkpoint'] = Path(candidate['model_checkpoint']).name
         structures = [candidate_payload(c, result.get('adduct', '')) for c in slim['candidates']]
         index.append(summary)
         results.append({'label': summary['label'], 'result': slim, 'structures': structures,
@@ -385,6 +395,10 @@ def export_static(result_paths, output: Path, top_k: int = 5, max_exp_peaks: int
             progress(i + 1, len(paths))
     data = {'index': index, 'results': results, 'top_k': top_k, 'demo_reviews': demo_reviews,
             'exported_at': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+    if demo_source_url:
+        data['demo_source_url'] = demo_source_url
+    if demo_install_url:
+        data['demo_install_url'] = demo_install_url
     output = Path(output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if split_data:

@@ -1,0 +1,47 @@
+name: Publish MS/MS demo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'demo/msms-structure-elucidation/**'
+      - '.github/workflows/demo-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: demo-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Stage only the public demo
+        run: |
+          mkdir -p _site/demo/msms-structure-elucidation
+          cp demo/msms-structure-elucidation/index.html demo/msms-structure-elucidation/manifest.json _site/demo/msms-structure-elucidation/
+          cat > _site/index.html <<'HTML'
+          <!doctype html><html lang="en"><meta charset="utf-8"><title>MS/MS structure elucidation demo</title>
+          <meta http-equiv="refresh" content="0;url=demo/msms-structure-elucidation/">
+          <p><a href="demo/msms-structure-elucidation/">Explore the plasma unknown demo</a></p>
+          HTML
+          touch _site/.nojekyll
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload demo
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Deploy demo
+        id: deployment
+        uses: actions/deploy-pages@v4

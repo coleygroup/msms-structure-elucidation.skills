@@ -151,6 +151,24 @@ class VisualizeTests(unittest.TestCase):
         self.assertTrue(data['demo_reviews'])
         self.assertEqual(len(data['results']), 1)
 
+    def test_public_demo_export_hides_local_paths_and_keeps_fragments(self):
+        from msms_structure_elucidation.visualize import export_static
+        source = json.loads(self.result.read_text())
+        source['input'] = str(self.root / 'private' / 'query.ms')
+        source['formula_results'] = [{'formula': 'C2H6O', 'atlas_mgf': str(self.root / 'atlas.mgf')}]
+        self.result.write_text(json.dumps(source))
+        out = export_static([self.result], self.root / 'public.html', demo_reviews=True,
+                            demo_source_url='https://example.org/query.ms',
+                            demo_install_url='https://example.org/skills')
+        page = out.read_text()
+        self.assertNotIn(str(self.root), page)
+        data = json.loads(page.split('window.MSMS_STATIC=', 1)[1].split(';</script>', 1)[0])
+        self.assertEqual(data['demo_source_url'], 'https://example.org/query.ms')
+        self.assertEqual(data['results'][0]['result']['input'], 'query.ms')
+        self.assertNotIn('atlas_mgf', data['results'][0]['result']['formula_results'][0])
+        self.assertEqual(len(data['results'][0]['structures'][0]['peaks']['10']), 1)
+        self.assertTrue(data['results'][0]['structures'][0]['fragments'])
+
     def test_legacy_atlas_backfill_requires_aligned_peaks(self):
         from msms_structure_elucidation.visualize import load_result
         source = json.loads(self.result.read_text())

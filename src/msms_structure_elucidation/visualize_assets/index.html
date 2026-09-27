@@ -7,7 +7,7 @@
   <title>Interactive fragment review · MS/MS structure elucidation</title>
   <script>try { const t = localStorage.getItem('msms-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
   <link rel="stylesheet" href="/assets/viewer.css">
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='7' rx='2' fill='%232a78d6'/%3E%3Crect y='9' width='16' height='7' rx='2' fill='%23eb6834'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='7' rx='2' fill='%2358595b'/%3E%3Crect y='9' width='16' height='7' rx='2' fill='%237c9d97'/%3E%3C/svg%3E">
 </head>
 <body>
   <header class="topbar">
@@ -78,6 +78,10 @@
         <span id="ws-pos" class="pos"></span>
         <button id="next" type="button" class="ghost" title="Next unknown (j)"><kbd>j</kbd> ›</button>
       </div>
+    </div>
+    <div class="notice demo-guide" id="demo-guide" hidden>
+      <span><b>Explore a real MS/MS result.</b> Switch energies, click peaks to inspect predicted fragments, compare structures, and try review notes. Demo notes stay in your browser; similarity is not identification confidence.</span>
+      <span class="demo-links"><a id="demo-source" hidden target="_blank" rel="noopener noreferrer">Source spectrum ↗</a><a id="demo-install" hidden target="_blank" rel="noopener noreferrer">Get the skills ↗</a></span>
     </div>
     <div class="ws-grid" id="ws-grid">
       <aside class="rail" aria-label="Ranked candidates">
