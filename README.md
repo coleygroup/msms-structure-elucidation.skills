@@ -14,7 +14,7 @@ Then attach your spectrum or give its path and ask the agent to analyze it. The 
 
 The [plasma unknown 583 demo](demo/msms-structure-elucidation/index.html) is a self-contained interactive result. Download the HTML file and open it in a browser. It uses the public [plasma_unknown_583.ms](https://github.com/coleygroup/ms-pred/blob/main/data/exp_specs/clinical/plasma_unknown_583.ms) spectrum from ms-pred. Its provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE**, despite the file's eV labels.
 
-In the demo, switch between collision energies, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Similarity ranks candidates but is not a probability of identification.
+In the demo, switch between collision energies, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Entropy similarity and explained intensity help rank candidates; explained intensity breaks close score ties. Neither is a probability of identification.
 
 ## What to provide
 
