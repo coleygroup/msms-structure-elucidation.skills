@@ -7,13 +7,14 @@ import concurrent.futures
 from collections import Counter
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
+from msms_structure_elucidation import hostprobe
 from msms_structure_elucidation.atlas import AtlasNoEntry, download_mgf
 from msms_structure_elucidation.config import asset, choice, settings
 from msms_structure_elucidation.report import write_report
@@ -426,8 +427,65 @@ def convert_mgf_command(args):
     return 0
 
 
-def batch(args):
+def _batch_feature(key, row, context: dict) -> dict:
+    """Run one manifest feature; executes in a batch worker process."""
+    args, out, cache = context['args'], context['out'], context['cache']
+    feature_counts, formula_list_hash = context['feature_counts'], context['formula_list_hash']
+    config_hash, asset_versions = context['config_hash'], context['asset_versions']
+    feature, path = key
+    name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in feature)
+    if feature_counts[feature] > 1 or name != feature:
+        name += '__' + hashlib.sha256((feature + path).encode()).hexdigest()[:8]
+    target = out / name
+    try:
+        old = json.loads((target / 'batch_state.json').read_text()) if (target / 'batch_state.json').exists() else {}
+    except (OSError, ValueError):
+        old = {}
+    formula = row.get('formula') or None
+    unit = row.get('collision_unit') or args.collision_unit
+    if not unit:
+        return {'feature_id': feature, 'status': 'needs_energy_unit', 'output_dir': str(target)}
+    digest = hashlib.sha256()
+    try:
+        with Path(path).open('rb') as file:
+            for block in iter(lambda: file.read(1024 * 1024), b''):
+                digest.update(block)
+    except OSError as exc:
+        return {'feature_id': feature, 'status': 'error', 'output_dir': str(target), 'error': str(exc)}
+    file_hash = digest.hexdigest()
+    signature = hashlib.sha256(json.dumps([file_hash, unit, formula,
+        formula_list_hash, config_hash, asset_versions, args.model, args.ms_pred_dir,
+        args.instrument, args.cuda_devices, args.top_k, args.atlas_url], sort_keys=True).encode()).hexdigest()
+    if old.get('signature') == signature and (target / 'retrieval.json').is_file():
+        previous = json.loads((target / 'retrieval.json').read_text())
+        if previous.get('status') in ('ranked', 'needs_formula', 'no_atlas_coverage', 'no_candidates'):
+            return {'feature_id': feature, 'status': previous['status'], 'output_dir': str(target), 'resumed': True}
+    opts = argparse.Namespace(input=path, collision_unit=unit, output_dir=str(target), formula=formula,
+        formulas_file=args.formulas_file, ms_pred_python=args.ms_pred_python, ms_pred_dir=args.ms_pred_dir,
+        config=args.config, instrument=row.get('instrument') or args.instrument,
+        cuda_devices=args.cuda_devices, model=args.model, checkpoint=args.checkpoint,
+        gen_checkpoint=args.gen_checkpoint, inten_checkpoint=args.inten_checkpoint,
+        model_batch_size=args.model_batch_size, model_shard_size=args.model_shard_size,
+        model_cpu_workers=args.model_cpu_workers, model_gpu_workers=args.model_gpu_workers,
+        atlas_mgf=None, atlas_cache_dir=str(cache), atlas_url=args.atlas_url,
+        top_k=args.top_k, no_report=args.no_report)
+    try:
+        run(opts)
+        status = json.loads((target / 'retrieval.json').read_text())['status']
+    except Exception as exc:
+        status = 'error'
+        error = str(exc)
+    (target / 'batch_state.json').write_text(json.dumps({'signature': signature}))
+    return {'feature_id': feature, 'status': status, 'output_dir': str(target), **({'error': error} if status == 'error' else {})}
+
+
+def _batch_worker_init(model_semaphore) -> None:
+    """Share one model-job limit across batch worker processes."""
     global _MODEL_SEMAPHORE
+    _MODEL_SEMAPHORE = model_semaphore
+
+
+def batch(args):
     config = settings(args.config)
     config_hash = config['_config_digest']
     formula_list_hash = hashlib.sha256(Path(args.formulas_file).read_bytes()).hexdigest() if args.formulas_file else None
@@ -436,16 +494,19 @@ def batch(args):
         Path(model_options[key]).stat().st_mtime_ns) for key in ('checkpoint', 'gen_checkpoint', 'inten_checkpoint')
         if model_options.get(key) and Path(model_options[key]).is_file()}
     defaults = config.get('models', {}).get('batch', {})
-    max_workers = args.max_workers or defaults.get('max_workers', 1)
     max_model_jobs = args.max_model_jobs or defaults.get('max_model_jobs', 1)
     min_free_gb = args.min_free_memory_gb if args.min_free_memory_gb is not None else defaults.get('min_free_memory_gb', 4)
+    max_workers = args.max_workers or defaults.get('max_workers') or 'auto'
+    if max_workers == 'auto':
+        # Several features at once keep the GPU busy while others run formula, atlas and scoring steps.
+        max_workers = hostprobe.batch_workers(hostprobe.cpu_threads(), hostprobe.ram_gb()[0],
+                                              max_model_jobs, min_free_gb)
     if min(max_workers, max_model_jobs) < 1:
         raise ValueError('Batch worker counts must be positive')
     try:
         import psutil
     except ImportError as exc:
         raise RuntimeError('Batch memory checks require the batch extra: pip install .[batch]') from exc
-    _MODEL_SEMAPHORE = threading.Semaphore(max_model_jobs)
     out = Path(args.output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     cache = out / 'atlas_cache'
@@ -466,60 +527,20 @@ def batch(args):
         key = (row.get('feature_id') or candidate.stem, str(candidate.resolve()))
         jobs[key] = row
     feature_counts = Counter(feature for feature, _ in jobs)
-    def execute(key, row):
-        feature, path = key
-        name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in feature)
-        if feature_counts[feature] > 1 or name != feature:
-            name += '__' + hashlib.sha256((feature + path).encode()).hexdigest()[:8]
-        target = out / name
-        try:
-            old = json.loads((target / 'batch_state.json').read_text()) if (target / 'batch_state.json').exists() else {}
-        except (OSError, ValueError):
-            old = {}
-        formula = row.get('formula') or None
-        unit = row.get('collision_unit') or args.collision_unit
-        if not unit:
-            return {'feature_id': feature, 'status': 'needs_energy_unit', 'output_dir': str(target)}
-        digest = hashlib.sha256()
-        try:
-            with Path(path).open('rb') as file:
-                for block in iter(lambda: file.read(1024 * 1024), b''):
-                    digest.update(block)
-        except OSError as exc:
-            return {'feature_id': feature, 'status': 'error', 'output_dir': str(target), 'error': str(exc)}
-        file_hash = digest.hexdigest()
-        signature = hashlib.sha256(json.dumps([file_hash, unit, formula,
-            formula_list_hash, config_hash, asset_versions, args.model, args.ms_pred_dir,
-            args.instrument, args.cuda_devices, args.top_k, args.atlas_url], sort_keys=True).encode()).hexdigest()
-        if old.get('signature') == signature and (target / 'retrieval.json').is_file():
-            previous = json.loads((target / 'retrieval.json').read_text())
-            if previous.get('status') in ('ranked', 'needs_formula', 'no_atlas_coverage', 'no_candidates'):
-                return {'feature_id': feature, 'status': previous['status'], 'output_dir': str(target), 'resumed': True}
-        opts = argparse.Namespace(input=path, collision_unit=unit, output_dir=str(target), formula=formula,
-            formulas_file=args.formulas_file, ms_pred_python=args.ms_pred_python, ms_pred_dir=args.ms_pred_dir,
-            config=args.config, instrument=row.get('instrument') or args.instrument,
-            cuda_devices=args.cuda_devices, model=args.model, checkpoint=args.checkpoint,
-            gen_checkpoint=args.gen_checkpoint, inten_checkpoint=args.inten_checkpoint,
-            model_batch_size=args.model_batch_size, model_shard_size=args.model_shard_size,
-            model_cpu_workers=args.model_cpu_workers, model_gpu_workers=args.model_gpu_workers,
-            atlas_mgf=None, atlas_cache_dir=str(cache), atlas_url=args.atlas_url,
-            top_k=args.top_k, no_report=args.no_report)
-        try:
-            run(opts)
-            status = json.loads((target / 'retrieval.json').read_text())['status']
-        except Exception as exc:
-            status = 'error'
-            error = str(exc)
-        (target / 'batch_state.json').write_text(json.dumps({'signature': signature}))
-        return {'feature_id': feature, 'status': status, 'output_dir': str(target), **({'error': error} if status == 'error' else {})}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+    context = {'args': args, 'out': out, 'cache': cache, 'feature_counts': feature_counts,
+               'formula_list_hash': formula_list_hash, 'config_hash': config_hash, 'asset_versions': asset_versions}
+    # Processes, not threads: formula inference and atlas scoring are CPU-bound Python, and MSBuddy keeps
+    # global state. Each worker loads ms-pred once and serves many features; spawn avoids forking threads.
+    spawn = multiprocessing.get_context('spawn')
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=spawn,
+            initializer=_batch_worker_init, initargs=(spawn.BoundedSemaphore(max_model_jobs),)) as pool:
         pending = iter(jobs.items())
         active = {}
         exhausted = False
         while active or not exhausted:
             while len(active) < max_workers and not exhausted:
                 available_gb = psutil.virtual_memory().available / 1024**3
-                if available_gb - 2 * len(active) < min_free_gb:
+                if available_gb - hostprobe.FEATURE_RAM_GB * len(active) < min_free_gb:
                     if not active:
                         for key, _ in pending:
                             summary.append({'feature_id': key[0], 'status': 'deferred_memory', 'output_dir': ''})
@@ -530,7 +551,7 @@ def batch(args):
                 except StopIteration:
                     exhausted = True
                     break
-                active[pool.submit(execute, key, row)] = key
+                active[pool.submit(_batch_feature, key, row, context)] = key
             if active:
                 done = next(concurrent.futures.as_completed(active))
                 try:
@@ -539,12 +560,11 @@ def batch(args):
                     summary.append({'feature_id': active[done][0], 'status': 'error',
                         'output_dir': '', 'error': str(exc)})
                 del active[done]
-    _MODEL_SEMAPHORE = None
     (out / 'batch_summary.json').write_text(json.dumps(summary, indent=2))
     with (out / 'batch_summary.csv').open('w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=['feature_id', 'status', 'output_dir', 'resumed', 'error'])
         writer.writeheader(); writer.writerows(summary)
-    print(json.dumps({'features': len(summary), 'status_counts': {s: sum(r['status'] == s for r in summary) for s in {r['status'] for r in summary}},
+    print(json.dumps({'features': len(summary), 'max_workers': max_workers, 'status_counts': {s: sum(r['status'] == s for r in summary) for s in {r['status'] for r in summary}},
         'summary': str(out / 'batch_summary.csv')}, indent=2))
     return 1 if any(r['status'] == 'error' for r in summary) else 0
 
@@ -622,8 +642,9 @@ def visualize(args):
 
 def setup_command(args):
     from msms_structure_elucidation.hostsetup import setup
-    options = {} if args.remote else _model_options(args, settings(None))
-    report = setup(args, options, model_python)
+    config = {} if args.remote else settings(None)
+    options = _model_options(args, config) if config else {}
+    report = setup(args, options, model_python, config.get('models', {}).get('batch', {}))
     if args.json:
         print('SETUP_JSON=' + json.dumps(report, allow_nan=False))
     else:
@@ -716,7 +737,8 @@ def main(argv=None):
     batcher.add_argument('--model-shard-size', type=int)
     batcher.add_argument('--atlas-url')
     batcher.add_argument('--top-k', type=int)
-    batcher.add_argument('--max-workers', type=int)
+    batcher.add_argument('--max-workers', type=int,
+                         help='features processed at once (default: models.batch.max_workers, or auto from CPU threads and RAM)')
     batcher.add_argument('--max-model-jobs', type=int)
     batcher.add_argument('--min-free-memory-gb', type=float)
     batcher.add_argument('--no-report', action='store_true')

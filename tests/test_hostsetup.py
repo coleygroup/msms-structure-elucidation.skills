@@ -1,12 +1,16 @@
+import concurrent.futures
 import json
 import subprocess
+import sys
+import threading
+import time
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from msms_structure_elucidation import config, hostprobe, hostsetup
+from msms_structure_elucidation import cli, config, hostprobe, hostsetup
 
 
 def gpu(index, total, free):
@@ -46,6 +50,57 @@ class RecommendTest(unittest.TestCase):
         self.assertEqual(hostprobe.recommend(host([gpu(0, 24.0, 23.5), gpu(1, 24.0, 23.5)]))['num_gpu_workers'], 4)
         cpu = hostprobe.recommend(host([], threads=32, ram=16.0))
         self.assertEqual((cpu['cuda_devices'], cpu['num_cpu_workers']), (None, 4))
+
+
+class BatchWorkersTest(unittest.TestCase):
+    def test_concurrent_features_follow_cpu_and_ram(self):
+        self.assertEqual(hostprobe.batch_workers(16, 15.3), 4)   # 8 GB-GPU laptop, RAM bound
+        self.assertEqual(hostprobe.batch_workers(32, 64.0), 8)   # workstation, capped
+        self.assertEqual(hostprobe.batch_workers(4, 64.0), 4)    # CPU bound
+        self.assertEqual(hostprobe.batch_workers(4, 8.0), 1)     # never below one
+        self.assertEqual(hostprobe.batch_workers(32, 12.0, max_model_jobs=2), 1)
+
+
+class BatchConcurrencyTest(unittest.TestCase):
+    def test_auto_runs_several_features_at_once(self):
+        running, peak, lock = [0], [0], threading.Lock()
+
+        def fake_run(opts):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            time.sleep(0.2)
+            with lock:
+                running[0] -= 1
+            Path(opts.output_dir).mkdir(parents=True, exist_ok=True)
+            (Path(opts.output_dir) / 'retrieval.json').write_text('{"status": "ranked"}')
+
+        memory = SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=64 * 1024 ** 3))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i in range(6):
+                (root / f'f{i}.ms').write_text('>parentmass 100\n50 1\n')
+            manifest = root / 'manifest.csv'
+            manifest.write_text('feature_id,ms_path,collision_unit\n'
+                                + ''.join(f'f{i},f{i}.ms,eV\n' for i in range(6)))
+            args = SimpleNamespace(manifest=str(manifest), output_dir=str(root / 'out'), config=None,
+                collision_unit=None, formulas_file=None, ms_pred_python=None, ms_pred_dir=None,
+                instrument=None, cuda_devices=None, model=None, checkpoint=None, gen_checkpoint=None,
+                inten_checkpoint=None, model_batch_size=None, model_shard_size=None, model_cpu_workers=None,
+                model_gpu_workers=None, atlas_url=None, top_k=None, no_report=True, max_workers=None,
+                max_model_jobs=None, min_free_memory_gb=None)
+            # Threads stand in for the spawned worker processes so the patched run() is visible.
+            def thread_pool(max_workers, mp_context, initializer, initargs):
+                return concurrent.futures.ThreadPoolExecutor(max_workers, initializer=initializer, initargs=initargs)
+            with patch.object(cli, 'settings', return_value={'_config_digest': 'x', 'models': {'batch': {'max_workers': 'auto'}}}), \
+                    patch.object(cli.hostprobe, 'batch_workers', return_value=3), \
+                    patch.object(cli.concurrent.futures, 'ProcessPoolExecutor', side_effect=thread_pool), \
+                    patch.object(cli.multiprocessing, 'get_context',
+                                 return_value=SimpleNamespace(BoundedSemaphore=threading.BoundedSemaphore)), \
+                    patch.object(cli, 'run', side_effect=fake_run), \
+                    patch.dict(sys.modules, {'psutil': memory}), patch('builtins.print'):
+                self.assertEqual(cli.batch(args), 0)
+        self.assertEqual(peak[0], 3)
 
 
 class TuneTest(unittest.TestCase):
