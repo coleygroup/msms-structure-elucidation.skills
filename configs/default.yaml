@@ -18,7 +18,7 @@ models:
     top_k: 10
     atlas_url: https://iceberg-ms.mit.edu
   batch:
-    max_workers: 1
+    max_workers: auto   # batch worker processes; auto: up to 8 from CPU threads and RAM, setup saves a value
     max_model_jobs: 1
     min_free_memory_gb: 4
   denovo:

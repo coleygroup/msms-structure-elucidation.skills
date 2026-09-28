@@ -154,7 +154,7 @@ def setup_remote(args) -> dict:
     return {'status': report['status'], 'execution': execution, 'config': str(LOCAL_CONFIG)}
 
 
-def setup(args, model_options: dict, find_python) -> dict:
+def setup(args, model_options: dict, find_python, batch_defaults: dict | None = None) -> dict:
     """Probe this host, benchmark ICEBERG when possible, and save configs/local.yaml."""
     if args.remote:
         return setup_remote(args)
@@ -184,7 +184,10 @@ def setup(args, model_options: dict, find_python) -> dict:
         simulator['batch_size'] = best
         simulator['shard_size'] = min(2048, max(256, 8 * best))
         status = 'benchmarked'
-    update = {'models': {'simulator': simulator}}
+    batch_defaults = batch_defaults or {}
+    features = hostprobe.batch_workers(host['cpu_threads'], host['ram_total_gb'],
+                                       batch_defaults.get('max_model_jobs', 1), batch_defaults.get('min_free_memory_gb', 4))
+    update = {'models': {'simulator': simulator, 'batch': {'max_workers': features}}}
     for key, option in (('ms_pred_src', 'ms_pred_dir'), ('gen_ckpt', 'gen_checkpoint'),
                         ('inten_ckpt', 'inten_checkpoint')):
         if getattr(args, option, None):
@@ -194,5 +197,6 @@ def setup(args, model_options: dict, find_python) -> dict:
         'configured': datetime.datetime.now().isoformat(timespec='seconds'), 'notes': notes,
         'benchmark': {str(t['batch_size']): t.get('spectra_per_second') if fits(t) else 'failed' for t in trials}}
     save_local(update)
-    return {'status': status, 'host': host, 'simulator': simulator, 'notes': notes, 'trials': trials,
+    return {'status': status, 'host': host, 'simulator': simulator, 'batch_max_workers': features,
+            'notes': notes, 'trials': trials,
             'config': str(LOCAL_CONFIG)}

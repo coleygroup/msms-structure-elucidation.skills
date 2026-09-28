@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import json
 import math
 import sys
+import threading
 from collections import defaultdict
 from pathlib import Path
+
+_MSBUDDY_LOCK = threading.Lock()
 
 
 def _serial_spec(composite):
@@ -121,33 +125,48 @@ def sort_candidates(candidates: list[dict], tie_band: float = 0.03) -> list[dict
         band = [c for c in ordered if anchor - c['entropy_similarity'] <= tie_band]
         ordered = ordered[len(band):]
         result.extend(sorted(band, key=lambda c: (c['explained_intensity'], c['entropy_similarity']), reverse=True))
+    # Flag a candidate when an earlier one has the same formula, identical matched peaks and entropy
+    # within tie_band. Every earlier candidate scores at least entropy - tie_band, so the first match is
+    # the first earlier entry of that group scoring at most entropy + tie_band: a bisect on running minima.
+    groups = {}
     for index, a in enumerate(result):
         a['rank'] = index + 1
         a['ambiguity'] = []
-        a_peaks = {(p['ce'], round(p['mz'], 4)) for p in a.get('matched_peaks', [])}
-        for b in result[:index]:
-            b_peaks = {(p['ce'], round(p['mz'], 4)) for p in b.get('matched_peaks', [])}
-            if a.get('formula') == b.get('formula') and a_peaks == b_peaks and abs(a['entropy_similarity'] - b['entropy_similarity']) <= tie_band:
-                a['ambiguity'].append(f"No diagnostic matched peaks versus rank {b['rank']}; positional isomers may be indistinguishable")
+        key = (a.get('formula'), frozenset((p['ce'], round(p['mz'], 4)) for p in a.get('matched_peaks', [])))
+        earlier, negated_minima = groups.setdefault(key, ([], []))
+        score = a['entropy_similarity']
+        # The margin keeps float rounding from skipping a match; the scan applies the exact test.
+        for b in earlier[bisect.bisect_left(negated_minima, -(score + tie_band + 1e-9)):]:
+            if abs(b['entropy_similarity'] - score) <= tie_band:
+                a['ambiguity'].append(f"No diagnostic matched peaks versus rank {b['rank']}; "
+                                      'positional isomers may be indistinguishable')
                 break
+        earlier.append(a)
+        negated_minima.append(max(negated_minima[-1], -score) if negated_minima else -score)
     return result
 
 
 def _explained(experimental, predicted, alignment, ppm=10):
+    """Fraction of experimental intensity within ppm of a predicted peak, and the matched peaks."""
+    import numpy as np
     matched = []
     total = 0.0
     covered = 0.0
     for pair in alignment:
         ce = pair['experimental_key']
         a, b = experimental[ce], predicted[pair['atlas_key']]
-        masses = list(map(float, b.masses))
-        for mz, intensity in zip(a.masses, a.intens):
-            mz, intensity = float(mz), float(intensity)
-            total += intensity
-            hits = [p for p in masses if abs(p-mz) <= max(0.002, mz * ppm * 1e-6)]
-            if hits:
-                covered += intensity
-                matched.append({'ce': ce, 'mz': mz, 'predicted_mz': min(hits, key=lambda p: abs(p-mz))})
+        mzs = np.asarray(a.masses, dtype=float)
+        intens = np.asarray(a.intens, dtype=float)
+        total += float(intens.sum())
+        masses = np.sort(np.asarray(b.masses, dtype=float))
+        if not len(masses) or not len(mzs):
+            continue
+        right = np.minimum(np.searchsorted(masses, mzs), len(masses) - 1)
+        left = np.maximum(right - 1, 0)
+        nearest = np.where(np.abs(masses[left] - mzs) <= np.abs(masses[right] - mzs), masses[left], masses[right])
+        hit = np.abs(nearest - mzs) <= np.maximum(0.002, mzs * ppm * 1e-6)
+        covered += float(intens[hit].sum())
+        matched.extend({'ce': ce, 'mz': float(mz), 'predicted_mz': float(p)} for mz, p in zip(mzs[hit], nearest[hit]))
     return (covered / total if total else 0.0), matched
 
 
@@ -204,8 +223,7 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
                 'entropy_similarity': float(similarity), 'explained_intensity': explained,
                 'collision_energies': [p['input_value'] for p in alignment],
                 'energy_alignment': alignment, 'matched_peaks': matched,
-                'predicted_spectra': _serial_spec(predicted),
-                'predicted_fragment_ids': _serial_fragment_ids(predicted, fragment_ids[key])})
+                '_predicted': (predicted, fragment_ids[key])})
         except (ValueError, AssertionError, KeyError, ZeroDivisionError) as exc:
             errors.append(str(exc))
             continue
@@ -213,6 +231,11 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
         raise RuntimeError(f'All {len(grouped)} atlas structures failed scoring; first error: {errors[0]}')
     results = sort_candidates(results)
     top = results[:top_k]
+    for index, candidate in enumerate(results):
+        predicted, atlas_fragments = candidate.pop('_predicted')
+        if index < top_k:  # serializing every structure's spectra is slow for large formulas
+            candidate['predicted_spectra'] = _serial_spec(predicted)
+            candidate['predicted_fragment_ids'] = _serial_fragment_ids(predicted, atlas_fragments)
     from rdkit import Chem
     for candidate in top:
         candidate['structure_image'] = _structure_image(candidate['smiles'])
@@ -244,10 +267,12 @@ def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: in
                 out.write('END IONS\n')
         try:
             import msbuddy
-            # Use MSBuddy's own annotated MGF importer and formula ranking.
-            engine = msbuddy.Msbuddy(msbuddy.MsbuddyConfig(ppm=True, ms1_tol=ms1_ppm, ms2_tol=ms2_ppm))
-            engine.load_mgf(str(mgf))
-            engine.annotate_formula()
+            # Use MSBuddy's own annotated MGF importer and formula ranking. MSBuddy keeps its database
+            # in a module global that every instance resets, so concurrent batch features take turns.
+            with _MSBUDDY_LOCK:
+                engine = msbuddy.Msbuddy(msbuddy.MsbuddyConfig(ppm=True, ms1_tol=ms1_ppm, ms2_tol=ms2_ppm))
+                engine.load_mgf(str(mgf))
+                engine.annotate_formula()
             formulas = []
             for data in engine.data:
                 for entry in getattr(data, 'candidate_formula_list', []) or []:

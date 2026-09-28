@@ -18,6 +18,11 @@ import sys
 # RTX 4070 Laptop 8 GB -> 16; RTX A5000 24 GB -> 128.
 ANCHORS = ((8.0, 16), (24.0, 128))
 MIN_BATCH, MAX_BATCH = 4, 256
+# Batch admission budget: RAM held by one batch worker process (ms-pred loaded plus one feature;
+# measured about 1.4 GB on eight clinical spectra), and by one ICEBERG model job.
+FEATURE_RAM_GB = 1.5
+MODEL_JOB_RAM_GB = 4
+MAX_FEATURES = 8
 
 
 def cpu_threads() -> int:
@@ -72,6 +77,14 @@ def anchor_batch_size(memory_gb: float) -> int:
     exponent = math.log(b1 / b0) / math.log(m1 / m0)
     estimate = b0 * (max(memory_gb, 1.0) / m0) ** exponent
     return int(min(MAX_BATCH, max(MIN_BATCH, 2 ** math.floor(math.log2(estimate) + 1e-9))))
+
+
+def batch_workers(threads: int, ram_total_gb: float | None, max_model_jobs: int = 1,
+                  min_free_gb: float = 4) -> int:
+    """Worker processes for `batch`: one feature each, one CPU core each, bounded by RAM."""
+    ram = ram_total_gb or 8
+    by_ram = int((ram - min_free_gb - MODEL_JOB_RAM_GB * max_model_jobs) // FEATURE_RAM_GB)
+    return max(1, min(MAX_FEATURES, threads, by_ram))
 
 
 def recommend(host: dict) -> dict:
