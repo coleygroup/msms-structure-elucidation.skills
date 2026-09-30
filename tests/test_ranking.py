@@ -3,7 +3,7 @@ import random
 import unittest
 from types import SimpleNamespace
 
-from msms_structure_elucidation.worker import _explained, sort_candidates
+from msms_structure_elucidation.worker import _explained, _explained_python, sort_candidates
 
 
 def reference_sort(candidates, tie_band=0.03):
@@ -70,13 +70,15 @@ class RankingEquivalenceTest(unittest.TestCase):
             predicted = {'p': SimpleNamespace(masses=pred_masses)}
             alignment = [{'experimental_key': 'e', 'atlas_key': 'p'}]
             expected_fraction, expected_peaks = reference_explained(experimental, predicted, alignment)
-            fraction, peaks = _explained(experimental, predicted, alignment)
-            self.assertAlmostEqual(fraction, expected_fraction, places=12)
-            self.assertEqual(len(peaks), len(expected_peaks))
-            for got, want in zip(peaks, expected_peaks):
-                self.assertEqual(got['ce'], want['ce'])
-                self.assertAlmostEqual(got['mz'], want['mz'], places=12)
-                self.assertAlmostEqual(abs(got['predicted_mz'] - got['mz']), abs(want['predicted_mz'] - want['mz']), places=12)
+            # _explained uses numpy when installed; the pure-Python fallback runs without it (as in CI).
+            for explained in (_explained, _explained_python):
+                fraction, peaks = explained(experimental, predicted, alignment)
+                self.assertAlmostEqual(fraction, expected_fraction, places=12)
+                self.assertEqual(len(peaks), len(expected_peaks))
+                for got, want in zip(peaks, expected_peaks):
+                    self.assertEqual(got['ce'], want['ce'])
+                    self.assertAlmostEqual(got['mz'], want['mz'], places=12)
+                    self.assertAlmostEqual(abs(got['predicted_mz'] - got['mz']), abs(want['predicted_mz'] - want['mz']), places=12)
 
 
 if __name__ == '__main__':
