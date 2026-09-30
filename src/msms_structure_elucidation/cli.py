@@ -78,7 +78,9 @@ def worker(python: str, action: str, **kwargs):
                 str(kwargs['spectrum']), kwargs['formula'], kwargs['experimental_unit'])
     cmd = [python, '-m', 'msms_structure_elucidation.worker', action]
     for key, value in kwargs.items():
-        if value is not None:
+        if value is True:
+            cmd.append('--' + key.replace('_', '-'))
+        elif value is not None and value is not False:
             cmd += ['--' + key.replace('_', '-'), str(value)]
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join(x for x in (
@@ -105,10 +107,17 @@ def _model_options(args, config: dict, default_model='iceberg') -> dict:
         'checkpoint': path_option(getattr(args, 'checkpoint', None), None, model_cfg.get('glacier_ckpt')),
         'gen_checkpoint': path_option(getattr(args, 'gen_checkpoint', None), None, model_cfg.get('gen_ckpt')),
         'inten_checkpoint': path_option(getattr(args, 'inten_checkpoint', None), None, model_cfg.get('inten_ckpt')),
-        'cuda_devices': choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices')),
+        'cuda_devices': _devices(choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices'))),
         'batch_size': getattr(args, 'model_batch_size', None) or model_cfg.get('batch_size', 1),
         'num_cpu_workers': getattr(args, 'model_cpu_workers', None) or model_cfg.get('num_cpu_workers', 1),
         'num_gpu_workers': getattr(args, 'model_gpu_workers', None) or model_cfg.get('num_gpu_workers', 1)}
+
+
+def _devices(value) -> str | None:
+    """CUDA_VISIBLE_DEVICES string; a YAML list such as [1] or [0, 1] becomes '1' or '0,1'."""
+    if isinstance(value, (list, tuple)):
+        return ','.join(str(item) for item in value) or None
+    return None if value is None else str(value)
 
 
 def _save(result: dict, out: Path, no_report=False) -> None:
@@ -141,7 +150,7 @@ def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str
         checkpoint_versions = {k: (str(options.get(k)), Path(options[k]).stat().st_size, Path(options[k]).stat().st_mtime_ns)
             for k in ('gen_checkpoint', 'inten_checkpoint') if options.get(k)}
         signature = hashlib.sha256(json.dumps([chunk, input_hash, unit, instrument,
-            {k: str(options.get(k)) for k in ('model','ms_pred_dir','cuda_devices','batch_size')},
+            {k: str(options.get(k)) for k in ('model', 'ms_pred_dir')},  # batch size, devices and workers do not change predictions
             checkpoint_versions], sort_keys=True).encode()).hexdigest()[:16]
         saved = shards / f'{start:08d}-{signature}.json'
         if saved.is_file():
@@ -152,12 +161,12 @@ def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str
             if _MODEL_SEMAPHORE is None:
                 candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
                     formula=formula, experimental_unit=unit, output_dir=out,
-                    instrument=instrument, **options)
+                    instrument=instrument, top_k=top_k, limit_images=True, **options)
             else:
                 with _MODEL_SEMAPHORE:
                     candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
                         formula=formula, experimental_unit=unit, output_dir=out,
-                        instrument=instrument, **options)
+                        instrument=instrument, top_k=top_k, limit_images=True, **options)
             temp = saved.with_suffix('.tmp')
             temp.write_text(json.dumps(candidates, allow_nan=False))
             temp.replace(saved)

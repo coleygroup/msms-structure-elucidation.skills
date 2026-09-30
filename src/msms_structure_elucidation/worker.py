@@ -116,7 +116,17 @@ def _score(experimental, predicted, alignment, precursor):
     return sum(scores) / len(scores)
 
 
-def sort_candidates(candidates: list[dict], tie_band: float = 0.03) -> list[dict]:
+TIE_BAND = 0.03  # entropy difference treated as a tie, broken by explained intensity
+
+
+def image_floor(scores: list[float], top_k: int | None) -> float:
+    """Lowest entropy that can still reach a merged top_k list: sort_candidates puts every
+    result below all results scoring more than TIE_BAND above it."""
+    ordered = sorted(scores, reverse=True)
+    return ordered[top_k - 1] - TIE_BAND if top_k and len(ordered) >= top_k else -math.inf
+
+
+def sort_candidates(candidates: list[dict], tie_band: float = TIE_BAND) -> list[dict]:
     """Keep entropy primary and use coverage within narrow score bands."""
     ordered = sorted(candidates, key=lambda c: c['entropy_similarity'], reverse=True)
     result = []
@@ -380,8 +390,12 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              inten_checkpoint: str | None, output_dir: str,
              experimental_unit: str, instrument: str | None = None,
              cuda_devices: str | None = None, batch_size: int = 1,
-             num_cpu_workers: int = 1, num_gpu_workers: int = 1) -> list[dict]:
-    """Run ms-pred only for structures unavailable in the precomputed atlas."""
+             num_cpu_workers: int = 1, num_gpu_workers: int = 1,
+             top_k: int | None = None) -> list[dict]:
+    """Run ms-pred only for structures unavailable in the precomputed atlas.
+
+    With top_k, structure images are drawn only where a merged top_k list can reach: a result
+    is always ranked below every result scoring more than TIE_BAND above it."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
     if model == 'glacier':
@@ -435,12 +449,17 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
                 'model_collision_energies_ev': model_energies, 'model_instrument': instrument,
                 'model_name': model.upper(), 'model_version': model_version, 'ms_pred_version': ms_pred_version,
                 'model_checkpoint': checkpoint if model == 'glacier' else [gen_checkpoint, inten_checkpoint],
-                'structure_image': _structure_image(smi)})
+                'structure_image': None})
     finally:
         pred_db.close()
     if len(results) != len(smiles):
         raise RuntimeError(f'{model.upper()} returned {len(results)} spectra for {len(smiles)} structures')
-    return sort_candidates(results)
+    results = sort_candidates(results)
+    floor = image_floor([c['entropy_similarity'] for c in results], top_k)
+    for candidate in results:
+        if candidate['entropy_similarity'] >= floor:
+            candidate['structure_image'] = _structure_image(candidate['smiles'])
+    return results
 
 
 def main():
@@ -450,6 +469,7 @@ def main():
     parser.add_argument('--mgf')
     parser.add_argument('--formula')
     parser.add_argument('--top-k', type=int, default=10)
+    parser.add_argument('--limit-images', action='store_true', help='simulate: draw structures for --top-k only')
     parser.add_argument('--smiles-json')
     parser.add_argument('--model', choices=['glacier', 'iceberg'], default='glacier')
     parser.add_argument('--checkpoint')
@@ -485,7 +505,7 @@ def main():
             args.formula, args.model, args.checkpoint, args.gen_checkpoint,
             args.inten_checkpoint, args.output_dir, args.experimental_unit,
             args.instrument, args.cuda_devices, args.batch_size,
-            args.num_cpu_workers, args.num_gpu_workers)
+            args.num_cpu_workers, args.num_gpu_workers, args.top_k if args.limit_images else None)
     print('RESULT_JSON=' + json.dumps(result, allow_nan=False))
 
 if __name__ == '__main__':

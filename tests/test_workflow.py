@@ -483,17 +483,49 @@ class WorkflowTests(unittest.TestCase):
                 chunk = json.loads(Path(kwargs['smiles_json']).read_text())
                 calls.extend(chunk)
                 self.assertEqual(kwargs['instrument'], 'QTOF')
+                self.assertEqual((kwargs['top_k'], kwargs['limit_images']), (2, True))
                 return [{'smiles': s, 'formula': 'C3H8', 'entropy_similarity': 0.1 * len(s),
                     'explained_intensity': 0.5, 'matched_peaks': []} for s in chunk]
             with patch.object(cli, 'worker', side_effect=fake_worker):
                 first, count = cli._simulate_shards('python', spec, mgf, 'C3H8', 'eV', root,
                     options, 'QTOF', 2, 2)
+                retuned = {**options, 'cuda_devices': '1', 'batch_size': 128, 'num_cpu_workers': 16, 'num_gpu_workers': 2}
                 second, count2 = cli._simulate_shards('python', spec, mgf, 'C3H8', 'eV', root,
-                    options, 'QTOF', 2, 2)
+                    retuned, 'QTOF', 2, 2)
             self.assertEqual(calls, ['C', 'CC', 'CCC'])
             self.assertEqual((count, count2), (3, 3))
             self.assertEqual([x['smiles'] for x in first], [x['smiles'] for x in second])
             self.assertEqual(len(list((root / 'model_shards/C3H8').glob('*.json'))), 4)
+
+    def test_yaml_device_lists_and_switch_arguments(self):
+        args = SimpleNamespace(cuda_devices=None, model_cpu_workers=None, model_gpu_workers=None)
+        with patch.dict('os.environ', {}, clear=True):
+            options = cli._model_options(args, {'models': {'simulator': {'cuda_devices': [1], 'batch_size': 128}}})
+        self.assertEqual((options['cuda_devices'], options['batch_size']), ('1', 128))
+        self.assertEqual(cli._devices([0, 1]), '0,1')
+        run = SimpleNamespace(returncode=0, stdout='RESULT_JSON=[]', stderr='')
+        with patch.object(cli.subprocess, 'run', return_value=run) as called:
+            cli.worker('python', 'simulate', limit_images=True, top_k=5, cuda_devices=None, skip=False)
+        self.assertEqual(called.call_args.args[0][-3:], ['--limit-images', '--top-k', '5'])
+
+    def test_shard_image_floor_covers_every_merged_leader(self):
+        import random
+        from msms_structure_elucidation.worker import image_floor, sort_candidates
+        # Scores packed within a few tie bands, where a shard's own top_k can miss a merged leader.
+        rng = random.Random(1)
+        for _ in range(3000):
+            shards = [[{'smiles': f'{s}-{i}', 'formula': 'X', 'entropy_similarity': round(rng.uniform(0.5, 0.58), 3),
+                        'explained_intensity': rng.random(), 'matched_peaks': []} for i in range(rng.randint(1, 6))]
+                      for s in range(rng.randint(2, 4))]
+            top_k = rng.randint(1, 3)
+            drawn = set()
+            for shard in shards:
+                floor = image_floor([c['entropy_similarity'] for c in shard], top_k)
+                drawn.update(c['smiles'] for c in shard if c['entropy_similarity'] >= floor)
+            leaders = []
+            for shard in shards:
+                leaders = sort_candidates(leaders + [dict(c) for c in shard])[:top_k]
+            self.assertTrue({c['smiles'] for c in leaders} <= drawn)
 
     def test_fragment_ids_are_peak_aligned_and_preserve_large_values(self):
         from msms_structure_elucidation.worker import _serial_fragment_ids
