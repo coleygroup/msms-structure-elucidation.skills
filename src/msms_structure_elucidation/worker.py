@@ -271,7 +271,9 @@ def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: in
         mgf = Path(temp) / 'query.mgf'
         with mgf.open('w') as out:
             for ce, peaks in parsed['spectra'].items():
-                out.write(f"BEGIN IONS\nTITLE=query_{ce}\nPEPMASS={parsed['parentmass']}\nCHARGE=1+\n")
+                charge = '1-' if parsed['adduct'].endswith('-') else '1+'
+                out.write(f"BEGIN IONS\nTITLE=query_{ce}\nPEPMASS={parsed['parentmass']}\nCHARGE={charge}\n"
+                          f"ADDUCT={parsed['adduct']}\n")
                 for mz, inten in peaks:
                     out.write(f'{mz} {inten}\n')
                 out.write('END IONS\n')

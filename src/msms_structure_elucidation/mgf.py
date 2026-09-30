@@ -10,6 +10,8 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
+from msms_structure_elucidation.ions import MODEL_ADDUCTS, annotate
+
 
 def entries(path: Path):
     meta, peaks = None, None
@@ -99,6 +101,19 @@ def _energy(meta: dict, raw: dict[str, dict], override: float | None,
     return None, 'ambiguous_MS2_scans' if len(values) > 1 else 'missing_MS2_energy', None, scans
 
 
+def _ion_identity(spectra: list, rt_window: float) -> dict[str, dict]:
+    """Ion identity over every MS2 feature with a precursor m/z and retention time."""
+    features = {}
+    for index, (meta, peaks) in enumerate(spectra, 1):
+        feature = meta.get('FEATURE_ID') or meta.get('SPECTRUMID') or meta.get('TITLE') or str(index)
+        mz, rt = _float((meta.get('PEPMASS') or '').split(' ')[0]), _float(meta.get('RTINSECONDS'))
+        if feature in features or mz is None or rt is None or meta.get('MSLEVEL', '2').strip() not in ('2', '2.0'):
+            continue
+        features[feature] = {'id': feature, 'mz': mz, 'rt': rt, 'peaks': peaks,
+                             'negative': meta.get('CHARGE', '').strip().endswith('-')}
+    return annotate(list(features.values()), rt_window=rt_window) if features else {}
+
+
 def _raw_files(raw_mzxml) -> list[Path]:
     if raw_mzxml is None:
         return []
@@ -111,8 +126,17 @@ def _raw_files(raw_mzxml) -> list[Path]:
 
 def convert_mgf(input_path: Path, output_dir: Path, unit: str,
                 energy: float | None = None, raw_mzxml: Path | list[Path] | None = None,
-                instrument: str | None = None, rt_window: float = 30.0) -> list[dict]:
-    """raw_mzxml: mzXML files or folders; an entry reads the file named by its SOURCE_FILE, or the only file given."""
+                instrument: str | None = None, rt_window: float = 30.0, feature_ids: set[str] | None = None,
+                ion_identity: bool = True, ion_rt_window: float = 3.0,
+                elucidate_all_ions: bool = False) -> list[dict]:
+    """Convert MS2 entries to .ms files and a batch manifest.
+
+    raw_mzxml: mzXML files or folders; an entry reads the file named by its SOURCE_FILE, or the only file given.
+    feature_ids: convert only these features; ion identity still uses every feature in the MGF.
+    ion_identity: derive each feature's adduct, and whether it is a multimer or in-source fragment, from
+    co-eluting features (ions.annotate). In-source fragments, multimers and adducts the models do not
+    support get their own manifest status unless elucidate_all_ions.
+    """
     if unit not in ('NCE', 'eV'):
         raise ValueError('Confirm --collision-unit NCE or eV with the spectrum provider')
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +149,9 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
         return parsed.get(path, {})
     grouped = defaultdict(list)
     manifest = []
-    for index, (meta, peaks) in enumerate(entries(input_path), 1):
+    spectra = list(entries(input_path))
+    ions = _ion_identity(spectra, ion_rt_window) if ion_identity else {}
+    for index, (meta, peaks) in enumerate(spectra, 1):
         try:
             level = int(float(meta.get('MSLEVEL', '2')))
         except ValueError:
@@ -133,7 +159,18 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
         if level != 2 or not peaks:
             continue
         feature = meta.get('FEATURE_ID') or meta.get('SPECTRUMID') or meta.get('TITLE') or str(index)
+        if feature_ids is not None and feature not in feature_ids:
+            continue
         ce, provenance, header_unit, ms2_scans = _energy(meta, raw_for(meta), energy, rt_window)
+        ion = ions.get(feature, {})
+        default = '[M-H]-' if meta.get('CHARGE', '').strip().endswith('-') else '[M+H]+'
+        stated = (meta.get('ADDUCT') or meta.get('ION') or meta.get('IONTYPE') or '').replace(' ', '')
+        stated = stated.replace(']1+', ']+').replace(']1-', ']-')
+        # A feature finder's stated adduct counts unless it is the default every feature gets.
+        if stated and (stated != default or not ion.get('partners')):
+            adduct, source = stated, 'mgf'
+        else:
+            adduct, source = ion.get('adduct') or default, 'ion_identity' if ion else 'default'
         base = {'feature_id': feature, 'mgf_entry': index, 'collision_unit': unit,
             'collision_energy': ce, 'energy_source': provenance,
             'header_collision_unit': header_unit, 'unit_conflict': bool(header_unit and header_unit != unit),
@@ -141,11 +178,21 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             'source_scan_role': 'feature_or_MS1_apex_not_MS2',
             'ms2_scans': meta.get('MERGED_SCANS') or meta.get('MS2_SCAN') or meta.get('MS2_SCANS') or ','.join(ms2_scans) or None,
             'parentmass': (meta.get('PEPMASS') or '').split()[0],
-            'formula': meta.get('FORMULA'), 'instrument': instrument or meta.get('INSTRUMENT') or meta.get('INSTRUMENTATION')}
+            'formula': meta.get('FORMULA'), 'instrument': instrument or meta.get('INSTRUMENT') or meta.get('INSTRUMENTATION'),
+            'adduct': adduct, 'adduct_source': source,
+            'ion_role': ion.get('role', 'molecule'), 'related_features': ';'.join(ion.get('related', [])),
+            'adduct_partners': ';'.join(f"{p['id']}:{p['adduct']}" for p in ion.get('partners', [])),
+            'ion_evidence': ion.get('evidence', '')}
         try:
             parentmass = float(base['parentmass'])
         except ValueError:
             parentmass = 0.0
+        if base['ion_role'] != 'molecule' and not elucidate_all_ions:
+            manifest.append({**base, 'status': base['ion_role'], 'ms_path': ''})
+            continue
+        if adduct not in MODEL_ADDUCTS and not elucidate_all_ions:
+            manifest.append({**base, 'status': 'unsupported_adduct', 'ms_path': ''})
+            continue
         if ce is None or not math.isfinite(ce) or ce <= 0 or not math.isfinite(parentmass) or parentmass <= 0:
             manifest.append({**base, 'status': 'needs_energy' if ce is None else 'needs_parentmass', 'ms_path': ''})
             continue
@@ -173,7 +220,7 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             path = output_dir / f'{safe}{f"_rep{replicate+1}" if replicates > 1 else ""}.ms'
             first = selected[0][0]
             lines = [f'>compound {feature}', f'>parentmass {first["parentmass"]}',
-                f'>ionization {"[M-H]-" if selected[0][2].get("CHARGE", "").endswith("-") else "[M+H]+"}']
+                f'>ionization {first["adduct"] if first["adduct"] in MODEL_ADDUCTS else "[M-H]-" if first["adduct"].endswith("-") else "[M+H]+"}']
             if first['formula']:
                 lines.append(f'>formula {first["formula"]}')
             if first['instrument']:
@@ -186,7 +233,8 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
     with (output_dir / 'manifest.csv').open('w', newline='') as file:
         columns = ['feature_id', 'mgf_entry', 'status', 'ms_path', 'collision_unit', 'collision_energy',
             'energy_source', 'header_collision_unit', 'unit_conflict', 'source_scan', 'source_scan_role',
-            'ms2_scans', 'parentmass', 'formula', 'instrument']
+            'ms2_scans', 'parentmass', 'formula', 'instrument', 'adduct', 'adduct_source', 'ion_role',
+            'related_features', 'adduct_partners', 'ion_evidence']
         writer = csv.DictWriter(file, fieldnames=columns)
         writer.writeheader(); writer.writerows(manifest)
     (output_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2))
