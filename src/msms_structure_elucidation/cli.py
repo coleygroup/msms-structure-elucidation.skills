@@ -420,8 +420,8 @@ def review(args):
 def convert_mgf_command(args):
     from msms_structure_elucidation.mgf import convert_mgf
     manifest = convert_mgf(Path(args.input).expanduser().resolve(), Path(args.output_dir).expanduser().resolve(),
-        args.collision_unit, args.energy, Path(args.raw_mzxml).expanduser().resolve() if args.raw_mzxml else None,
-        args.instrument)
+        args.collision_unit, args.energy, [Path(p).expanduser().resolve() for p in args.raw_mzxml or []] or None,
+        args.instrument, args.ms2_rt_window)
     print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': sum(r['status'] == 'ready' for r in manifest),
         'needs_energy': sum(r['status'] == 'needs_energy' for r in manifest)}, indent=2))
     return 0
@@ -745,7 +745,11 @@ def main(argv=None):
     converter.add_argument('--output-dir', required=True)
     converter.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'])
     converter.add_argument('--energy', type=float, help='confirmed energy override for entries without MS2 energy')
-    converter.add_argument('--raw-mzxml', help='read collisionEnergy from referenced MS2 scans')
+    converter.add_argument('--raw-mzxml', nargs='+',
+                           help='mzXML files or folders; collisionEnergy is read from referenced MS2 scans, or from '
+                                'MS2 scans matching the precursor and retention time in the SOURCE_FILE run')
+    converter.add_argument('--ms2-rt-window', type=float, default=30.0,
+                           help='seconds around RTINSECONDS for precursor-matched MS2 scans (default 30)')
     converter.add_argument('--instrument')
     batcher = sub.add_parser('batch', help='run a feature manifest with shared atlas cache and bounded model jobs')
     batcher.add_argument('--manifest', required=True)

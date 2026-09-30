@@ -401,6 +401,36 @@ class WorkflowTests(unittest.TestCase):
             skipped.assert_not_called()
             self.assertNotIn('review_page', info)
 
+    def test_gnps_mgf_energy_from_precursor_matched_ms2_scans_in_source_file(self):
+        from msms_structure_elucidation.mgf import convert_mgf, _seconds
+        self.assertEqual((_seconds('PT298.725S'), _seconds('PT4.5M'), _seconds('PT1M3S'), _seconds('')), (298.725, 270.0, 63.0, None))
+        def scan(num, level, rt, precursor=None, ce=None):
+            if level == '1':
+                return f'<scan num="{num}" msLevel="1" retentionTime="PT{rt}S"/>'
+            return (f'<scan num="{num}" msLevel="2" retentionTime="PT{rt}S" collisionEnergy="{ce}">'
+                    f'<precursorMz precursorIntensity="10">{precursor}</precursorMz></scan>')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / 'raw'; raw.mkdir()
+            (raw / 'a.mzXML').write_text('<mzXML><msRun>' + scan(10, '1', 100) + scan(11, '2', 101, 300.1001, 28)
+                + scan(12, '2', 104, 300.1003, 28) + scan(13, '2', 102, 450.2, 33) + '</msRun></mzXML>')
+            (raw / 'b.mzXML').write_text('<mzXML><msRun>' + scan(11, '2', 99, 300.1002, 40)
+                + scan(20, '2', 200, 500.0, 35) + scan(40, '2', 230, 500.0, 30) + '</msRun></mzXML>')
+            (raw / 'notes.txt').write_text('ignored')
+            entry = 'BEGIN IONS\nFEATURE_ID={}\nSOURCE_FILE={}\nSOURCE_SCAN=10\nPEPMASS={}\nRTINSECONDS={}\nMSLEVEL=2\n50 10\nEND IONS\n'
+            mgf = root / 'features.mgf'
+            mgf.write_text(entry.format(1, 'a.mzXML', 300.1, 110) + entry.format(2, 'b.mzXML', 500.0, 205)
+                           + entry.format(3, 'missing.mzXML', 300.1, 110))
+            rows = {r['feature_id']: r for r in convert_mgf(mgf, root / 'converted', 'eV', raw_mzxml=[raw])}
+            # MS1 apex scan 10 is ignored; scans 11 and 12 of a.mzXML match precursor and RT, not b.mzXML's scan 11
+            self.assertEqual((rows['1']['collision_energy'], rows['1']['energy_source'], rows['1']['ms2_scans']),
+                             (28.0, 'mzXML:MS2_precursor_match', '11,12'))
+            self.assertEqual(rows['1']['status'], 'ready')
+            self.assertEqual((rows['2']['status'], rows['2']['energy_source']), ('needs_energy', 'ambiguous_MS2_scans'))
+            self.assertEqual(rows['3']['status'], 'needs_energy')
+            narrow = {r['feature_id']: r for r in convert_mgf(mgf, root / 'narrow', 'eV', raw_mzxml=[raw], rt_window=10)}
+            self.assertEqual(narrow['2']['collision_energy'], 35.0)
+
     def test_mgf_missing_energy_is_manifest_status(self):
         from msms_structure_elucidation.mgf import convert_mgf
         with tempfile.TemporaryDirectory() as tmp:
