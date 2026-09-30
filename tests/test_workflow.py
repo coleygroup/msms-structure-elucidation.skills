@@ -278,7 +278,7 @@ class WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / 'weights.ckpt'
             checkpoint.touch()
-            with patch.dict(sys.modules, modules), patch.object(worker, '_check_glacier_features'), patch.object(worker, '_experimental_spectra',
+            with patch.dict(sys.modules, modules), patch.object(worker, '_check_glacier_features'), patch.object(worker, '_require_cuda'), patch.object(worker, '_experimental_spectra',
                     return_value=({'parentmass': str(precursor), 'ionization': '[M+H]+'},
                                   converted, source)):
                 for model in ('glacier', 'iceberg'):

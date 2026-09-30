@@ -387,6 +387,17 @@ def _check_glacier_features(checkpoint: str) -> None:
         raise RuntimeError(f'GLACIER checkpoint expects {expected} atom features, but this ms-pred checkout produces {actual}. Use a compatible ms-pred commit or checkpoint.')
 
 
+def _require_cuda(cuda_devices: str | None) -> None:
+    """Fail fast when GPUs are configured but CUDA is unavailable (driver reset, WSL GPU suspended):
+    ms-pred started with --gpu then waits indefinitely instead of exiting."""
+    if cuda_devices in (None, ''):
+        return
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(f'cuda_devices={cuda_devices} is set but CUDA is not available to this process; '
+                           'restore GPU access (check nvidia-smi) or unset cuda_devices to run on CPU')
+
+
 def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              checkpoint: str | None, gen_checkpoint: str | None,
              inten_checkpoint: str | None, output_dir: str,
@@ -400,6 +411,7 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
     is always ranked below every result scoring more than TIE_BAND above it."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
+    _require_cuda(cuda_devices)
     if model == 'glacier':
         if not checkpoint or not Path(checkpoint).is_file():
             raise FileNotFoundError('GLACIER checkpoint required; see ms-pred README for public MassSpecGym weights or provide licensed NIST weights')
