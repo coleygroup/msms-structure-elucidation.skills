@@ -158,10 +158,7 @@ def sort_candidates(candidates: list[dict], tie_band: float = TIE_BAND) -> list[
 
 def _explained(experimental, predicted, alignment, ppm=10):
     """Fraction of experimental intensity within ppm of a predicted peak, and the matched peaks."""
-    try:
-        import numpy as np
-    except ImportError:
-        return _explained_python(experimental, predicted, alignment, ppm)
+    import numpy as np
     matched = []
     total = 0.0
     covered = 0.0
@@ -180,29 +177,6 @@ def _explained(experimental, predicted, alignment, ppm=10):
         hit = np.abs(nearest - mzs) <= np.maximum(0.002, mzs * ppm * 1e-6)
         covered += float(intens[hit].sum())
         matched.extend({'ce': ce, 'mz': float(mz), 'predicted_mz': float(p)} for mz, p in zip(mzs[hit], nearest[hit]))
-    return (covered / total if total else 0.0), matched
-
-
-def _explained_python(experimental, predicted, alignment, ppm=10):
-    """_explained without numpy (bisect on sorted predicted masses); the core package declares no dependencies."""
-    matched = []
-    total = 0.0
-    covered = 0.0
-    for pair in alignment:
-        ce = pair['experimental_key']
-        a, b = experimental[ce], predicted[pair['atlas_key']]
-        masses = sorted(float(m) for m in b.masses)
-        for mz, intensity in zip(a.masses, a.intens):
-            mz, intensity = float(mz), float(intensity)
-            total += intensity
-            if not masses:
-                continue
-            index = bisect.bisect_left(masses, mz)
-            left, right = masses[max(index - 1, 0)], masses[min(index, len(masses) - 1)]
-            nearest = left if abs(left - mz) <= abs(right - mz) else right
-            if abs(nearest - mz) <= max(0.002, mz * ppm * 1e-6):
-                covered += intensity
-                matched.append({'ce': ce, 'mz': mz, 'predicted_mz': nearest})
     return (covered / total if total else 0.0), matched
 
 
