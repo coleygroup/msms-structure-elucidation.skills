@@ -55,6 +55,8 @@ rt_range: [5.0, 15.0]  # optional — overrides auto-detected RT crop, minutes
 
 ### Batch-generate per-file .mzbatch from a folder of .raw files
 
+The checked-in `resources/pos.mzbatch` and `resources/neg.mzbatch` contain example `/path/to/input/` and `/path/to/output/` values. Replace them with real paths before running either file directly.
+
 ```bash
 .agents/skills/msms-feature-detect/scripts/make_batches.sh [-p pos|neg|both] [-r] [-b mzmine-bin] [-u mzmine-user] path/to/raw_folder
 ```

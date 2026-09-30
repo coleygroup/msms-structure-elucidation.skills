@@ -2,14 +2,14 @@
 <batch mzmine_version="4.10.6">
     <batchstep method="io.github.mzmine.modules.io.import_rawdata_all.AllSpectralDataImportModule" module_name="Import MS data" parameter_version="1">
         <parameter name="File names">
-            <file>/Users/magdalenalederbauer/Downloads/luca_sarpong_2.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_7.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_99_low.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_99_normal_gradient.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_99_pw_low.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_99_pw.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_99.raw</file>
-<file>/Users/magdalenalederbauer/Downloads/rxn_238.raw</file>
+            <file>/path/to/input/pos_sample_01.raw</file>
+<file>/path/to/input/pos_sample_02.raw</file>
+<file>/path/to/input/pos_sample_03.raw</file>
+<file>/path/to/input/pos_sample_04.raw</file>
+<file>/path/to/input/pos_sample_05.raw</file>
+<file>/path/to/input/pos_sample_06.raw</file>
+<file>/path/to/input/pos_sample_07.raw</file>
+<file>/path/to/input/pos_sample_08.raw</file>
         </parameter>
         <parameter name="Vendor data options">
             <parameter name="Try vendor centroiding">true</parameter>
@@ -655,7 +655,7 @@
     </batchstep>
     <batchstep method="io.github.mzmine.modules.visualization.projectmetadata.io.ProjectMetadataExportModule" module_name="Project metadata export" parameter_version="1">
         <parameter name="Metadata file">
-            <current_file>/Users/magdalenalederbauer/Downloads/processed_files/metadata.csv</current_file>
+            <current_file>/path/to/output/pos/metadata.csv</current_file>
         </parameter>
         <parameter name="Format">Default</parameter>
     </batchstep>
@@ -663,7 +663,7 @@
         <parameter name="Feature lists" type="BATCH_LAST_FEATURELISTS"/>
         <parameter name="Row selection">all_major_ions</parameter>
         <parameter name="Filename">
-            <current_file>/Users/magdalenalederbauer/Downloads/processed_files/full_feature_table.csv</current_file>
+            <current_file>/path/to/output/pos/full_feature_table.csv</current_file>
         </parameter>
         <parameter name="Field separator">,</parameter>
         <parameter name="Identification separator">;</parameter>
@@ -673,7 +673,7 @@
     <batchstep method="io.github.mzmine.modules.io.export_features_sirius.SiriusExportModule" module_name="Export for SIRIUS" parameter_version="2">
         <parameter name="Feature lists" type="BATCH_LAST_FEATURELISTS"/>
         <parameter name="Filename">
-            <current_file>/Users/magdalenalederbauer/Downloads/processed_files/sirius.mgf</current_file>
+            <current_file>/path/to/output/pos/sirius.mgf</current_file>
         </parameter>
         <parameter name="Intensity normalization" scientific="true">no_normalization</parameter>
         <parameter name="Merge &amp; select fragment scans" selected_item="preset_merged">
@@ -722,13 +722,13 @@
     <batchstep method="io.github.mzmine.modules.io.export_compoundAnnotations_csv.CompoundAnnotationsCSVExportModule" module_name="Export all annotations to CSV file" parameter_version="1">
         <parameter name="Feature lists" type="BATCH_LAST_FEATURELISTS"/>
         <parameter name="Filename">
-            <current_file>/Users/magdalenalederbauer/Downloads/processed_files/annotations.csv</current_file>
+            <current_file>/path/to/output/pos/annotations.csv</current_file>
         </parameter>
         <parameter name="Top N per method">10</parameter>
     </batchstep>
     <batchstep method="io.github.mzmine.modules.batchmode.autosave.AutoSaveBatchModule" module_name="Save current batch" parameter_version="1">
         <parameter name="Save batch to" selected="true">
-            <current_file>/Users/magdalenalederbauer/Downloads/processed_files/batch.mzbatch</current_file>
+            <current_file>/path/to/output/pos/batch.mzbatch</current_file>
         </parameter>
     </batchstep>
 </batch>
