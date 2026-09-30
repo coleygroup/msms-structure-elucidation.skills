@@ -331,6 +331,31 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result['formula'], 'F1')
             self.assertEqual(len(result['formula_results']), 3)
 
+    def test_adduct_missing_from_atlas_predicts_every_structure_with_that_adduct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spec = root / 'query.ms'
+            spec.write_text('>parentmass 527.3156\n>ionization [M+Na]+\n>collision 30 eV\n50 10\n')
+            mgf = root / 'atlas.mgf'; mgf.write_text('BEGIN IONS\nADDUCT=[M+H]+\nEND IONS\n')
+            def fake_worker(_, action, **kw):
+                if action == 'formula':
+                    return [{'formula': 'C26H48O9'}]
+                if action == 'atlas-info':
+                    return {'library_structures': 2, 'missing_energies_ev': [], 'smiles': ['C', 'CC']}
+                raise AssertionError(f'{action} must not rank [M+H]+ atlas spectra against [M+Na]+')
+            simulated = [{'smiles': 'C', 'formula': 'C26H48O9', 'source': 'ICEBERG', 'entropy_similarity': 0.7,
+                          'explained_intensity': 0.7, 'matched_peaks': [], 'energy_alignment': [], 'predicted_spectra': {}}]
+            args = SimpleNamespace(input=str(spec), collision_unit='eV', output_dir=str(root / 'out'),
+                formula=None, formulas_file=None, ms_pred_python='python', atlas_mgf=None,
+                atlas_url=None, top_k=10, no_report=True)
+            with patch.object(cli, 'worker', side_effect=fake_worker), patch.object(cli, 'download_mgf', return_value=mgf), \
+                    patch.object(cli, '_simulate_shards', return_value=(simulated, 2)) as shards:
+                self.assertEqual(cli.run(args), 0)
+            self.assertEqual(shards.call_args.args[-1], ['C', 'CC'])
+            record = json.loads((root / 'out/retrieval.json').read_text())['formula_results'][0]
+            self.assertEqual((record['reason'], record['atlas_adduct'], record['status']),
+                             ('atlas_lacks_adduct', '[M+H]+', 'ranked'))
+
     def test_model_asset_block_is_fatal_and_recorded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

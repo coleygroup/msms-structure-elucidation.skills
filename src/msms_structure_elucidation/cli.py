@@ -120,6 +120,23 @@ def _devices(value) -> str | None:
     return None if value is None else str(value)
 
 
+def _mgf_adduct(path: Path) -> str | None:
+    """Adduct of the first spectrum in an atlas MGF."""
+    try:
+        with Path(path).open() as file:
+            for line in file:
+                if line.upper().startswith(('ADDUCT=', 'ION=')):
+                    return line.split('=', 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def _same_adduct(a: str, b: str) -> bool:
+    norm = lambda s: s.replace(' ', '').replace(']1+', ']+').replace(']1-', ']-')
+    return norm(a) == norm(b)
+
+
 def _save(result: dict, out: Path, no_report=False) -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / 'retrieval.json').write_text(json.dumps(result, indent=2, allow_nan=False))
@@ -248,9 +265,13 @@ def run(args):
                 energies=','.join(str(row['model_energy_ev']) for row in data['energy_mapping']))
             record.update({'atlas_mgf': str(mgf), 'library_structures': coverage['library_structures'],
                 'missing_energies_ev': coverage['missing_energies_ev']})
-            if coverage['missing_energies_ev'] and coverage['library_structures']:
+            atlas_adduct = _mgf_adduct(mgf)
+            if atlas_adduct and _same_adduct(atlas_adduct, data['adduct']) is False:
+                # The public atlas holds [M+H]+ predictions only; use its structures, not its spectra.
+                record['atlas_adduct'] = atlas_adduct
+            if (coverage['missing_energies_ev'] or 'atlas_adduct' in record) and coverage['library_structures']:
                 record['status'] = 'model_fallback'
-                record['reason'] = 'no_exact_atlas_energy'
+                record['reason'] = 'atlas_lacks_adduct' if 'atlas_adduct' in record else 'no_exact_atlas_energy'
                 record['prediction_source'] = 'local ICEBERG'
                 simulated, simulated_count = _simulate_shards(python, path, mgf, formula, args.collision_unit, out,
                     model_options, result['instrument'],
@@ -274,7 +295,7 @@ def run(args):
                 record['status'] = 'formula_incompatible'
                 record['reason'] = str(exc)
             else:
-                record['status'] = 'blocked_model_assets' if isinstance(exc, FileNotFoundError) and record.get('reason') == 'no_exact_atlas_energy' else 'error'
+                record['status'] = 'blocked_model_assets' if isinstance(exc, FileNotFoundError) and record.get('reason') in ('no_exact_atlas_energy', 'atlas_lacks_adduct') else 'error'
                 record['error'] = str(exc)
                 operational_error = exc
                 break
@@ -375,7 +396,9 @@ def review(args):
     existing = list(result.get('candidates', []))
     atlas_mgf = next((r.get('atlas_mgf') for r in result.get('formula_results', []) if r['formula'] == formula), result.get('atlas_mgf'))
     if atlas_mgf and Path(atlas_mgf).exists() and not any(
-            row.get('missing_energies_ev') for row in result.get('formula_results', []) if row['formula'] == formula):
+            row.get('missing_energies_ev') or row.get('atlas_adduct')
+            for row in result.get('formula_results', []) if row['formula'] == formula) \
+            and _same_adduct(_mgf_adduct(Path(atlas_mgf)) or result.get('adduct', '[M+H]+'), result.get('adduct', '[M+H]+')):
         atlas = worker(python, 'rank', spectrum=result['input'], mgf=atlas_mgf,
                        formula=formula, top_k=100000,
                        experimental_unit=result['collision_unit'])
@@ -426,13 +449,24 @@ def review(args):
     return 0 if valid else 2
 
 
+def _feature_ids(path: str) -> set[str]:
+    """Feature IDs from a text or CSV file: one per line, or the first column (a header row is skipped)."""
+    rows = [line.split(',')[0].strip() for line in Path(path).expanduser().read_text().splitlines() if line.strip()]
+    if rows and rows[0].lower() in ('feature_id', 'feature', 'id', 'row id'):
+        rows = rows[1:]
+    return set(rows)
+
+
 def convert_mgf_command(args):
     from msms_structure_elucidation.mgf import convert_mgf
     manifest = convert_mgf(Path(args.input).expanduser().resolve(), Path(args.output_dir).expanduser().resolve(),
         args.collision_unit, args.energy, [Path(p).expanduser().resolve() for p in args.raw_mzxml or []] or None,
-        args.instrument, args.ms2_rt_window)
-    print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': sum(r['status'] == 'ready' for r in manifest),
-        'needs_energy': sum(r['status'] == 'needs_energy' for r in manifest)}, indent=2))
+        args.instrument, args.ms2_rt_window, _feature_ids(args.feature_ids) if args.feature_ids else None,
+        not args.no_ion_identity, args.ion_rt_window, args.elucidate_all_ions)
+    statuses = Counter(r['status'] for r in manifest)
+    print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': statuses.pop('ready', 0),
+        'needs_energy': statuses.pop('needs_energy', 0), **dict(statuses),
+        'adducts': dict(Counter(r['adduct'] for r in manifest if r['status'] == 'ready'))}, indent=2))
     return 0
 
 
@@ -757,6 +791,14 @@ def main(argv=None):
     converter.add_argument('--raw-mzxml', nargs='+',
                            help='mzXML files or folders; collisionEnergy is read from referenced MS2 scans, or from '
                                 'MS2 scans matching the precursor and retention time in the SOURCE_FILE run')
+    converter.add_argument('--feature-ids', help='file of feature IDs to convert (one per line or first CSV column); '
+                                                 'ion identity still uses every feature in the MGF')
+    converter.add_argument('--no-ion-identity', action='store_true',
+                           help='skip adduct, multimer and in-source fragment annotation from co-eluting features')
+    converter.add_argument('--ion-rt-window', type=float, default=3.0,
+                           help='seconds within which features count as co-eluting for ion identity (default 3)')
+    converter.add_argument('--elucidate-all-ions', action='store_true',
+                           help='also convert in-source fragments, multimers and adducts the models do not support')
     converter.add_argument('--ms2-rt-window', type=float, default=30.0,
                            help='seconds around RTINSECONDS for precursor-matched MS2 scans (default 30)')
     converter.add_argument('--instrument')
