@@ -375,6 +375,62 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(rows[0]['ms2_scans'], '1280')
             self.assertIn('>collision 35.0 eV', Path(rows[0]['ms_path']).read_text())
 
+    def test_batch_ends_with_one_review_page_for_all_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for name in ('a', 'b'):
+                (out / name).mkdir(); (out / name / 'retrieval.json').write_text('{}')
+            summary = [{'feature_id': 'a', 'status': 'ranked', 'output_dir': str(out / 'a')},
+                       {'feature_id': 'b', 'status': 'ranked', 'output_dir': str(out / 'b')},
+                       {'feature_id': 'c', 'status': 'error', 'output_dir': ''}]
+            args = SimpleNamespace(ms_pred_python='python', no_review_page=False)
+            def fake_visualize(view):
+                Path(view.export).write_text('<html>')
+                return 0
+            with patch.object(cli, 'visualize', side_effect=fake_visualize) as called:
+                info = cli._batch_review_page(args, summary, out)
+            view = called.call_args.args[0]
+            self.assertEqual(view.result, [str(out / 'a/retrieval.json'), str(out / 'b/retrieval.json')])
+            self.assertEqual(info['review_page'], str(out / 'review_report.html'))
+            self.assertIn('visualize --result', info['review_viewer_command'])
+            with patch.object(cli, 'visualize', return_value=2), patch('builtins.print'):
+                (out / 'review_report.html').unlink()
+                self.assertIn('review_page_error', cli._batch_review_page(args, summary, out))
+            with patch.object(cli, 'visualize') as skipped:
+                info = cli._batch_review_page(SimpleNamespace(ms_pred_python=None, no_review_page=True), summary, out)
+            skipped.assert_not_called()
+            self.assertNotIn('review_page', info)
+
+    def test_gnps_mgf_energy_from_precursor_matched_ms2_scans_in_source_file(self):
+        from msms_structure_elucidation.mgf import convert_mgf, _seconds
+        self.assertEqual((_seconds('PT298.725S'), _seconds('PT4.5M'), _seconds('PT1M3S'), _seconds('')), (298.725, 270.0, 63.0, None))
+        def scan(num, level, rt, precursor=None, ce=None):
+            if level == '1':
+                return f'<scan num="{num}" msLevel="1" retentionTime="PT{rt}S"/>'
+            return (f'<scan num="{num}" msLevel="2" retentionTime="PT{rt}S" collisionEnergy="{ce}">'
+                    f'<precursorMz precursorIntensity="10">{precursor}</precursorMz></scan>')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw = root / 'raw'; raw.mkdir()
+            (raw / 'a.mzXML').write_text('<mzXML><msRun>' + scan(10, '1', 100) + scan(11, '2', 101, 300.1001, 28)
+                + scan(12, '2', 104, 300.1003, 28) + scan(13, '2', 102, 450.2, 33) + '</msRun></mzXML>')
+            (raw / 'b.mzXML').write_text('<mzXML><msRun>' + scan(11, '2', 99, 300.1002, 40)
+                + scan(20, '2', 200, 500.0, 35) + scan(40, '2', 230, 500.0, 30) + '</msRun></mzXML>')
+            (raw / 'notes.txt').write_text('ignored')
+            entry = 'BEGIN IONS\nFEATURE_ID={}\nSOURCE_FILE={}\nSOURCE_SCAN=10\nPEPMASS={}\nRTINSECONDS={}\nMSLEVEL=2\n50 10\nEND IONS\n'
+            mgf = root / 'features.mgf'
+            mgf.write_text(entry.format(1, 'a.mzXML', 300.1, 110) + entry.format(2, 'b.mzXML', 500.0, 205)
+                           + entry.format(3, 'missing.mzXML', 300.1, 110))
+            rows = {r['feature_id']: r for r in convert_mgf(mgf, root / 'converted', 'eV', raw_mzxml=[raw])}
+            # MS1 apex scan 10 is ignored; scans 11 and 12 of a.mzXML match precursor and RT, not b.mzXML's scan 11
+            self.assertEqual((rows['1']['collision_energy'], rows['1']['energy_source'], rows['1']['ms2_scans']),
+                             (28.0, 'mzXML:MS2_precursor_match', '11,12'))
+            self.assertEqual(rows['1']['status'], 'ready')
+            self.assertEqual((rows['2']['status'], rows['2']['energy_source']), ('needs_energy', 'ambiguous_MS2_scans'))
+            self.assertEqual(rows['3']['status'], 'needs_energy')
+            narrow = {r['feature_id']: r for r in convert_mgf(mgf, root / 'narrow', 'eV', raw_mzxml=[raw], rt_window=10)}
+            self.assertEqual(narrow['2']['collision_energy'], 35.0)
+
     def test_mgf_missing_energy_is_manifest_status(self):
         from msms_structure_elucidation.mgf import convert_mgf
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,17 +483,49 @@ class WorkflowTests(unittest.TestCase):
                 chunk = json.loads(Path(kwargs['smiles_json']).read_text())
                 calls.extend(chunk)
                 self.assertEqual(kwargs['instrument'], 'QTOF')
+                self.assertEqual((kwargs['top_k'], kwargs['limit_images']), (2, True))
                 return [{'smiles': s, 'formula': 'C3H8', 'entropy_similarity': 0.1 * len(s),
                     'explained_intensity': 0.5, 'matched_peaks': []} for s in chunk]
             with patch.object(cli, 'worker', side_effect=fake_worker):
                 first, count = cli._simulate_shards('python', spec, mgf, 'C3H8', 'eV', root,
                     options, 'QTOF', 2, 2)
+                retuned = {**options, 'cuda_devices': '1', 'batch_size': 128, 'num_cpu_workers': 16, 'num_gpu_workers': 2}
                 second, count2 = cli._simulate_shards('python', spec, mgf, 'C3H8', 'eV', root,
-                    options, 'QTOF', 2, 2)
+                    retuned, 'QTOF', 2, 2)
             self.assertEqual(calls, ['C', 'CC', 'CCC'])
             self.assertEqual((count, count2), (3, 3))
             self.assertEqual([x['smiles'] for x in first], [x['smiles'] for x in second])
             self.assertEqual(len(list((root / 'model_shards/C3H8').glob('*.json'))), 4)
+
+    def test_yaml_device_lists_and_switch_arguments(self):
+        args = SimpleNamespace(cuda_devices=None, model_cpu_workers=None, model_gpu_workers=None)
+        with patch.dict('os.environ', {}, clear=True):
+            options = cli._model_options(args, {'models': {'simulator': {'cuda_devices': [1], 'batch_size': 128}}})
+        self.assertEqual((options['cuda_devices'], options['batch_size']), ('1', 128))
+        self.assertEqual(cli._devices([0, 1]), '0,1')
+        run = SimpleNamespace(returncode=0, stdout='RESULT_JSON=[]', stderr='')
+        with patch.object(cli.subprocess, 'run', return_value=run) as called:
+            cli.worker('python', 'simulate', limit_images=True, top_k=5, cuda_devices=None, skip=False)
+        self.assertEqual(called.call_args.args[0][-3:], ['--limit-images', '--top-k', '5'])
+
+    def test_shard_image_floor_covers_every_merged_leader(self):
+        import random
+        from msms_structure_elucidation.worker import image_floor, sort_candidates
+        # Scores packed within a few tie bands, where a shard's own top_k can miss a merged leader.
+        rng = random.Random(1)
+        for _ in range(3000):
+            shards = [[{'smiles': f'{s}-{i}', 'formula': 'X', 'entropy_similarity': round(rng.uniform(0.5, 0.58), 3),
+                        'explained_intensity': rng.random(), 'matched_peaks': []} for i in range(rng.randint(1, 6))]
+                      for s in range(rng.randint(2, 4))]
+            top_k = rng.randint(1, 3)
+            drawn = set()
+            for shard in shards:
+                floor = image_floor([c['entropy_similarity'] for c in shard], top_k)
+                drawn.update(c['smiles'] for c in shard if c['entropy_similarity'] >= floor)
+            leaders = []
+            for shard in shards:
+                leaders = sort_candidates(leaders + [dict(c) for c in shard])[:top_k]
+            self.assertTrue({c['smiles'] for c in leaders} <= drawn)
 
     def test_fragment_ids_are_peak_aligned_and_preserve_large_values(self):
         from msms_structure_elucidation.worker import _serial_fragment_ids

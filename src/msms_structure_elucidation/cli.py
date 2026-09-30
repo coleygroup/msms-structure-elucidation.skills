@@ -78,7 +78,9 @@ def worker(python: str, action: str, **kwargs):
                 str(kwargs['spectrum']), kwargs['formula'], kwargs['experimental_unit'])
     cmd = [python, '-m', 'msms_structure_elucidation.worker', action]
     for key, value in kwargs.items():
-        if value is not None:
+        if value is True:
+            cmd.append('--' + key.replace('_', '-'))
+        elif value is not None and value is not False:
             cmd += ['--' + key.replace('_', '-'), str(value)]
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join(x for x in (
@@ -105,10 +107,17 @@ def _model_options(args, config: dict, default_model='iceberg') -> dict:
         'checkpoint': path_option(getattr(args, 'checkpoint', None), None, model_cfg.get('glacier_ckpt')),
         'gen_checkpoint': path_option(getattr(args, 'gen_checkpoint', None), None, model_cfg.get('gen_ckpt')),
         'inten_checkpoint': path_option(getattr(args, 'inten_checkpoint', None), None, model_cfg.get('inten_ckpt')),
-        'cuda_devices': choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices')),
+        'cuda_devices': _devices(choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices'))),
         'batch_size': getattr(args, 'model_batch_size', None) or model_cfg.get('batch_size', 1),
         'num_cpu_workers': getattr(args, 'model_cpu_workers', None) or model_cfg.get('num_cpu_workers', 1),
         'num_gpu_workers': getattr(args, 'model_gpu_workers', None) or model_cfg.get('num_gpu_workers', 1)}
+
+
+def _devices(value) -> str | None:
+    """CUDA_VISIBLE_DEVICES string; a YAML list such as [1] or [0, 1] becomes '1' or '0,1'."""
+    if isinstance(value, (list, tuple)):
+        return ','.join(str(item) for item in value) or None
+    return None if value is None else str(value)
 
 
 def _save(result: dict, out: Path, no_report=False) -> None:
@@ -141,7 +150,7 @@ def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str
         checkpoint_versions = {k: (str(options.get(k)), Path(options[k]).stat().st_size, Path(options[k]).stat().st_mtime_ns)
             for k in ('gen_checkpoint', 'inten_checkpoint') if options.get(k)}
         signature = hashlib.sha256(json.dumps([chunk, input_hash, unit, instrument,
-            {k: str(options.get(k)) for k in ('model','ms_pred_dir','cuda_devices','batch_size')},
+            {k: str(options.get(k)) for k in ('model', 'ms_pred_dir')},  # batch size, devices and workers do not change predictions
             checkpoint_versions], sort_keys=True).encode()).hexdigest()[:16]
         saved = shards / f'{start:08d}-{signature}.json'
         if saved.is_file():
@@ -152,12 +161,12 @@ def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str
             if _MODEL_SEMAPHORE is None:
                 candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
                     formula=formula, experimental_unit=unit, output_dir=out,
-                    instrument=instrument, **options)
+                    instrument=instrument, top_k=top_k, limit_images=True, **options)
             else:
                 with _MODEL_SEMAPHORE:
                     candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
                         formula=formula, experimental_unit=unit, output_dir=out,
-                        instrument=instrument, **options)
+                        instrument=instrument, top_k=top_k, limit_images=True, **options)
             temp = saved.with_suffix('.tmp')
             temp.write_text(json.dumps(candidates, allow_nan=False))
             temp.replace(saved)
@@ -420,8 +429,8 @@ def review(args):
 def convert_mgf_command(args):
     from msms_structure_elucidation.mgf import convert_mgf
     manifest = convert_mgf(Path(args.input).expanduser().resolve(), Path(args.output_dir).expanduser().resolve(),
-        args.collision_unit, args.energy, Path(args.raw_mzxml).expanduser().resolve() if args.raw_mzxml else None,
-        args.instrument)
+        args.collision_unit, args.energy, [Path(p).expanduser().resolve() for p in args.raw_mzxml or []] or None,
+        args.instrument, args.ms2_rt_window)
     print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': sum(r['status'] == 'ready' for r in manifest),
         'needs_energy': sum(r['status'] == 'needs_energy' for r in manifest)}, indent=2))
     return 0
@@ -564,9 +573,39 @@ def batch(args):
     with (out / 'batch_summary.csv').open('w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=['feature_id', 'status', 'output_dir', 'resumed', 'error'])
         writer.writeheader(); writer.writerows(summary)
+    review = _batch_review_page(args, summary, out)
     print(json.dumps({'features': len(summary), 'max_workers': max_workers, 'status_counts': {s: sum(r['status'] == s for r in summary) for s in {r['status'] for r in summary}},
-        'summary': str(out / 'batch_summary.csv')}, indent=2))
+        'summary': str(out / 'batch_summary.csv'), 'reviewable_results': len(review.get('results', [])),
+        **{k: v for k, v in review.items() if k != 'results'}}, indent=2))
+    if args.serve and review.get('results'):
+        visualize(argparse.Namespace(result=review['results'], ms_pred_python=args.ms_pred_python,
+            port=0, atlas_mgf=None, export=None))
     return 1 if any(r['status'] == 'error' for r in summary) else 0
+
+
+def _batch_review_page(args, summary: list[dict], out: Path) -> dict:
+    """Final batch step: one self-contained review page across every finished feature."""
+    results = sorted({str(Path(r['output_dir']) / 'retrieval.json') for r in summary
+                      if r.get('output_dir') and (Path(r['output_dir']) / 'retrieval.json').is_file()})
+    if not results:
+        return {}
+    serve = 'msms-structure-elucidation visualize --result ' + str(out / '*' / 'retrieval.json')
+    info = {'results': results, 'review_viewer_command': serve}
+    if args.no_review_page:
+        return info
+    page = out / 'review_report.html'
+    try:
+        code = visualize(argparse.Namespace(result=results, ms_pred_python=args.ms_pred_python, port=0,
+            atlas_mgf=None, export=str(page), split_data=False, demo_reviews=False,
+            title=f'MS/MS review: {out.name}'))
+    except Exception as exc:  # the computed results stand; report why the page is missing
+        code, error = 1, str(exc)
+    else:
+        error = f'visualize exited with {code}'
+    if code or not page.is_file():
+        print(f'Review page export failed ({error}); serve it with: {serve}', file=sys.stderr)
+        return {**info, 'review_page_error': error}
+    return {**info, 'review_page': str(page)}
 
 
 def denovo(args):
@@ -715,7 +754,11 @@ def main(argv=None):
     converter.add_argument('--output-dir', required=True)
     converter.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'])
     converter.add_argument('--energy', type=float, help='confirmed energy override for entries without MS2 energy')
-    converter.add_argument('--raw-mzxml', help='read collisionEnergy from referenced MS2 scans')
+    converter.add_argument('--raw-mzxml', nargs='+',
+                           help='mzXML files or folders; collisionEnergy is read from referenced MS2 scans, or from '
+                                'MS2 scans matching the precursor and retention time in the SOURCE_FILE run')
+    converter.add_argument('--ms2-rt-window', type=float, default=30.0,
+                           help='seconds around RTINSECONDS for precursor-matched MS2 scans (default 30)')
     converter.add_argument('--instrument')
     batcher = sub.add_parser('batch', help='run a feature manifest with shared atlas cache and bounded model jobs')
     batcher.add_argument('--manifest', required=True)
@@ -742,6 +785,10 @@ def main(argv=None):
     batcher.add_argument('--max-model-jobs', type=int)
     batcher.add_argument('--min-free-memory-gb', type=float)
     batcher.add_argument('--no-report', action='store_true')
+    batcher.add_argument('--no-review-page', action='store_true',
+                         help='skip the final combined review_report.html (msms-visualize export)')
+    batcher.add_argument('--serve', action='store_true',
+                         help='after the batch, serve the interactive review viewer for every feature')
     generator = sub.add_parser('denovo', help='run optional FRIGID fallback for a retrieval result')
     generator.add_argument('--result', required=True)
     generator.add_argument('--ms-pred-python')
