@@ -17,6 +17,8 @@ When there is more than one unknown, always serve every result in one viewer ins
 msms-structure-elucidation visualize --result results/*/retrieval.json
 ```
 
+`batch` already ends with this step: it writes `review_report.html` for every finished feature into its output directory and prints the serving command (`--serve` starts the viewer, `--no-review-page` skips the page).
+
 The page opens on an overview of every unknown: summary counts, the rank-1 similarity distribution, outcome (ICEBERG Atlas, model prediction labelled with the model and version used such as ICEBERG 2.1 prediction, missing exact Atlas energy, not in ICEBERG Atlas, Atlas retrieval failed, no formula, no PubChem formula), with the next step shown for unknowns without candidates, review progress, and a filterable, sortable table with rank-1 structures. Each result keeps its own `review_notes.json` beside its `retrieval.json`; results load on demand, so large batches stay responsive. `--atlas-mgf` applies only to a single result.
 
 The command prints a `http://127.0.0.1:<port>/` URL and serves until Ctrl+C. It selects a Python with `ms_pred`; that interpreter also needs Flask (`python -m pip install -e '.[visualize]'`). Use `--ms-pred-python` to select another interpreter. If ms-pred must be installed, clone [coleygroup/ms-pred](https://github.com/coleygroup/ms-pred), read the checkout's `README.md` **Install & setup** section, and follow its environment instructions before installing this skill's visualization extra. For an older result moved away from its cached atlas, pass `--atlas-mgf /path/to/formula.mgf` to restore fragment IDs.

@@ -88,7 +88,7 @@ class BatchConcurrencyTest(unittest.TestCase):
                 instrument=None, cuda_devices=None, model=None, checkpoint=None, gen_checkpoint=None,
                 inten_checkpoint=None, model_batch_size=None, model_shard_size=None, model_cpu_workers=None,
                 model_gpu_workers=None, atlas_url=None, top_k=None, no_report=True, max_workers=None,
-                max_model_jobs=None, min_free_memory_gb=None)
+                max_model_jobs=None, min_free_memory_gb=None, no_review_page=True, serve=False)
             # Threads stand in for the spawned worker processes so the patched run() is visible.
             def thread_pool(max_workers, mp_context, initializer, initargs):
                 return concurrent.futures.ThreadPoolExecutor(max_workers, initializer=initializer, initargs=initargs)
