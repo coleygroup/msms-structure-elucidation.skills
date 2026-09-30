@@ -564,9 +564,39 @@ def batch(args):
     with (out / 'batch_summary.csv').open('w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=['feature_id', 'status', 'output_dir', 'resumed', 'error'])
         writer.writeheader(); writer.writerows(summary)
+    review = _batch_review_page(args, summary, out)
     print(json.dumps({'features': len(summary), 'max_workers': max_workers, 'status_counts': {s: sum(r['status'] == s for r in summary) for s in {r['status'] for r in summary}},
-        'summary': str(out / 'batch_summary.csv')}, indent=2))
+        'summary': str(out / 'batch_summary.csv'), 'reviewable_results': len(review.get('results', [])),
+        **{k: v for k, v in review.items() if k != 'results'}}, indent=2))
+    if args.serve and review.get('results'):
+        visualize(argparse.Namespace(result=review['results'], ms_pred_python=args.ms_pred_python,
+            port=0, atlas_mgf=None, export=None))
     return 1 if any(r['status'] == 'error' for r in summary) else 0
+
+
+def _batch_review_page(args, summary: list[dict], out: Path) -> dict:
+    """Final batch step: one self-contained review page across every finished feature."""
+    results = sorted({str(Path(r['output_dir']) / 'retrieval.json') for r in summary
+                      if r.get('output_dir') and (Path(r['output_dir']) / 'retrieval.json').is_file()})
+    if not results:
+        return {}
+    serve = 'msms-structure-elucidation visualize --result ' + str(out / '*' / 'retrieval.json')
+    info = {'results': results, 'review_viewer_command': serve}
+    if args.no_review_page:
+        return info
+    page = out / 'review_report.html'
+    try:
+        code = visualize(argparse.Namespace(result=results, ms_pred_python=args.ms_pred_python, port=0,
+            atlas_mgf=None, export=str(page), split_data=False, demo_reviews=False,
+            title=f'MS/MS review: {out.name}'))
+    except Exception as exc:  # the computed results stand; report why the page is missing
+        code, error = 1, str(exc)
+    else:
+        error = f'visualize exited with {code}'
+    if code or not page.is_file():
+        print(f'Review page export failed ({error}); serve it with: {serve}', file=sys.stderr)
+        return {**info, 'review_page_error': error}
+    return {**info, 'review_page': str(page)}
 
 
 def denovo(args):
@@ -742,6 +772,10 @@ def main(argv=None):
     batcher.add_argument('--max-model-jobs', type=int)
     batcher.add_argument('--min-free-memory-gb', type=float)
     batcher.add_argument('--no-report', action='store_true')
+    batcher.add_argument('--no-review-page', action='store_true',
+                         help='skip the final combined review_report.html (msms-visualize export)')
+    batcher.add_argument('--serve', action='store_true',
+                         help='after the batch, serve the interactive review viewer for every feature')
     generator = sub.add_parser('denovo', help='run optional FRIGID fallback for a retrieval result')
     generator.add_argument('--result', required=True)
     generator.add_argument('--ms-pred-python')

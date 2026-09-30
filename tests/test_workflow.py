@@ -375,6 +375,32 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(rows[0]['ms2_scans'], '1280')
             self.assertIn('>collision 35.0 eV', Path(rows[0]['ms_path']).read_text())
 
+    def test_batch_ends_with_one_review_page_for_all_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for name in ('a', 'b'):
+                (out / name).mkdir(); (out / name / 'retrieval.json').write_text('{}')
+            summary = [{'feature_id': 'a', 'status': 'ranked', 'output_dir': str(out / 'a')},
+                       {'feature_id': 'b', 'status': 'ranked', 'output_dir': str(out / 'b')},
+                       {'feature_id': 'c', 'status': 'error', 'output_dir': ''}]
+            args = SimpleNamespace(ms_pred_python='python', no_review_page=False)
+            def fake_visualize(view):
+                Path(view.export).write_text('<html>')
+                return 0
+            with patch.object(cli, 'visualize', side_effect=fake_visualize) as called:
+                info = cli._batch_review_page(args, summary, out)
+            view = called.call_args.args[0]
+            self.assertEqual(view.result, [str(out / 'a/retrieval.json'), str(out / 'b/retrieval.json')])
+            self.assertEqual(info['review_page'], str(out / 'review_report.html'))
+            self.assertIn('visualize --result', info['review_viewer_command'])
+            with patch.object(cli, 'visualize', return_value=2), patch('builtins.print'):
+                (out / 'review_report.html').unlink()
+                self.assertIn('review_page_error', cli._batch_review_page(args, summary, out))
+            with patch.object(cli, 'visualize') as skipped:
+                info = cli._batch_review_page(SimpleNamespace(ms_pred_python=None, no_review_page=True), summary, out)
+            skipped.assert_not_called()
+            self.assertNotIn('review_page', info)
+
     def test_mgf_missing_energy_is_manifest_status(self):
         from msms_structure_elucidation.mgf import convert_mgf
         with tempfile.TemporaryDirectory() as tmp:
