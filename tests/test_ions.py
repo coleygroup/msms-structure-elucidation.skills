@@ -120,5 +120,16 @@ class MsbuddyAdductTests(unittest.TestCase):
         self.assertIn('ADDUCT=[M+Na]+', seen[0])
 
 
+class CudaPreflightTests(unittest.TestCase):
+    def test_configured_gpu_without_cuda_fails_fast(self):
+        from msms_structure_elucidation.worker import _require_cuda
+        no_cuda = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
+        with patch.dict(sys.modules, {'torch': no_cuda}):
+            _require_cuda(None)
+            _require_cuda('')
+            with self.assertRaisesRegex(RuntimeError, 'CUDA is not available'):
+                _require_cuda('0')
+
+
 if __name__ == '__main__':
     unittest.main()
