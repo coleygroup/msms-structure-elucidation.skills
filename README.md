@@ -8,13 +8,13 @@ Open Codex or Claude Code in your project and type:
 
 > Install the skills from https://github.com/coleygroup/msms-structure-elucidation.skills. Check which required environments, repository checkouts, and model assets are already available, and tell me what is ready or missing. I am not providing a spectrum yet.
 
-Agents: installation follows [AGENTS.md](AGENTS.md) and the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. That skill asks whether models run on this machine or a remote GPU host, probes that host, and saves tuned inference settings to `configs/local.yaml` for later runs.
+Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. That skill asks whether models run on this machine or a remote GPU host, probes that host, and saves tuned inference settings to `configs/local.yaml` for later runs.
 
 Installation does not require collision-energy information. When you are ready to analyze a spectrum, attach it or give its path and ask the agent to run the workflow. At that point, the agent should confirm the supplied collision energies and whether their values are **NCE or absolute eV** before scoring; a file header alone does not establish the unit.
 
 ## Explore a completed example
 
-The [plasma unknown 583 demo](demo/README.md) is a self-contained interactive result generated from a verified analysis snapshot. The GitHub Pages workflow rebuilds its HTML on every commit; you can also [build it locally](demo/README.md). It uses the public [plasma_unknown_583.ms](https://github.com/coleygroup/ms-pred/blob/main/data/exp_specs/clinical/plasma_unknown_583.ms) spectrum from ms-pred. Its provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE**, despite the file's eV labels.
+The [clinical unknowns demo](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/) shows the three public unknowns in [ms-pred's clinical spectra directory](https://github.com/coleygroup/ms-pred/tree/main/data/exp_specs/clinical) on one interactive page. The GitHub Pages workflow rebuilds its HTML on every commit; you can also [build it locally](demo/README.md). The provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE** for all three unknowns, despite the files' eV labels.
 
 In the demo, switch between collision energies, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Entropy similarity and explained intensity help rank candidates; explained intensity breaks close score ties. Neither is a probability of identification.
 
@@ -51,6 +51,6 @@ The public atlas does not contain licensed NIST structures. A good spectral matc
 3. Open the result URL the agent provides. Select a candidate and energy, click a peak, compare another candidate, and inspect the unexplained peaks.
 4. Add a candidate or fragment note in the local viewer, then tell the agent: **“Please review my saved notes and refine the candidates.”**
 
-For this example, the workflow inferred three formulas and scored 158 public-atlas structures. The demo shows the top 20 candidates with all five energy pairs; the leading candidate has 0.615 entropy similarity and 86.7% explained intensity. Those numbers describe the match to this spectrum, not identification confidence. See the [demo provenance and build instructions](demo/README.md) for the source spectrum and energy mapping.
+For plasma 583, the workflow inferred three formulas and scored 158 public-atlas structures. The demo shows its top 20 candidates with all five energy pairs; the leading candidate has 0.615 entropy similarity and 86.7% explained intensity. Those numbers describe the match to this spectrum, not identification confidence. The same demo also includes CSF and plasma 198. See the [demo provenance and build instructions](demo/README.md) for all three spectra and their energy mapping.
 
 For manual installation, batch processing, model checkpoints, and command line options, see the [technical guide](docs/technical-guide.md). The [scientific workflow](.agents/workflows/msms-elucidation.md) and [skills](.agents/skills) contain the agent procedures.

@@ -52,7 +52,7 @@ const api = {
 };
 
 /* ---------- demo reviews: kept in this browser only ---------- */
-const demoKey = () => `msms-demo-reviews:${STATIC.exported_at}`;
+const demoKey = () => STATIC.demo_review_storage_key || `msms-demo-reviews:${STATIC.exported_at}`;
 function demoStore() {
   try { return JSON.parse(localStorage.getItem(demoKey()) || '{}'); } catch (e) { return {}; }
 }
@@ -265,6 +265,11 @@ async function openResult(i) {
 function renderWorkspace() {
   showError('');
   const r = S.index[S.r], res = S.result, has = res.candidates.length > 0;
+  if (DEMO()) {
+    const url = STATIC.demo_source_urls?.[S.r] || STATIC.demo_source_url;
+    $('demo-source').hidden = !url || !/^https:\/\//.test(url);
+    if (!$('demo-source').hidden) $('demo-source').href = url;
+  }
   const pos = S.order.indexOf(S.r);
   $('ws-name').textContent = r.label;
   $('ws-pos').textContent = pos >= 0 ? `${pos + 1} / ${S.order.length}` : `— / ${S.order.length}`;
@@ -877,7 +882,7 @@ async function init() {
     if (DEMO()) {
       $('demo-note').hidden = false;
       $('demo-guide').hidden = false;
-      for (const [id, url] of [['demo-source', STATIC.demo_source_url], ['demo-install', STATIC.demo_install_url]]) {
+      for (const [id, url] of [['demo-install', STATIC.demo_install_url]]) {
         if (url && /^https:\/\//.test(url)) { $(id).href = url; $(id).hidden = false; }
       }
       const store = demoStore();  // reflect this browser's demo reviews in the overview

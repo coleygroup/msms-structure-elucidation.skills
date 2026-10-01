@@ -29,7 +29,7 @@ jobs:
           cat > _site/index.html <<'HTML'
           <!doctype html><html lang="en"><meta charset="utf-8"><title>MS/MS structure elucidation demo</title>
           <meta http-equiv="refresh" content="0;url=demo/msms-structure-elucidation/">
-          <p><a href="demo/msms-structure-elucidation/">Explore the plasma unknown demo</a></p>
+          <p><a href="demo/msms-structure-elucidation/">Explore the clinical unknowns demo</a></p>
           HTML
           touch _site/.nojekyll
       - name: Configure Pages
