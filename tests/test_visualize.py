@@ -38,7 +38,7 @@ class VisualizeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'Interactive fragment review', response.data)
         response.close()
-        for asset in ('viewer.js', 'viewer.css'):
+        for asset in ('viewer.js', 'viewer_merge.js', 'viewer.css'):
             response = self.client.get('/assets/' + asset)
             self.assertEqual(response.status_code, 200)
             response.close()
@@ -131,7 +131,9 @@ class VisualizeTests(unittest.TestCase):
         out = export_static([self.result, odd], self.root / 'report.html')
         page = out.read_text()
         self.assertNotIn('/assets/viewer.js', page)
+        self.assertNotIn('/assets/viewer_merge.js', page)
         self.assertIn('window.MSMS_STATIC=', page)
+        self.assertIn('root.MSMSMerge = api', page)
         data = page.split('window.MSMS_STATIC=', 1)[1].split(';</script>', 1)[0]
         self.assertNotIn('</script>', data)
         parsed = json.loads(data.replace('<\\/', '</'))

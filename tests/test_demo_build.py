@@ -27,6 +27,8 @@ class DemoBuildTests(unittest.TestCase):
             page = output.read_text()
             manifest = json.loads(output.with_name('manifest.json').read_text())
         self.assertIn('window.MSMS_STATIC=', page)
+        self.assertIn('Merged all energies', page)
+        self.assertIn('root.MSMSMerge = api', page)
         self.assertIn('click', page)
         self.assertEqual([row['name'] for row in manifest['unknowns']], NAMES)
         self.assertTrue(all(row['user_confirmed_collision_unit'] == 'NCE' for row in manifest['unknowns']))

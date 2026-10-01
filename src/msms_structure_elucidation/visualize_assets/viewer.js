@@ -18,8 +18,9 @@ const ICON = { keep: '✓', uncertain: '?', reject: '✕' };
 
 const S = {
   index: [], order: [], token: null, sort: { key: 'label', dir: 1 },
-  r: null, result: null, notes: null, cand: 0, pairIdx: 0, compare: null, peak: null, zoom: null,
+  r: null, result: null, notes: null, cand: 0, pairIdx: -1, compare: null, peak: null, zoom: null,
   payloads: new Map(), thumbs: new Map(), drafts: new Map(), saveTimers: {}, loading: 0, formulaCache: {},
+  mergedCache: new WeakMap(),
 };
 
 /* ---------- data access: live server or embedded static export ---------- */
@@ -212,13 +213,21 @@ function renderTable() {
 const cand = (k = S.cand) => S.result.candidates[k];
 const pairOf = c => (c.energy_alignment || [])[S.pairIdx] || (c.energy_alignment || [])[0] || null;
 const noteFor = c => S.notes?.candidates?.[c.review_key] || {};
+const peakRef = (sp, i) => sp.predRefs?.[i] || { key: sp.key, index: i, id: sp.ids[i] };
+const peakFormula = (k, sp, i) => {
+  const ref = peakRef(sp, i);
+  return S.formulaCache[`${k}:${ref.key}:${ref.index}`];
+};
+const peakNoteKey = (sp, i) => {
+  const ref = peakRef(sp, i);
+  return `${ref.key}:${ref.index}`;
+};
 function nearest(peaks, mz) {
   let best = -1, d = 0.01;
   peaks.forEach((p, i) => { const x = Math.abs(p[0] - mz); if (x < d) { d = x; best = i; } });
   return best;
 }
-function spectraFor(c) {
-  const pair = pairOf(c);
+function pairedSpectrum(c, pair) {
   if (!pair) return null;
   const key = pair.prediction_key ?? pair.atlas_key;
   const exp = S.result.spectra[pair.experimental_key] || [], pred = c.predicted_spectra?.[key] || [];
@@ -231,7 +240,56 @@ function spectraFor(c) {
     const ei = nearest(exp, m.mz), pi = nearest(pred, m.predicted_mz);
     if (ei >= 0 && pi >= 0) { e2p.set(ei, pi); if (!p2e.has(pi) || exp[ei][1] > exp[p2e.get(pi)][1]) p2e.set(pi, ei); }
   }
-  return { pair, key, exp, pred, ids, expMax, predMax, e2p, p2e, precursor };
+  return { pair, key, exp, pred, ids, expMax, predMax, e2p, p2e, precursor, merged: false };
+}
+function mergedSpectrum(c) {
+  if (S.mergedCache.has(c)) return S.mergedCache.get(c);
+  const entries = (c.energy_alignment || []).map(pair => {
+    const key = pair.prediction_key ?? pair.atlas_key;
+    return { pair, key, exp: S.result.spectra[pair.experimental_key] || [],
+      pred: c.predicted_spectra?.[key] || [], ids: c.predicted_fragment_ids?.[key] || [] };
+  }).filter(e => e.exp.length && e.pred.length);
+  if (entries.length < 2) return pairedSpectrum(c, entries[0]?.pair);
+  const merge = window.MSMSMerge.mergePeaks;
+  const expMerged = merge(entries.map(e => ({ key: e.pair.experimental_key, peaks: e.exp })));
+  const uniquePred = [...new Map(entries.map(e => [e.key, e])).values()];
+  const predMerged = merge(uniquePred.map(e => ({ key: e.key, peaks: e.pred, ids: e.ids })));
+  const exp = expMerged.peaks, pred = predMerged.peaks;
+  const predRefs = predMerged.members.map(group => group.filter(p => p.id != null)
+    .sort((a, b) => b.intensity - a.intensity)[0] || null);
+  const ids = predRefs.map(ref => ref?.id ?? null);
+  const expLookup = new Map(), predLookup = new Map();
+  expMerged.members.forEach((group, i) => group.forEach(p => expLookup.set(`${p.key}:${p.index}`, i)));
+  predMerged.members.forEach((group, i) => group.forEach(p => predLookup.set(`${p.key}:${p.index}`, i)));
+  const e2p = new Map(), p2e = new Map();
+  const byExperimentalKey = new Map(entries.map(e => [String(e.pair.experimental_key), e]));
+  for (const match of c.matched_peaks || []) {
+    const e = byExperimentalKey.get(String(match.ce));
+    if (!e) continue;
+    const expIndex = nearest(e.exp, match.mz), predIndex = nearest(e.pred, match.predicted_mz);
+    if (expIndex < 0 || predIndex < 0) continue;
+    const ei = expLookup.get(`${e.pair.experimental_key}:${expIndex}`);
+    const pi = predLookup.get(`${e.key}:${predIndex}`);
+    if (ei == null || pi == null) continue;
+    if (!e2p.has(ei) || pred[pi][1] > pred[e2p.get(ei)][1]) e2p.set(ei, pi);
+    if (!p2e.has(pi) || exp[ei][1] > exp[p2e.get(pi)][1]) p2e.set(pi, ei);
+  }
+  const precursor = Number(S.result.parentmass) || Infinity;
+  const sp = {
+    pair: { merged: true, input_values: entries.map(e => e.pair.input_value),
+      input_unit: entries[0].pair.input_unit,
+      model_energies_ev: [...new Set(entries.map(e => e.pair.model_energy_ev ?? e.pair.atlas_ev))],
+      entropy_similarity: c.entropy_similarity },
+    key: 'merged', exp, pred, ids, predRefs, predMembers: predMerged.members,
+    expMax: Math.max(1e-9, ...exp.filter(p => p[0] <= precursor + 2).map(p => p[1])),
+    predMax: Math.max(1e-9, ...pred.map(p => p[1])), e2p, p2e, precursor, merged: true,
+  };
+  S.mergedCache.set(c, sp);
+  return sp;
+}
+function spectraFor(c) {
+  return S.pairIdx === -1 && (c.energy_alignment || []).length > 1
+    ? mergedSpectrum(c) : pairedSpectrum(c, pairOf(c));
 }
 function defaultRange(sp) {
   const mzs = [...sp.pred.map(p => p[0]), ...sp.exp.filter(p => p[0] <= sp.precursor + 2).map(p => p[0])];
@@ -257,7 +315,8 @@ async function openResult(i) {
     if (token !== S.loading) return;
     S.r = i; S.result = data.result; S.notes = data.notes || { version: 1, candidates: {} };
     if (data.review_token) S.token = data.review_token;
-    S.cand = 0; S.pairIdx = 0; S.compare = null; S.peak = null; S.zoom = null; S.formulaCache = {};
+    S.cand = 0; S.pairIdx = -1; S.compare = null; S.peak = null; S.zoom = null;
+    S.formulaCache = {}; S.mergedCache = new WeakMap();
     renderWorkspace();
     S.result.candidates.slice(0, 12).forEach((_, k) => payload(k).then(p => { if (S.r === i) fillMini(k, p); }));
   } catch (error) { showError(`Cannot load ${S.index[i]?.label || 'result'}: ${error.message}`); }
@@ -336,9 +395,11 @@ function renderRail() {
 }
 function renderEnergy() {
   const c = cand(), sel = $('energy');
-  sel.innerHTML = (c.energy_alignment || []).map((a, i) => `<option value="${i}">${fmt(a.input_value, 0)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}</option>`).join('');
-  sel.value = String(Math.min(S.pairIdx, Math.max(0, (c.energy_alignment || []).length - 1)));
-  sel.disabled = (c.energy_alignment || []).length < 2;
+  const align = c.energy_alignment || [];
+  const merged = align.length > 1 ? `<option value="-1">Merged all energies · ${align.map(a => fmt(a.input_value, 0)).join('/')} ${esc(align[0].input_unit)} ↔ ${[...new Set(align.map(a => fmt(a.model_energy_ev ?? a.atlas_ev, 0)))].join('/')} eV</option>` : '';
+  sel.innerHTML = merged + align.map((a, i) => `<option value="${i}">${fmt(a.input_value, 0)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}</option>`).join('');
+  sel.value = String(S.pairIdx === -1 && align.length > 1 ? -1 : Math.max(0, Math.min(S.pairIdx, align.length - 1)));
+  sel.disabled = align.length < 2;
   $('compare').setAttribute('aria-pressed', String(S.compare != null));
   $('compare').disabled = S.result.candidates.length < 2;
   const other = $('compare-with');
@@ -411,7 +472,7 @@ function drawMirror(el, k, compact) {
     s += `<circle class="peak-cap exp" cx="${x(sp.exp[selExp][0])}" cy="${mid - Math.max(1, h)}" r="4"/>`;
   }
   if (selPred != null && inRange(sp.pred[selPred][0])) {
-    const px = x(sp.pred[selPred][0]), h = (sp.pred[selPred][1] / sp.predMax) * half, formula = S.formulaCache[`${k}:${sp.key}:${selPred}`];
+    const px = x(sp.pred[selPred][0]), h = (sp.pred[selPred][1] / sp.predMax) * half, formula = peakFormula(k, sp, selPred);
     const text = `${sp.pred[selPred][0].toFixed(3)}${formula ? ' · ' + esc(hill(formula)) : ''}`;
     s += `<circle class="peak-cap pred" cx="${px}" cy="${mid + Math.max(1, h)}" r="4"/>`;
     if (h > half - 24) {  // tall peak: label beside the tip so it clears the caption and axis
@@ -420,8 +481,12 @@ function drawMirror(el, k, compact) {
     } else s += `<text class="plabel sel" x="${px}" y="${mid + h + 16}" text-anchor="middle">${text}</text>`;
   }
   s += `<line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${mid}" y2="${mid}"/>`;
-  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + 10}">Experimental · ${fmt(sp.pair.input_value, 0)} ${esc(sp.pair.input_unit)}</text>`;
-  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${fmt(sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}</text>`;
+  const expLabel = sp.merged ? `merged ${sp.pair.input_values.map(v => fmt(v, 0)).join('/')} ${esc(sp.pair.input_unit)}`
+    : `${fmt(sp.pair.input_value, 0)} ${esc(sp.pair.input_unit)}`;
+  const predLabel = sp.merged ? `merged ${sp.pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV · overall similarity ${fmt(c.entropy_similarity, 3)}`
+    : `${fmt(sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}`;
+  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + 10}">Experimental · ${expLabel}</text>`;
+  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${predLabel}</text>`;
   s += '</svg>';
   el.innerHTML = s;
   wirePlot(el, k, sp, { m, iw, ih, mid, x, lo, hi });
@@ -484,12 +549,14 @@ function peakTip(k, sp, h) {
     const [mz, it] = sp.exp[h.i], pi = sp.e2p.get(h.i);
     const rel = `${(100 * it / sp.expMax).toFixed(1)}% of base peak`;
     if (pi == null) return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br><span class="muted">Not explained by #${k + 1}</span>`;
-    const f = S.formulaCache[`${k}:${sp.key}:${pi}`];
+    const f = peakFormula(k, sp, pi);
     return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br>Matched predicted ${sp.pred[pi][0].toFixed(4)} (${ppm(mz, sp.pred[pi][0]).toFixed(1)} ppm)${f ? `<br>${fhtml(f)}` : ''}`;
   }
-  const [mz, it] = sp.pred[h.i], ei = sp.p2e.get(h.i), f = S.formulaCache[`${k}:${sp.key}:${h.i}`];
+  const [mz, it] = sp.pred[h.i], ei = sp.p2e.get(h.i), f = peakFormula(k, sp, h.i);
+  const sources = sp.merged ? [...new Set(sp.predMembers[h.i].map(p => p.key))].join('/') : null;
   return `<b>Predicted m/z ${mz.toFixed(4)}</b>${f ? ` · ${fhtml(f)}` : ''}<br>${(100 * it / sp.predMax).toFixed(1)}% of predicted base peak<br>` +
     (ei != null ? `Matches experimental ${sp.exp[ei][0].toFixed(4)} (${ppm(sp.exp[ei][0], mz).toFixed(1)} ppm)` : '<span class="muted">No experimental match</span>') +
+    (sources ? `<br>Contributing predictions: ${esc(sources)} eV` : '') +
     (sp.ids[h.i] == null ? '<br><span class="muted">No fragment ID</span>' : '');
 }
 function placeTip(cx, cy) {
@@ -553,9 +620,10 @@ function highlight(frag) {
 let currentPayload = null;
 function fragmentFor(pl, sp, pi) {
   if (!pl || pi == null || !sp) return null;
-  const id = sp.ids[pi];
+  const ref = peakRef(sp, pi), id = ref.id;
   if (id == null) return null;
-  return { id: String(id), formula: pl.peaks?.[sp.key]?.[pi] || '', shape: pl.fragments?.[String(id)] || null };
+  return { id: String(id), formula: pl.peaks?.[ref.key]?.[ref.index] || '',
+    shape: pl.fragments?.[String(id)] || null, source: ref.key };
 }
 function previewFragment(pi, sp) {
   if (!currentPayload) return;
@@ -574,9 +642,9 @@ async function renderInspector() {
   currentPayload = null;
   $('struct').classList.remove('dim');
   $('struct').innerHTML = '<span class="sub">Drawing…</span>';
-  $('cand-summary').innerHTML = `<div class="stat"><b>${fmt(sp?.pair.entropy_similarity ?? c.entropy_similarity, 3)}</b><span>entropy similarity</span></div>
+  $('cand-summary').innerHTML = `<div class="stat"><b>${fmt(sp?.pair.entropy_similarity ?? c.entropy_similarity, 3)}</b><span>${sp?.merged ? 'overall ' : ''}entropy similarity</span></div>
     <div class="stat"><b>${pct(c.explained_intensity)}</b><span>intensity explained</span></div>
-    <div class="stat"><b>${sp ? sp.e2p.size : 0}<span class="sub"> / ${S.result.peaks ?? (sp ? sp.exp.length : 0)}</span></b><span>peaks matched</span></div>
+    <div class="stat"><b>${sp ? sp.e2p.size : 0}<span class="sub"> / ${sp ? sp.exp.length : 0}</span></b><span>${sp?.merged ? 'merged ' : ''}peaks matched</span></div>
     <div class="smiles">${esc(c.smiles)}</div>`;
   renderPeakInfo(sp, null);
   $('frag-list').innerHTML = '';
@@ -604,11 +672,13 @@ function renderPeakInfo(sp, pl) {
     return;
   }
   const i = S.peak.i, [mz, it] = sp.pred[i], ei = sp.p2e.get(i), f = fragmentFor(pl, sp, i);
+  const assignmentCount = sp.merged ? new Set(sp.predMembers[i].map(p => p.id).filter(id => id != null)).size : 0;
   box.innerHTML = `${f?.formula ? `<div class="formula">${fhtml(f.formula)}</div>` : ''}
     <div>Predicted m/z <b>${mz.toFixed(4)}</b> · ${(100 * it / sp.predMax).toFixed(1)}%${f ? ` · fragment <span class="mono">${esc(f.id)}</span>` : ''}</div>
+    ${sp.merged && f ? `<div class="sub">Representative fragment from ${esc(f.source)} eV${assignmentCount > 1 ? ` · ${assignmentCount} assignments contribute; select an individual energy to inspect each` : ''}. Merged intensities include every paired energy.</div>` : ''}
     <div>${ei != null ? `Experimental <b>${sp.exp[ei][0].toFixed(4)}</b> · ${(100 * sp.exp[ei][1] / sp.expMax).toFixed(1)}% · ${ppm(sp.exp[ei][0], mz).toFixed(1)} ppm` : '<span class="sub">No experimental peak within tolerance</span>'}</div>`;
   if (sp.ids[i] != null) {
-    const key = `${sp.key}:${i}`, draft = S.drafts.get(`${S.r}|${cand().review_key}|${key}`);
+    const key = peakNoteKey(sp, i), draft = S.drafts.get(`${S.r}|${cand().review_key}|${key}`);
     note.disabled = READONLY();
     note.value = draft ?? noteFor(cand()).fragments?.[key]?.comment ?? '';
   }
@@ -621,7 +691,7 @@ function renderFragList(sp, pl) {
     if (seen.has(String(sp.ids[i])) || rows.length >= 8) return; seen.add(String(sp.ids[i])); rows.push(i);
   });
   $('frag-list').innerHTML = rows.length ? rows.map(i => {
-    const f = fragmentFor(pl, sp, i), key = `${sp.key}:${i}`;
+    const f = fragmentFor(pl, sp, i), key = peakNoteKey(sp, i);
     return `<button class="frag-row" type="button" data-peak="${i}" aria-current="${S.peak?.kind === 'p' && S.peak.i === i}">
       <span>${f?.formula ? fhtml(f.formula) : '<span class="sub">—</span>'} <span class="sub">${sp.pred[i][0].toFixed(3)}</span>${notes[key] ? ' <span class="note-dot" title="Has a note">●</span>' : ''}</span>
       <span class="sub">${sp.p2e.has(i) ? 'matched' : 'unmatched'}</span>
@@ -636,10 +706,13 @@ function renderEvidence() {
     .sort((a, b) => sp.exp[b][1] - sp.exp[a][1]).slice(0, 10);
   const hyps = (res.formula_hypotheses || []).map(h => h.formula).filter(f => f && f !== res.formula);
   const pair = sp.pair;
+  const energyText = sp.merged
+    ? `Merged <b>${pair.input_values.map(v => fmt(v, 0)).join('/')} ${esc(pair.input_unit)}</b> experimental spectra with predictions at <b>${pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV</b>. Peaks within 20 ppm are combined by summed intensity and an intensity-weighted m/z centroid.`
+    : `Experimental <b>${fmt(pair.input_value, 0)} ${esc(pair.input_unit)}</b> paired with the prediction at <b>${fmt(pair.model_energy_ev ?? pair.atlas_ev, 0)} eV</b>${pair.delta_ev != null ? ` (Δ ${fmt(pair.delta_ev, 1)} eV)` : ''}`;
   $('evidence').innerHTML = `<div class="ev-grid">
     <div class="ev-item"><h3>Match</h3>
-      <p>Entropy similarity <b>${fmt(pair.entropy_similarity ?? c.entropy_similarity, 3)}</b> · explained intensity <b>${pct(c.explained_intensity)}</b></p>
-      <p>Experimental <b>${fmt(pair.input_value, 0)} ${esc(pair.input_unit)}</b> paired with the prediction at <b>${fmt(pair.model_energy_ev ?? pair.atlas_ev, 0)} eV</b>${pair.delta_ev != null ? ` (Δ ${fmt(pair.delta_ev, 1)} eV)` : ''}</p>
+      <p>${sp.merged ? 'Overall ' : ''}entropy similarity <b>${fmt(pair.entropy_similarity ?? c.entropy_similarity, 3)}</b> · explained intensity <b>${pct(c.explained_intensity)}</b></p>
+      <p>${energyText}</p>
       ${(c.ambiguity || []).map(a => `<p class="warn">${esc(a)}</p>`).join('')}
       <p class="sub">Similarity ranks candidates for this spectrum; it is not identification confidence.</p></div>
     <div class="ev-item"><h3>Provenance</h3>
@@ -674,12 +747,13 @@ function setDraft(patch) { S.drafts.set(`${S.r}|${cand().review_key}`, { ...curr
 function rememberFragmentDraft() {
   if (!S.result?.candidates.length || S.peak?.kind !== 'p' || $('frag-note').disabled) return;
   const sp = spectraFor(cand());
-  S.drafts.set(`${S.r}|${cand().review_key}|${sp.key}:${S.peak.i}`, $('frag-note').value);
+  S.drafts.set(`${S.r}|${cand().review_key}|${peakNoteKey(sp, S.peak.i)}`, $('frag-note').value);
 }
 function scheduleSave(kind, delay) {
   if (READONLY()) return;
   const r = S.r, k = S.cand, c = cand(), sp = spectraFor(c), peak = S.peak;
-  const fragKey = kind === 'fragment' && peak?.kind === 'p' && sp ? `${sp.key}:${peak.i}` : null;
+  const ref = kind === 'fragment' && peak?.kind === 'p' && sp ? peakRef(sp, peak.i) : null;
+  const fragKey = ref && ref.id != null ? `${ref.key}:${ref.index}` : null;
   const timerKey = `${r}|${c.review_key}|${fragKey || kind}`;
   clearTimeout(S.saveTimers[timerKey]);
   $('save-state').textContent = 'Editing…';
@@ -687,7 +761,7 @@ function scheduleSave(kind, delay) {
     const rv = S.drafts.get(`${r}|${c.review_key}`) || {};
     const note = S.r === r ? noteFor(c) : {};
     const body = { result: r, candidate_key: c.review_key, decision: rv.decision || note.decision || 'unreviewed', comment: rv.comment ?? note.comment ?? '' };
-    if (fragKey) body.fragment = { ce: sp.key, peak_index: peak.i, comment: S.drafts.get(`${r}|${c.review_key}|${fragKey}`) ?? '' };
+    if (fragKey) body.fragment = { ce: ref.key, peak_index: ref.index, comment: S.drafts.get(`${r}|${c.review_key}|${fragKey}`) ?? '' };
     if (S.r === r) $('save-state').textContent = 'Saving…';
     try {
       const data = await api.save(body);
@@ -730,7 +804,7 @@ function stepUnknown(dir) {
 function selectCandidate(k) {
   if (!S.result || k < 0 || k >= S.result.candidates.length) return;
   rememberFragmentDraft();
-  S.cand = k; S.peak = null; S.pairIdx = 0;
+  S.cand = k; S.peak = null; S.pairIdx = -1;
   if (S.compare === k) S.compare = null;
   renderRail(); renderEnergy(); renderPlots(); renderEvidence(); renderInspector(); renderVerdict();
   document.querySelector(`.cand[data-k="${k}"]`)?.scrollIntoView({ block: 'nearest' });

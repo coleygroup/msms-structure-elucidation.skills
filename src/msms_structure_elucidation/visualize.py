@@ -352,6 +352,7 @@ def _summarize(index: int, result_path: Path) -> tuple[dict, list[str]]:
 def _inline_page(data: dict | None, data_src: str | None = None, title: str | None = None) -> str:
     page = (ASSETS / 'index.html').read_text()
     css = (ASSETS / 'viewer.css').read_text()
+    merge_script = (ASSETS / 'viewer_merge.js').read_text()
     script = (ASSETS / 'viewer.js').read_text()
     if data_src:  # data published as a separate (gzip) file next to the page
         boot = f'<script>window.MSMS_STATIC_SRC={json.dumps(data_src)};</script>'
@@ -361,6 +362,8 @@ def _inline_page(data: dict | None, data_src: str | None = None, title: str | No
     if title:
         page = re.sub(r'<title>.*?</title>', f'<title>{html.escape(title)}</title>', page, count=1)
     page = page.replace('<link rel="stylesheet" href="/assets/viewer.css">', f'<style>\n{css}\n</style>')
+    page = page.replace('<script src="/assets/viewer_merge.js" defer></script>',
+                        f'<script>\n{merge_script}\n</script>')
     return page.replace('<script src="/assets/viewer.js" defer></script>',
                         f'{boot}\n<script>\n{script}\n</script>')
 

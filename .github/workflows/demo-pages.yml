@@ -22,6 +22,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Check demo snapshot and merged viewer behavior
+        run: |
+          python -m unittest tests.test_demo_build -q
+          node tests/viewer_merge_check.js
       - name: Build public demo from verified analysis snapshot
         run: python scripts/build_demo.py --snapshot demo/msms-structure-elucidation/source.json.gz
       - name: Add project landing page
