@@ -45,7 +45,9 @@ def settings(path: str | None = None) -> dict:
     if not explicit and LOCAL_CONFIG.is_file():
         local = read_yaml(LOCAL_CONFIG)
         profile = local.get('host_profile') or {}
-        if profile.get('hostname') and profile['hostname'] != socket.gethostname():
+        # Under Slurm the profile describes a compute node, never the login node reading it.
+        scheduled = (local.get('mcp') or {}).get('backend') == 'slurm'
+        if profile.get('hostname') and profile['hostname'] != socket.gethostname() and not scheduled:
             print(f"Warning: {LOCAL_CONFIG} was tuned on {profile['hostname']}, not {socket.gethostname()}; "
                   'rerun `msms-structure-elucidation setup`.', file=sys.stderr)
         overlay(data, local)

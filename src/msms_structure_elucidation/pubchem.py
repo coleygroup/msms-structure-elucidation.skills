@@ -99,3 +99,35 @@ def structures_for_formula(formula: str, limit: int = 500) -> list[str]:
         if len(smiles) >= limit:
             break
     return smiles
+
+
+_PROPERTIES = 'ConnectivitySMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName'
+
+
+def isomers(query: str, query_type: str = 'formula', max_results: int = 20) -> list[dict]:
+    """PubChem compounds for a formula or SMILES, with identifiers and basic properties."""
+    if query_type not in ('formula', 'smiles'):
+        raise ValueError('query_type must be formula or smiles')
+    cids = _get(f'compound/{query_type}/{urllib.parse.quote(query)}/cids/JSON')
+    for _ in range(10):  # formula searches are asynchronous: poll the ListKey until the list is ready
+        if 'Waiting' not in cids:
+            break
+        time.sleep(2)
+        cids = _get(f'compound/listkey/{cids["Waiting"]["ListKey"]}/cids/JSON')
+    found = cids.get('IdentifierList', {}).get('CID', [])[:max_results]
+    if not found:
+        return []
+    table = _get(f'compound/cid/{",".join(map(str, found))}/property/{_PROPERTIES}/JSON')
+    return table.get('PropertyTable', {}).get('Properties', [])
+
+
+def compound(identifier: str, id_type: str = 'name') -> dict:
+    """One PubChem compound by CID, name, InChIKey or SMILES, with up to ten synonyms; {} when absent."""
+    if id_type not in ('cid', 'name', 'inchikey', 'smiles'):
+        raise ValueError('id_type must be cid, name, inchikey or smiles')
+    encoded = urllib.parse.quote(identifier)
+    rows = _get(f'compound/{id_type}/{encoded}/property/{_PROPERTIES}/JSON').get('PropertyTable', {}).get('Properties', [])
+    if not rows:
+        return {}
+    synonyms = _get(f'compound/{id_type}/{encoded}/synonyms/JSON').get('InformationList', {}).get('Information', [{}])
+    return {**rows[0], 'Synonyms': synonyms[0].get('Synonym', [])[:10]}

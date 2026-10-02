@@ -8,7 +8,7 @@ Open Codex or Claude Code in your project and type:
 
 > Install the skills from https://github.com/coleygroup/msms-structure-elucidation.skills. Check which required environments, repository checkouts, and model assets are already available, and tell me what is ready or missing. I am not providing a spectrum yet.
 
-Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. That skill asks whether models run on this machine or a remote GPU host, probes that host, and saves tuned inference settings to `configs/local.yaml` for later runs.
+Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. It first finds or asks for the prediction server, which can be this machine, a GPU host reached over ssh, or a Slurm cluster. It then sets up that host's environment, probes and tunes it, saves the settings to `configs/local.yaml`, and registers the [MCP server](docs/technical-guide.md#mcp-server) that exposes ICEBERG, GLACIER, FRIGID, MIST and atlas retrieval as tools.
 
 Installation does not require collision-energy information. When you are ready to analyze a spectrum, attach it or give its path and ask the agent to run the workflow. At that point, the agent should confirm the supplied collision energies and whether their values are **NCE or absolute eV** before scoring; a file header alone does not establish the unit.
 

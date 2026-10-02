@@ -24,6 +24,48 @@ The public atlas endpoint is `https://iceberg-ms.mit.edu/download_mgf?formula=..
 
 `msms-structure-elucidation setup` reads the CPU threads, RAM and GPUs, chooses ms-pred inference settings from measured anchors, and saves them to `configs/local.yaml`, which Git ignores. If ms-pred and ICEBERG checkpoints are available, it also times ICEBERG to choose batch_size. Every command applies that file on top of `configs/default.yaml` unless `--config` or `MSMS_CONFIG` is given. Use `--remote HOST --remote-repo PATH` to tune a GPU host over ssh, adding `--remote-prefix` for environment activation or a scheduler such as `srun`. See the [msms-setup skill](../.agents/skills/msms-setup/SKILL.md).
 
+## MCP server
+
+`msms-structure-elucidation mcp` (or `python -m msms_structure_elucidation.mcp`) serves the model tools over MCP stdio:
+
+| Tool | What it does |
+|---|---|
+| `server_info` | Reports the backend, host, GPUs, and which models are configured |
+| `predict_spectra` | Forward prediction (SMILES → spectra and fragments) with ICEBERG or GLACIER |
+| `score_candidates` | Ranks candidate SMILES against a spectrum |
+| `retrieve_atlas` | Public atlas retrieval |
+| `generate_structures_frigid` | FRIGID de novo generation |
+| `predict_fingerprint_mist` | MIST spectrum → fingerprint |
+| `get_job`, `cancel_job`, `list_jobs` | Follow or stop submitted jobs |
+| `pubchem_isomers`, `pubchem_compound` | PubChem lookups |
+
+**Inputs and outputs.** Spectra go in as `.ms` text, or as a path on the server host. Every model tool requires `collision_unit` (`NCE` or `eV`).
+
+**Where the server runs.** It runs on the host that holds the models and needs only `mcp` and this package, for example a `.cache/mcp-venv` made with `pip install -e .[mcp]`. It calls the ms-pred and FRIGID interpreters named in `configs/local.yaml` (`models.simulator.python`, `models.denovo.frigid_python`) and never imports them itself.
+
+**How jobs run.**
+- Each model call becomes a job directory under `mcp.job_root`, holding the request, status, result and logs.
+- A tool waits up to `mcp.wait_seconds` and then returns either the result or a job id for `get_job`.
+- Jobs are detached, so they survive a dropped client connection.
+- An identical request returns the earlier job.
+
+**Backends.** `mcp.backend` selects one.
+- `local`: runs each job on an idle GPU that has at least `gpu_min_free_fraction` of its memory free, and waits while every GPU is busy.
+- `slurm`: submits each job with `sbatch`, using only the options set under `mcp.slurm`. Those options are `partition`, `account`, `qos`, `gpus`, `cpus_per_task`, `mem`, `time`, `requeue`, `extra_args`, `setup` shell lines, and `cpu` resources for CPU-only tasks.
+
+**Setup.** `setup` writes `configs/local.yaml` and `mcp-config` writes the client entry; see the [msms-setup skill](../.agents/skills/msms-setup/SKILL.md).
+
+```bash
+# On a Slurm login node: list partitions, then save the chosen settings and benchmark in a job
+msms-structure-elucidation setup --scheduler slurm
+msms-structure-elucidation setup --scheduler slurm --slurm-partition <partition> --slurm-gpus <gpu-request> \
+  --slurm-time 04:00:00 --slurm-setup '<environment activation>' --ms-pred-dir <ms-pred> ...
+# On the client: print or merge the .mcp.json entry for the configured host
+msms-structure-elucidation mcp-config --write
+```
+
+For a remote host, the client entry runs `ssh -o BatchMode=yes <ssh-destination> 'cd <remote-repo> && <server-python> -m msms_structure_elucidation.mcp'`. ssh must log in without a prompt. If the host asks for a password or a second factor, open a persistent connection first (`ControlMaster`/`ControlPersist` in `~/.ssh/config`) and keep it open while the client runs.
+
 ## Optional models
 
 `ms-pred` supplies GLACIER, ICEBERG, and spectral utilities. Clone the [official ms-pred repository](https://github.com/coleygroup/ms-pred), read its README, and follow its environment setup for your host. Set `--ms-pred-dir` to that checkout for local inference; the worker runs there because GLACIER uses a relative script path. Use the open-source MassSpecGym checkpoint links in the [ms-pred README](https://github.com/coleygroup/ms-pred#readme), or provide local licensed NIST checkpoints if your license permits. GLACIER needs one checkpoint; ICEBERG needs generation and intensity checkpoints. Model calls receive rounded integer eV with `nce=False`. The `.ms` `>instrumentation` value is used for model calls, with `--instrument` taking priority. Use `--cuda-devices 0` or `MSMS_CUDA_DEVICES=0` to select a GPU. Batch size and ms-pred worker counts (`--model-batch-size`, `--model-cpu-workers`, `--model-gpu-workers`) should match the GPU memory; the measured anchors (8 GB → 16, 24 GB → 128, 16 CPU and 2 GPU workers) are in `.agents/skills/msms-sim-iceberg/SKILL.md`.
@@ -42,7 +84,7 @@ You may instead provide your own checkpoint files. The [FRIGID public weights](h
 
 ## Agent portability
 
-The canonical skills live in `.agents/skills` and are linked under `.claude/skills` for Claude Code. For installation into another project, copy the needed skill directories from `.agents/skills` into that agent's project or user skills directory so the `SKILL.md` files and their scripts stay together. Codex commonly uses `.agents/skills` in a project or `~/.codex/skills` for user skills; Claude Code uses `.claude/skills` in a project or `~/.claude/skills` for user skills. The scientific workflow is [msms-elucidation.md](../.agents/workflows/msms-elucidation.md). The CLI uses no LLM or MCP dependency; an agent can review `retrieval.json` and supply new candidate SMILES through the `msms-structure-review` skill. Optional MCP servers are separate adapters.
+The canonical skills live in `.agents/skills` and are linked under `.claude/skills` for Claude Code. For installation into another project, copy the needed skill directories from `.agents/skills` into that agent's project or user skills directory so the `SKILL.md` files and their scripts stay together. Codex commonly uses `.agents/skills` in a project or `~/.codex/skills` for user skills; Claude Code uses `.claude/skills` in a project or `~/.claude/skills` for user skills. The scientific workflow is [msms-elucidation.md](../.agents/workflows/msms-elucidation.md). The CLI uses no LLM or MCP dependency; an agent can review `retrieval.json` and supply new candidate SMILES through the `msms-structure-review` skill. The optional [MCP server](#mcp-server) exposes the same models as tools.
 
 For raw files or mzML, export a feature-level `.ms` spectrum with the preprocessing and inspection skills first. For GNPS/MZmine MGF:
 

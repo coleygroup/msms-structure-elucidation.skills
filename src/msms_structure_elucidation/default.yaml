@@ -2,6 +2,7 @@
 models:
   simulator:
     ms_pred_src: ''
+    python: ''
     model: iceberg
     glacier_ckpt: ''
     gen_ckpt: ''
@@ -23,6 +24,7 @@ models:
     min_free_memory_gb: 4
   denovo:
     frigid_src: .cache/FRIGID
+    frigid_python: ''
     dlm_ckpt: ''
     mist_ckpt: ''
     iceberg_gen_ckpt: ''
@@ -31,6 +33,26 @@ models:
     num_rounds: 0
     batch_size: 128
     cuda_devices: null
+mcp:
+  backend: local
+  job_root: results/mcp_jobs
+  wait_seconds: 600
+  gpu_min_free_fraction: 0.8
+  max_concurrent_jobs: auto
+  slurm:
+    partition: null
+    account: null
+    qos: null
+    gpus: null
+    cpus_per_task: null
+    mem: null
+    time: null
+    requeue: false
+    extra_args: []
+    setup: []
+    cpu:
+      cpus_per_task: null
+      mem: null
 preprocessing:
   converter: msconvert
   output_format: mzML

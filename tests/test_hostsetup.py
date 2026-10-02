@@ -175,7 +175,7 @@ class RemoteTest(unittest.TestCase):
             result = hostsetup.setup_remote(remote_args(remote_repo='~/msms repo', remote_python='~/venv/bin/python'))
             saved = config.read_yaml(Path(tmp) / 'local.yaml')
         body = run.call_args.args[0][-1]
-        self.assertTrue(body.startswith("source ~/env/bin/activate ms-pred && cd '~/msms repo' && "))
+        self.assertTrue(body.startswith("source ~/env/bin/activate ms-pred && cd ~/'msms repo' && "))
         self.assertIn('msms_structure_elucidation.cli setup --json --ms-pred-dir', body)
         self.assertEqual(result['status'], 'benchmarked')
         self.assertEqual(saved['execution']['simulator']['batch_size'], 128)

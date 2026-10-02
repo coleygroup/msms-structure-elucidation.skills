@@ -279,6 +279,7 @@ def main() -> None:
     parser.add_argument("--dlm-ckpt", help="DLM checkpoint")
     parser.add_argument("--iceberg-gen-ckpt", help="ICEBERG generator checkpoint")
     parser.add_argument("--iceberg-inten-ckpt", help="ICEBERG intensity checkpoint")
+    parser.add_argument("--cuda-devices", help="GPU IDs, for example 0; overrides config")
     parser.add_argument("--output", required=True, help="Output JSON path")
     args = parser.parse_args()
 
@@ -292,6 +293,8 @@ def main() -> None:
         value = getattr(args, arg_name)
         if value:
             denovo_cfg[config_name] = value
+    if args.cuda_devices is not None:
+        denovo_cfg["cuda_devices"] = args.cuda_devices or None
     frigid_dir = resolve(args.frigid_dir or denovo_cfg["frigid_src"], project_root)
     frigid_python = args.frigid_python or str(project_root / ".cache/frigid-venv/bin/python")
     if not Path(frigid_python).is_file():

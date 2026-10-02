@@ -2,6 +2,7 @@
 models:
   simulator:
     ms_pred_src: ''  # clone ms-pred, then set this checkout path
+    python: ''  # interpreter with ms_pred; empty: MS_PRED_PYTHON, then discovery
     model: iceberg
     glacier_ckpt: ''  # Public MassSpecGym weights: see ms-pred README; licensed NIST weights can be supplied locally
     gen_ckpt: ''      # ICEBERG generator, when --model iceberg
@@ -23,6 +24,7 @@ models:
     min_free_memory_gb: 4
   denovo:
     frigid_src: .cache/FRIGID
+    frigid_python: ''  # interpreter of the FRIGID environment
     dlm_ckpt: ''
     mist_ckpt: ''
     iceberg_gen_ckpt: ''
@@ -31,6 +33,26 @@ models:
     num_rounds: 0   # FRIGID-base; set >0 when ICEBERG weights and GPU are available
     batch_size: 128
     cuda_devices: null
+mcp:  # prediction server; setup writes host-specific values to configs/local.yaml
+  backend: local          # local: run jobs on this host; slurm: submit them with sbatch
+  job_root: results/mcp_jobs  # relative to the checkout
+  wait_seconds: 600       # tools wait this long for a result before returning a job id
+  gpu_min_free_fraction: 0.8  # a GPU is free when idle with this fraction of its memory free
+  max_concurrent_jobs: auto  # auto: one per GPU, or one without GPUs
+  slurm:  # every unset key is left out of sbatch
+    partition: null
+    account: null
+    qos: null
+    gpus: null            # --gpus value, for example 1 or <type>:1
+    cpus_per_task: null
+    mem: null
+    time: null
+    requeue: false
+    extra_args: []        # further sbatch arguments
+    setup: []             # shell lines run before the job, such as environment activation
+    cpu:                  # resources for CPU-only tasks (atlas retrieval)
+      cpus_per_task: null
+      mem: null
 preprocessing:
   converter: msconvert
   output_format: mzML

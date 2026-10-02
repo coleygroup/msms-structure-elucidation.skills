@@ -12,7 +12,7 @@ dependencies = ["numpy"]
 
 [project.optional-dependencies]
 plot = ["matplotlib"]
-mcp = ["mcp"]
+mcp = ["mcp>=2.2,<3", "pyyaml"]
 visualize = ["flask>=3.0"]
 batch = ["psutil>=5.9"]
 

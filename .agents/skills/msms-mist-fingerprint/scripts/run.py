@@ -49,6 +49,18 @@ def resolve(p: str, root: Path) -> Path:
     return path if path.is_absolute() else root / path
 
 
+def checkpoint_dims(checkpoint_path: Path) -> tuple[int, int]:
+    """hidden_size and magma_modulo of a MIST checkpoint, from its magma head (modulo x hidden).
+
+    MSG checkpoints give (640, 2048) and CANOPUS checkpoints (512, 512), as in FRIGID's
+    spec2mol_benchmark_msg.yaml and spec2mol_benchmark_canopus.yaml.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state = checkpoint.get("state_dict", checkpoint)
+    modulo, hidden = state["spectra_encoder.1.0.weight"].shape
+    return int(hidden), int(modulo)
+
+
 def load_mist_encoder_fixed(encoder_cls, config: dict, device) -> torch.nn.Module:
     """
     Load the MIST encoder, working around a bug in FRIGID's own
@@ -86,16 +98,20 @@ def load_mist_encoder_fixed(encoder_cls, config: dict, device) -> torch.nn.Modul
     )
 
     model_keys = set(encoder.state_dict().keys())
+    # FRIGID's published .pt files already use the encoder's own key names; older
+    # Lightning .ckpt files add one "spectra_encoder." prefix that must be stripped.
     stripped = {
         k.replace("spectra_encoder.", "", 1): v
         for k, v in raw_state_dict.items()
         if k.startswith("spectra_encoder.")
     }
+    if len(model_keys & set(raw_state_dict)) >= len(model_keys & set(stripped)):
+        stripped = dict(raw_state_dict)
     matched = model_keys & set(stripped.keys())
     if len(matched) < 0.9 * len(model_keys):
         raise RuntimeError(
-            f"MIST checkpoint prefix mismatch: only {len(matched)}/{len(model_keys)} keys matched "
-            "after stripping 'spectra_encoder.' — checkpoint format may have changed."
+            f"MIST checkpoint key mismatch: only {len(matched)}/{len(model_keys)} encoder keys found, "
+            "with or without the 'spectra_encoder.' prefix — checkpoint format may have changed."
         )
 
     missing_before_load = model_keys - set(stripped.keys())
@@ -174,12 +190,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="MIST-only fingerprint prediction from MS/MS spectra"
     )
-    p.add_argument(
-        "--ms-dir", required=True, type=Path, help="Directory of <inchikey14>.ms files"
-    )
-    p.add_argument(
-        "--formulae-csv", required=True, type=Path, help="CSV with a smiles column"
-    )
+    p.add_argument("--ms-dir", type=Path, help="Directory of <inchikey14>.ms files")
+    p.add_argument("--formulae-csv", type=Path, help="CSV with a smiles column")
+    p.add_argument("--spectrum", type=Path, help="One unknown .ms spectrum, instead of --ms-dir")
+    p.add_argument("--formula", help="Precursor formula of --spectrum")
     p.add_argument(
         "--subform-dir",
         required=True,
@@ -195,9 +209,19 @@ def parse_args() -> argparse.Namespace:
         help="Binarization threshold (FRIGID default)",
     )
     p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--frigid-dir", help="FRIGID checkout; overrides config")
+    p.add_argument("--mist-ckpt", help="MIST checkpoint; overrides config")
+    p.add_argument("--cuda-devices", help="GPU ID; overrides config")
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--failure-log", required=True, type=Path)
-    return p.parse_args()
+    args = p.parse_args()
+    if bool(args.spectrum) == bool(args.ms_dir):
+        p.error("pass either --spectrum with --formula, or --ms-dir with --formulae-csv")
+    if args.spectrum and not args.formula:
+        p.error("--spectrum requires --formula")
+    if args.ms_dir and not args.formulae_csv:
+        p.error("--ms-dir requires --formulae-csv")
+    return args
 
 
 def main() -> None:
@@ -208,6 +232,9 @@ def main() -> None:
     with open(project_root / args.config) as f:
         cfg = yaml.safe_load(f)
     denovo_cfg = cfg["models"]["denovo"]
+    for key in ("frigid_dir", "mist_ckpt", "cuda_devices"):
+        if getattr(args, key) is not None:
+            denovo_cfg["frigid_src" if key == "frigid_dir" else key] = getattr(args, key) or None
 
     frigid_dir = resolve(denovo_cfg["frigid_src"], project_root)
     if not frigid_dir.exists():
@@ -229,12 +256,15 @@ def main() -> None:
 
     encoder_config = s2m.get_default_config()["mist_encoder"]
     encoder_config["checkpoint"] = str(mist_ckpt)
-    # MSG Large Model dims (matches configs/spec2mol_benchmark_msg.yaml, since
-    # mist_ckpt here is mist_msg.ckpt, not the smaller CANOPUS checkpoint)
-    encoder_config["hidden_size"] = 640
-    encoder_config["magma_modulo"] = 2048
+    encoder_config["hidden_size"], encoder_config["magma_modulo"] = checkpoint_dims(mist_ckpt)
 
-    smiles_formula_map = load_smiles_formula_map(args.formulae_csv)
+    if args.spectrum:
+        # An unknown has no structure: key it by file stem and give MIST a placeholder SMILES,
+        # as msms-denovo does; only the formula and the spectrum condition the encoder.
+        args.ms_dir = args.spectrum.parent
+        smiles_formula_map = {args.spectrum.stem: {"smiles": "C", "formula": args.formula}}
+    else:
+        smiles_formula_map = load_smiles_formula_map(args.formulae_csv)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.failure_log.parent.mkdir(parents=True, exist_ok=True)
@@ -253,7 +283,8 @@ def main() -> None:
             s2m.SpectraEncoderGrowing, encoder_config, device
         )
 
-        dataset, split_data, _, _, spec_to_formula = s2m.load_spec_data(
+        # FRIGID returns four or five values depending on version; only the first two are used.
+        dataset, split_data = s2m.load_spec_data(
             config={
                 "datadir": str(data_dir),
                 "labels_file": str(data_dir / "labels.tsv"),
@@ -263,7 +294,7 @@ def main() -> None:
             },
             encoder_config=encoder_config,
             split="test",
-        )
+        )[:2]
 
         dataloader = s2m.get_paired_loader(
             dataset, shuffle=False, batch_size=1, num_workers=0

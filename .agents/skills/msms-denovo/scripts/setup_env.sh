@@ -16,6 +16,17 @@ fi
 "$ASSETS/frigid-venv/bin/python" -m pip install -r "$FRIGID_DIR/ms-pred/requirements.txt"
 "$ASSETS/frigid-venv/bin/python" -m pip install -e "$FRIGID_DIR/ms-pred"
 "$ASSETS/frigid-venv/bin/python" -m pip install -e "$FRIGID_DIR"
+# ms-pred and FRIGID also import torch_scatter (a PyG wheel built for the installed torch), dgl, torchdata,
+# ray, ngboost and tensorboardX, which their pip requirements omit.
+TORCH_TAG="$("$ASSETS/frigid-venv/bin/python" -c 'import torch; v = torch.version.cuda; print(torch.__version__.split("+")[0] + "+" + ("cu" + v.replace(".", "") if v else "cpu"))')"
+"$ASSETS/frigid-venv/bin/python" -m pip install torch_scatter -f "https://data.pyg.org/whl/torch-${TORCH_TAG}.html"
+"$ASSETS/frigid-venv/bin/python" -m pip install "dgl==1.1.3" "torchdata==0.10.1" "ray[tune]" ngboost tensorboardx
+# safe-mol imports names newer transformers removed; apply FRIGID's own fix once (it reads CONDA_PREFIX).
+SAFE_INIT="$("$ASSETS/frigid-venv/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/safe/__init__.py"
+if grep -q '^from \. import trainer' "$SAFE_INIT"; then
+  CONDA_PREFIX="$ASSETS/frigid-venv" bash "$FRIGID_DIR/env/fix_safe_imports.sh"
+fi
+"$ASSETS/frigid-venv/bin/python" -c 'import dlm.sampler, ms_pred.common; print("FRIGID environment ready")'
 if [[ "${MSMS_DOWNLOAD_FRIGID_WEIGHTS:-0}" == 1 ]]; then
   mkdir -p "$ASSETS/checkpoints/frigid"
   curl -fL 'https://zenodo.org/records/19685145/files/frigid_pretrained_checkpoints.tar.gz?download=1' -o "$ASSETS/checkpoints/frigid/frigid_pretrained_checkpoints.tar.gz"

@@ -62,10 +62,13 @@ python .agents/skills/msms-mist-fingerprint/scripts/run.py \
 - **MIST atom support**: only `C, O, P, N, S, Cl, F, H` — molecules with any
   other element (Br, I, Si, metals, etc.) are silently dropped by FRIGID's
   data loader; this skill detects and logs those as failures
-- **Encoder config**: hardcoded to the MSG Large Model dims
-  (`hidden_size=640, magma_modulo=2048`), matching `mist_msg.ckpt`. If
-  switching to a CANOPUS checkpoint, update these to `hidden_size=512,
-  magma_modulo=512` (see FRIGID's `configs/spec2mol_benchmark_canopus.yaml`).
+- **Encoder config**: `hidden_size` and `magma_modulo` are read from the
+  checkpoint's magma head, so MSG (`640`, `2048`) and CANOPUS (`512`, `512`)
+  checkpoints both load. `msms-denovo` runs FRIGID's CANOPUS config, so the
+  shared `mist_ckpt` should be the CANOPUS checkpoint when both skills are used.
+- **One unknown spectrum**: `--spectrum x.ms --formula F` replaces `--ms-dir`
+  and `--formulae-csv`; `--frigid-dir`, `--mist-ckpt` and `--cuda-devices`
+  override the config.
 - **Fingerprint format**: 4096-bit, radius-2 Morgan-equivalent (matches
   FRIGID's `fingerprint.bits`/`fingerprint.radius` defaults), threshold 0.172
   for binarization (FRIGID default).

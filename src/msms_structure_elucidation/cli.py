@@ -37,7 +37,8 @@ def _instrument(value: str | None) -> str | None:
 def model_python(explicit: str | None) -> str:
     if explicit:
         path = Path(explicit).expanduser()
-        return str(path.resolve()) if path.exists() else shutil.which(explicit) or explicit
+        # absolute(), not resolve(): resolving a venv's bin/python symlink would leave the venv.
+        return str(path.absolute()) if path.exists() else shutil.which(explicit) or explicit
     if os.environ.get('MS_PRED_PYTHON'):
         return model_python(os.environ['MS_PRED_PYTHON'])
     try:
@@ -61,7 +62,7 @@ def worker(python: str, action: str, **kwargs):
         cwd = Path(cwd).expanduser().resolve()
         if not (cwd / 'src/ms_pred').is_dir():
             raise FileNotFoundError(f'Not an ms-pred checkout: {cwd}. Clone https://github.com/coleygroup/ms-pred and follow its README.')
-    if cwd is None and Path(python).resolve() == Path(sys.executable).resolve():
+    if cwd is None and Path(python).absolute() == Path(sys.executable).absolute():
         from msms_structure_elucidation import worker as science
         if action == 'rank':
             return science.rank(str(kwargs['spectrum']), str(kwargs['mgf']), kwargs['formula'],
@@ -642,6 +643,47 @@ def _batch_review_page(args, summary: list[dict], out: Path) -> dict:
     return {**info, 'review_page': str(page)}
 
 
+def run_denovo(spectrum: str, formula: str, adduct: str, out_dir: Path, *, ms_pred_python: str,
+               frigid_python: str, frigid_dir: str, mist_ckpt: str, dlm_ckpt: str, num_rounds: int = 0,
+               top_k: int = 10, iceberg_gen_ckpt: str | None = None, iceberg_inten_ckpt: str | None = None,
+               instrument: str | None = None, cuda_devices: str | None = None, stdout=None) -> dict:
+    """Assign subformulae, then generate formula-constrained structures with FRIGID; returns denovo.json."""
+    repo = Path(__file__).resolve().parents[2]
+    frigid_py = Path(frigid_python).expanduser().absolute()
+    frigid_dir = Path(frigid_dir).expanduser().resolve()
+    for path in (frigid_py, frigid_dir / 'scripts/spec2mol_scaling.py', Path(mist_ckpt), Path(dlm_ckpt)):
+        if not path.is_file():
+            raise FileNotFoundError(f'Missing FRIGID asset: {path}. Run its setup script or supply a valid path.')
+    if num_rounds:
+        for path in (iceberg_gen_ckpt, iceberg_inten_ckpt):
+            if not path or not Path(path).is_file():
+                raise FileNotFoundError('ICEBERG refinement requires both checkpoint files')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subform = out_dir / 'subformulae'
+    command = [ms_pred_python, str(repo / '.agents/skills/msms-subformulae/scripts/run.py'),
+        '--spectrum', spectrum, '--formula', formula, '--adduct', adduct, '--output-dir', str(subform)]
+    subprocess.run(command, cwd=repo, check=True, stdout=stdout, stderr=stdout)
+    output = out_dir / 'denovo.json'
+    command = [str(frigid_py), str(repo / '.agents/skills/msms-denovo/scripts/run.py'),
+        '--spectrum', spectrum, '--formula', formula,
+        '--adduct', adduct, '--subform-dir', str(subform),
+        '--frigid-dir', str(frigid_dir), '--frigid-python', str(frigid_py),
+        '--mist-ckpt', str(Path(mist_ckpt).resolve()),
+        '--dlm-ckpt', str(Path(dlm_ckpt).resolve()),
+        '--num-rounds', str(num_rounds), '--top-k', str(top_k),
+        '--output', str(output)]
+    if instrument:
+        command += ['--instrument', instrument]
+    if cuda_devices is not None:
+        command += ['--cuda-devices', cuda_devices]
+    if iceberg_gen_ckpt:
+        command += ['--iceberg-gen-ckpt', str(Path(iceberg_gen_ckpt).resolve())]
+    if iceberg_inten_ckpt:
+        command += ['--iceberg-inten-ckpt', str(Path(iceberg_inten_ckpt).resolve())]
+    subprocess.run(command, cwd=repo, check=True, stdout=stdout, stderr=stdout)
+    return json.loads(output.read_text())
+
+
 def denovo(args):
     """Run subformula assignment and the FRIGID adapter with explicit assets."""
     result_path = Path(args.result).resolve()
@@ -649,43 +691,17 @@ def denovo(args):
     formula = result.get('formula')
     if not formula:
         raise ValueError('FRIGID requires a formula; rerun retrieval with --formula')
-    repo = Path(__file__).resolve().parents[2]
-    model_py = model_python(args.ms_pred_python)
-    frigid_py = Path(args.frigid_python).resolve()
-    frigid_dir = Path(args.frigid_dir).resolve()
-    for path in (frigid_py, frigid_dir / 'scripts/spec2mol_scaling.py',
-                 Path(args.mist_ckpt), Path(args.dlm_ckpt)):
-        if not path.is_file():
-            raise FileNotFoundError(f'Missing FRIGID asset: {path}. Run its setup script or supply a valid path.')
-    if args.num_rounds:
-        for path in (args.iceberg_gen_ckpt, args.iceberg_inten_ckpt):
-            if not path or not Path(path).is_file():
-                raise FileNotFoundError('ICEBERG refinement requires both checkpoint files')
-    subform = result_path.parent / 'subformulae'
-    command = [model_py, str(repo / '.agents/skills/msms-subformulae/scripts/run.py'),
-        '--spectrum', result['input'], '--formula', formula,
-        '--adduct', result['adduct'], '--output-dir', str(subform)]
-    subprocess.run(command, cwd=repo, check=True)
-    output = result_path.parent / 'denovo.json'
-    command = [str(frigid_py), str(repo / '.agents/skills/msms-denovo/scripts/run.py'),
-        '--spectrum', result['input'], '--formula', formula,
-        '--adduct', result['adduct'], '--subform-dir', str(subform),
-        '--frigid-dir', str(frigid_dir), '--frigid-python', str(frigid_py),
-        '--mist-ckpt', str(Path(args.mist_ckpt).resolve()),
-        '--dlm-ckpt', str(Path(args.dlm_ckpt).resolve()),
-        '--num-rounds', str(args.num_rounds), '--top-k', str(args.top_k),
-        '--output', str(output)]
-    if args.iceberg_gen_ckpt:
-        command += ['--iceberg-gen-ckpt', str(Path(args.iceberg_gen_ckpt).resolve())]
-    if args.iceberg_inten_ckpt:
-        command += ['--iceberg-inten-ckpt', str(Path(args.iceberg_inten_ckpt).resolve())]
-    subprocess.run(command, cwd=repo, check=True)
-    generated = json.loads(output.read_text())
+    generated = run_denovo(result['input'], formula, result['adduct'], result_path.parent,
+        ms_pred_python=model_python(args.ms_pred_python), frigid_python=args.frigid_python,
+        frigid_dir=args.frigid_dir, mist_ckpt=args.mist_ckpt, dlm_ckpt=args.dlm_ckpt,
+        num_rounds=args.num_rounds, top_k=args.top_k, iceberg_gen_ckpt=args.iceberg_gen_ckpt,
+        iceberg_inten_ckpt=args.iceberg_inten_ckpt)
     result['denovo_candidates'] = generated['candidates']
     result['denovo_source'] = 'FRIGID'
     result_path.write_text(json.dumps(result, indent=2, allow_nan=False))
     write_report(result, result_path.parent / 'report.html')
-    print(json.dumps({'denovo_candidates': len(generated['candidates']), 'output': str(output)}, indent=2))
+    print(json.dumps({'denovo_candidates': len(generated['candidates']),
+                      'output': str(result_path.parent / 'denovo.json')}, indent=2))
     return 0
 
 
@@ -722,6 +738,26 @@ def setup_command(args):
         print('SETUP_JSON=' + json.dumps(report, allow_nan=False))
     else:
         print(json.dumps(report, indent=2))
+    return 0
+
+
+def mcp_command(args):
+    from msms_structure_elucidation.mcp.__main__ import main as serve
+    argv = [flag for name in ('backend', 'config', 'job_root') if getattr(args, name)
+            for flag in ('--' + name.replace('_', '-'), getattr(args, name))]
+    return serve(argv)
+
+
+def mcp_config_command(args):
+    from msms_structure_elucidation.config import LOCAL_CONFIG, read_yaml
+    from msms_structure_elucidation.hostsetup import client_entry, write_client_config
+    execution = read_yaml(LOCAL_CONFIG).get('execution') if LOCAL_CONFIG.is_file() else None
+    entry = client_entry(execution, args.python)
+    if args.write:
+        path = Path(args.write).expanduser().resolve()
+        write_client_config(path, args.name, entry)
+        print(f'Wrote {args.name} to {path}; reload MCP servers in the client to use it.')
+    print(json.dumps({'mcpServers': {args.name: entry}}, indent=2))
     return 0
 
 
@@ -855,6 +891,35 @@ def main(argv=None):
     installer.add_argument('--remote-prefix', help='shell text run before remote commands, for example '
                            '"source ~/miniforge3/bin/activate ms-pred &&" or "srun --gres=gpu:1"')
     installer.add_argument('--ssh-option', action='append', help='extra ssh -o option; repeatable')
+    installer.add_argument('--frigid-python', help='FRIGID environment interpreter; saved to configs/local.yaml')
+    installer.add_argument('--frigid-dir', help='FRIGID checkout; saved to configs/local.yaml')
+    installer.add_argument('--mist-checkpoint', help='MIST encoder checkpoint; saved to configs/local.yaml')
+    installer.add_argument('--dlm-checkpoint', help='FRIGID DLM checkpoint; saved to configs/local.yaml')
+    installer.add_argument('--scheduler', choices=['slurm'],
+                           help='models run through a scheduler; without --slurm-partition, list partitions only')
+    installer.add_argument('--slurm-partition')
+    installer.add_argument('--slurm-account')
+    installer.add_argument('--slurm-qos')
+    installer.add_argument('--slurm-gpus', help='sbatch --gpus value for model jobs, such as 1 or <type>:1')
+    installer.add_argument('--slurm-cpus', help='sbatch --cpus-per-task for model jobs')
+    installer.add_argument('--slurm-mem', help='sbatch --mem for model jobs, such as 64G')
+    installer.add_argument('--slurm-time', help='sbatch --time limit, such as 04:00:00')
+    installer.add_argument('--slurm-cpu-cpus', help='--cpus-per-task for CPU-only jobs')
+    installer.add_argument('--slurm-cpu-mem', help='--mem for CPU-only jobs')
+    installer.add_argument('--slurm-requeue', action='store_true', help='submit with --requeue (preemptible partitions)')
+    installer.add_argument('--slurm-setup', action='append',
+                           help='shell line run at the start of each job, such as environment activation; repeatable')
+    installer.add_argument('--slurm-arg', action='append', help='extra sbatch argument; repeatable')
+    installer.add_argument('--mcp-job-root', help='MCP job directory root on the model host, such as a project or '
+                                                 'scratch file system; saved to configs/local.yaml')
+    serve = sub.add_parser('mcp', help='serve the model tools over MCP stdio on this host')
+    serve.add_argument('--backend', choices=['local', 'slurm'], help='job backend; default mcp.backend')
+    serve.add_argument('--config', help='workflow config; default configs/default.yaml with configs/local.yaml')
+    serve.add_argument('--job-root', help='job directory root; default mcp.job_root')
+    client = sub.add_parser('mcp-config', help='print or write the .mcp.json entry for the configured model host')
+    client.add_argument('--name', default='msms-structure-elucidation', help='server name in .mcp.json')
+    client.add_argument('--python', help='server interpreter for a local server (default: this interpreter)')
+    client.add_argument('--write', nargs='?', const='.mcp.json', help='merge the entry into this .mcp.json')
     viewer = sub.add_parser('visualize', help='open a local interactive fragment review webpage')
     viewer.add_argument('--result', required=True, nargs='+',
                         help='retrieval.json produced by run or review; pass several to review all unknowns on one page')
@@ -871,7 +936,8 @@ def main(argv=None):
     try:
         return {'run': run, 'review': review, 'denovo': denovo,
                 'visualize': visualize, 'convert-mgf': convert_mgf_command,
-                'batch': batch, 'setup': setup_command}[args.command](args)
+                'batch': batch, 'setup': setup_command, 'mcp': mcp_command,
+                'mcp-config': mcp_config_command}[args.command](args)
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 

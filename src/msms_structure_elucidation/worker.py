@@ -398,6 +398,110 @@ def _require_cuda(cuda_devices: str | None) -> None:
                            'restore GPU access (check nvidia-smi) or unset cuda_devices to run on CPU')
 
 
+def _run_model(smiles: list[str], energies: list, nce: bool, adduct: str, model: str,
+               checkpoint: str | None, gen_checkpoint: str | None, inten_checkpoint: str | None,
+               instrument: str | None, cuda_devices: str | None, batch_size: int,
+               num_cpu_workers: int, num_gpu_workers: int) -> Path:
+    """Run GLACIER or ICEBERG on SMILES and return the directory holding preds*.hdf5."""
+    _require_cuda(cuda_devices)
+    if model == 'glacier':
+        if not checkpoint or not Path(checkpoint).is_file():
+            raise FileNotFoundError('GLACIER checkpoint required; see ms-pred README for public MassSpecGym weights or provide licensed NIST weights')
+        _check_glacier_features(checkpoint)
+        from ms_pred.glacier.glacier_elucidation import glacier_prediction
+        prediction = glacier_prediction(candidate_smiles=smiles, collision_energies=energies,
+            nce=nce, adduct=adduct, instrument=instrument, python_path=sys.executable, ckpt=checkpoint,
+            cuda_devices=cuda_devices, num_gpu_workers=1,  # >1 shards GLACIER output across GPUs
+            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
+    else:
+        if not gen_checkpoint or not inten_checkpoint or not Path(gen_checkpoint).is_file() or not Path(inten_checkpoint).is_file():
+            raise FileNotFoundError('ICEBERG generation and intensity checkpoints required; see ms-pred README for public MassSpecGym weights')
+        from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction
+        prediction = iceberg_prediction(candidate_smiles=smiles, collision_energies=energies,
+            nce=nce, adduct=adduct, instrument=instrument, python_path=sys.executable, gen_ckpt=gen_checkpoint,
+            inten_ckpt=inten_checkpoint, cuda_devices=cuda_devices, num_gpu_workers=num_gpu_workers,
+            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
+    save_dir = Path(prediction[0])
+    marker = save_dir / f'{model}_run_successful'
+    if not marker.is_file() or not list(save_dir.glob('preds*.hdf5')):
+        raise RuntimeError(f'{model.upper()} subprocess failed or produced no spectra at {save_dir}; check model logs and checkpoint compatibility')
+    return save_dir
+
+
+def _model_versions(model: str) -> tuple[str | None, str | None]:
+    import ms_pred
+    try:  # model versions are tracked separately from the ms-pred package version
+        from ms_pred.model_registry import MODEL_REGISTRY
+        model_version = MODEL_REGISTRY.get(model, {}).get('version')
+    except ImportError:
+        model_version = None
+    return model_version, getattr(ms_pred, '__version__', None)
+
+
+def _fragment_smiles(engine, fragment_id: int) -> str | None:
+    """SMILES of the atoms and bonds a fragment bitmask keeps."""
+    from rdkit import Chem
+    drawing = engine.get_draw_dict(fragment_id)
+    if not drawing['hatoms']:
+        return None
+    return Chem.MolFragmentToSmiles(drawing['mol'], atomsToUse=list(drawing['hatoms']),
+                                    bondsToUse=list(drawing['hbonds']) or None, canonical=True)
+
+
+def _peak_annotations(smiles: str, spectra: dict, fragment_ids: dict, adduct: str) -> dict:
+    """Per energy: [m/z, intensity, fragment formula, fragment SMILES] for every predicted peak."""
+    from msms_structure_elucidation.visualize import _fragment_engine, _fragment_formula
+    engine = _fragment_engine(smiles)
+    annotated = {}
+    for ce, peaks in spectra.items():
+        ids = fragment_ids.get(ce) or [None] * len(peaks)
+        rows = []
+        for (mz, intensity), fragment_id in zip(peaks, ids):
+            formula = fragment = None
+            if fragment_id is not None:
+                formula = _fragment_formula(engine, int(fragment_id), mz, adduct)[0] or None
+                fragment = _fragment_smiles(engine, int(fragment_id))
+            rows.append([mz, intensity, formula, fragment])
+        annotated[ce] = rows
+    return annotated
+
+
+def predict(smiles: list[str], collision_energies: list[float], collision_unit: str, adduct: str,
+            model: str, checkpoint: str | None, gen_checkpoint: str | None,
+            inten_checkpoint: str | None, instrument: str | None = None,
+            cuda_devices: str | None = None, batch_size: int = 1, num_cpu_workers: int = 1,
+            num_gpu_workers: int = 1, fragments: bool = False) -> list[dict]:
+    """Forward-predict spectra and fragment IDs for SMILES, without an experimental spectrum."""
+    if collision_unit not in ('NCE', 'eV'):
+        raise ValueError('collision_unit must be NCE or eV')
+    if not smiles or not collision_energies:
+        raise ValueError('predict needs at least one SMILES and one collision energy')
+    # ms-pred expects integer energies; keep a fractional value only when it was given.
+    collision_energies = [int(value) if float(value).is_integer() else float(value) for value in collision_energies]
+    save_dir = _run_model(smiles, collision_energies, collision_unit == 'NCE', adduct, model,
+        checkpoint, gen_checkpoint, inten_checkpoint, instrument, cuda_devices, batch_size,
+        num_cpu_workers, num_gpu_workers)
+    from ms_pred import common
+    model_version, ms_pred_version = _model_versions(model)
+    pred_db = common.PredSpecDB(save_dir / 'preds.hdf5')
+    results = []
+    try:
+        for item in pred_db.get_all_specs():
+            pred = item[-1]
+            spectra, fragment_ids = _serial_spec(pred), _serial_fragment_ids(pred)
+            results.append({'smiles': pred.root_canonical_smiles, 'adduct': adduct,
+                'collision_energies': collision_energies, 'collision_unit': collision_unit,
+                'predicted_spectra': spectra, 'predicted_fragment_ids': fragment_ids,
+                'annotated_peaks': _peak_annotations(pred.root_canonical_smiles, spectra, fragment_ids, adduct)
+                if fragments else None,
+                'model_name': model.upper(), 'model_version': model_version, 'ms_pred_version': ms_pred_version,
+                'model_instrument': instrument,
+                'model_checkpoint': checkpoint if model == 'glacier' else [gen_checkpoint, inten_checkpoint]})
+    finally:
+        pred_db.close()
+    return results
+
+
 def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              checkpoint: str | None, gen_checkpoint: str | None,
              inten_checkpoint: str | None, output_dir: str,
@@ -411,38 +515,11 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
     is always ranked below every result scoring more than TIE_BAND above it."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
-    _require_cuda(cuda_devices)
-    if model == 'glacier':
-        if not checkpoint or not Path(checkpoint).is_file():
-            raise FileNotFoundError('GLACIER checkpoint required; see ms-pred README for public MassSpecGym weights or provide licensed NIST weights')
-        _check_glacier_features(checkpoint)
-        from ms_pred.glacier.glacier_elucidation import glacier_prediction
-        prediction = glacier_prediction(candidate_smiles=smiles, collision_energies=model_energies,
-            nce=False, adduct=metadata.get('ionization', '[M+H]+'),
-            instrument=instrument, python_path=sys.executable, ckpt=checkpoint,
-            cuda_devices=cuda_devices, num_gpu_workers=1,  # >1 shards GLACIER output across GPUs
-            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
-    else:
-        if not gen_checkpoint or not inten_checkpoint or not Path(gen_checkpoint).is_file() or not Path(inten_checkpoint).is_file():
-            raise FileNotFoundError('ICEBERG generation and intensity checkpoints required; see ms-pred README for public MassSpecGym weights')
-        from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction
-        prediction = iceberg_prediction(candidate_smiles=smiles, collision_energies=model_energies,
-            nce=False, adduct=metadata.get('ionization', '[M+H]+'),
-            instrument=instrument, python_path=sys.executable, gen_ckpt=gen_checkpoint,
-            inten_ckpt=inten_checkpoint, cuda_devices=cuda_devices, num_gpu_workers=num_gpu_workers,
-            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
-    save_dir = Path(prediction[0])
-    marker = save_dir / f'{model}_run_successful'
-    if not marker.is_file() or not list(save_dir.glob('preds*.hdf5')):
-        raise RuntimeError(f'{model.upper()} subprocess failed or produced no spectra at {save_dir}; check model logs and checkpoint compatibility')
-    import ms_pred
+    save_dir = _run_model(smiles, model_energies, False, metadata.get('ionization', '[M+H]+'), model,
+        checkpoint, gen_checkpoint, inten_checkpoint, instrument, cuda_devices, batch_size,
+        num_cpu_workers, num_gpu_workers)
     from ms_pred import common
-    try:  # model versions are tracked separately from the ms-pred package version
-        from ms_pred.model_registry import MODEL_REGISTRY
-        model_version = MODEL_REGISTRY.get(model, {}).get('version')
-    except ImportError:
-        model_version = None
-    ms_pred_version = getattr(ms_pred, '__version__', None)
+    model_version, ms_pred_version = _model_versions(model)
     pred_db = common.PredSpecDB(save_dir / 'preds.hdf5')
     results = []
     try:
@@ -478,7 +555,7 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['rank', 'formula', 'validate', 'simulate', 'atlas-smiles', 'atlas-info'])
+    parser.add_argument('action', choices=['rank', 'formula', 'validate', 'simulate', 'predict', 'atlas-smiles', 'atlas-info'])
     parser.add_argument('--spectrum')
     parser.add_argument('--mgf')
     parser.add_argument('--formula')
@@ -497,6 +574,10 @@ def main():
     parser.add_argument('--num-cpu-workers', type=int, default=1)
     parser.add_argument('--num-gpu-workers', type=int, default=1)
     parser.add_argument('--energies')
+    parser.add_argument('--collision-energies', help='predict: comma-separated energies')
+    parser.add_argument('--collision-unit', choices=['NCE', 'eV'], help='predict: unit of --collision-energies')
+    parser.add_argument('--adduct', default='[M+H]+')
+    parser.add_argument('--fragments', action='store_true', help='predict: annotate peaks with fragment formula and SMILES')
     parser.add_argument('--ms1-ppm', type=float, default=5.0)
     parser.add_argument('--ms2-ppm', type=float, default=10.0)
     args = parser.parse_args()
@@ -514,6 +595,14 @@ def main():
                                     ms1_ppm=args.ms1_ppm, ms2_ppm=args.ms2_ppm)
     elif args.action == 'validate':
         result = validate_smiles(json.loads(Path(args.smiles_json).read_text()), args.formula)
+    elif args.action == 'predict':
+        if not args.collision_energies or not args.collision_unit:
+            parser.error('predict requires --collision-energies and --collision-unit')
+        result = predict(json.loads(Path(args.smiles_json).read_text()),
+            [float(value) for value in args.collision_energies.split(',')], args.collision_unit,
+            args.adduct, args.model, args.checkpoint, args.gen_checkpoint, args.inten_checkpoint,
+            args.instrument, args.cuda_devices, args.batch_size, args.num_cpu_workers, args.num_gpu_workers,
+            args.fragments)
     else:
         result = simulate(args.spectrum, json.loads(Path(args.smiles_json).read_text()),
             args.formula, args.model, args.checkpoint, args.gen_checkpoint,
