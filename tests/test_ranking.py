@@ -7,14 +7,8 @@ from msms_structure_elucidation.worker import _explained, sort_candidates
 
 
 def reference_sort(candidates, tie_band=0.03):
-    """Previous quadratic implementation, kept as the specification."""
-    ordered = sorted(candidates, key=lambda c: c['entropy_similarity'], reverse=True)
-    result = []
-    while ordered:
-        anchor = ordered[0]['entropy_similarity']
-        band = [c for c in ordered if anchor - c['entropy_similarity'] <= tie_band]
-        ordered = ordered[len(band):]
-        result.extend(sorted(band, key=lambda c: (c['explained_intensity'], c['entropy_similarity']), reverse=True))
+    """Quadratic specification: entropy order, exact ties by explained intensity; flags near-identical isomers."""
+    result = sorted(candidates, key=lambda c: (c['entropy_similarity'], c['explained_intensity']), reverse=True)
     for index, a in enumerate(result):
         a['rank'] = index + 1
         a['ambiguity'] = []
@@ -46,6 +40,13 @@ def reference_explained(experimental, predicted, alignment, ppm=10):
 
 
 class RankingEquivalenceTest(unittest.TestCase):
+    def test_entropy_ranks_first_even_against_much_higher_coverage(self):
+        ranked = sort_candidates([
+            {'smiles': 'covered', 'formula': 'X', 'entropy_similarity': 0.50, 'explained_intensity': 0.95, 'matched_peaks': []},
+            {'smiles': 'entropy', 'formula': 'X', 'entropy_similarity': 0.52, 'explained_intensity': 0.40, 'matched_peaks': []},
+            {'smiles': 'tie', 'formula': 'X', 'entropy_similarity': 0.52, 'explained_intensity': 0.60, 'matched_peaks': []}])
+        self.assertEqual([c['smiles'] for c in ranked], ['tie', 'entropy', 'covered'])
+
     def test_sort_matches_reference_with_ties_and_shared_peaks(self):
         rng = random.Random(7)
         peak_sets = [[], [{'ce': '20', 'mz': 91.0542}], [{'ce': '20', 'mz': 91.05421}, {'ce': '40', 'mz': 65.039}]]

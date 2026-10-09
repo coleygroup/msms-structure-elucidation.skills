@@ -16,7 +16,7 @@ Installation does not require collision-energy information. When you are ready t
 
 The [clinical unknowns demo](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/) shows the three public unknowns in [ms-pred's clinical spectra directory](https://github.com/coleygroup/ms-pred/tree/main/data/exp_specs/clinical) on one interactive page. The GitHub Pages workflow rebuilds its HTML on every commit; you can also [build it locally](demo/README.md). The provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE** for all three unknowns, despite the files' eV labels.
 
-In the demo, the mirror plot opens with all paired collision energies merged. Switch to an individual energy, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Entropy similarity and explained intensity help rank candidates; explained intensity breaks close score ties. Neither is a probability of identification.
+In the demo, the mirror plot opens with all paired collision energies merged. Switch to an individual energy, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Candidates are ranked by entropy similarity; explained intensity is shown as supporting evidence. Neither is a probability of identification.
 
 ## What to provide
 

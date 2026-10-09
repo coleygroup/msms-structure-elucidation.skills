@@ -116,28 +116,24 @@ def _score(experimental, predicted, alignment, precursor):
     return sum(scores) / len(scores)
 
 
-TIE_BAND = 0.03  # entropy difference treated as a tie, broken by explained intensity
+# Entropy difference within which candidates sharing a formula and matched peaks are flagged as
+# possibly indistinguishable. It does not reorder candidates: on NIST20/NIST'23 retrieval benchmarks,
+# reordering such near-ties by explained intensity lowered top-1 accuracy for ICEBERG and GLACIER.
+AMBIGUITY_BAND = 0.03
 
 
 def image_floor(scores: list[float], top_k: int | None) -> float:
-    """Lowest entropy that can still reach a merged top_k list: sort_candidates puts every
-    result below all results scoring more than TIE_BAND above it."""
+    """Lowest entropy that can still reach a merged top_k list, which is ordered by entropy."""
     ordered = sorted(scores, reverse=True)
-    return ordered[top_k - 1] - TIE_BAND if top_k and len(ordered) >= top_k else -math.inf
+    return ordered[top_k - 1] if top_k and len(ordered) >= top_k else -math.inf
 
 
-def sort_candidates(candidates: list[dict], tie_band: float = TIE_BAND) -> list[dict]:
-    """Keep entropy primary and use coverage within narrow score bands."""
-    ordered = sorted(candidates, key=lambda c: c['entropy_similarity'], reverse=True)
-    result = []
-    while ordered:
-        anchor = ordered[0]['entropy_similarity']
-        band = [c for c in ordered if anchor - c['entropy_similarity'] <= tie_band]
-        ordered = ordered[len(band):]
-        result.extend(sorted(band, key=lambda c: (c['explained_intensity'], c['entropy_similarity']), reverse=True))
+def sort_candidates(candidates: list[dict], ambiguity_band: float = AMBIGUITY_BAND) -> list[dict]:
+    """Rank by mean entropy similarity (precursor excluded); explained intensity breaks exact ties only."""
+    result = sorted(candidates, key=lambda c: (c['entropy_similarity'], c['explained_intensity']), reverse=True)
     # Flag a candidate when an earlier one has the same formula, identical matched peaks and entropy
-    # within tie_band. Every earlier candidate scores at least entropy - tie_band, so the first match is
-    # the first earlier entry of that group scoring at most entropy + tie_band: a bisect on running minima.
+    # within ambiguity_band. Every earlier candidate scores at least entropy - ambiguity_band, so the first match is
+    # the first earlier entry of that group scoring at most entropy + ambiguity_band: a bisect on running minima.
     groups = {}
     for index, a in enumerate(result):
         a['rank'] = index + 1
@@ -146,8 +142,8 @@ def sort_candidates(candidates: list[dict], tie_band: float = TIE_BAND) -> list[
         earlier, negated_minima = groups.setdefault(key, ([], []))
         score = a['entropy_similarity']
         # The margin keeps float rounding from skipping a match; the scan applies the exact test.
-        for b in earlier[bisect.bisect_left(negated_minima, -(score + tie_band + 1e-9)):]:
-            if abs(b['entropy_similarity'] - score) <= tie_band:
+        for b in earlier[bisect.bisect_left(negated_minima, -(score + ambiguity_band + 1e-9)):]:
+            if abs(b['entropy_similarity'] - score) <= ambiguity_band:
                 a['ambiguity'].append(f"No diagnostic matched peaks versus rank {b['rank']}; "
                                       'positional isomers may be indistinguishable')
                 break
@@ -511,8 +507,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              top_k: int | None = None) -> list[dict]:
     """Run ms-pred only for structures unavailable in the precomputed atlas.
 
-    With top_k, structure images are drawn only where a merged top_k list can reach: a result
-    is always ranked below every result scoring more than TIE_BAND above it."""
+    With top_k, structure images are drawn only where a merged top_k list can reach: results
+    are ranked by entropy similarity."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
     model_energies = model_collision_energies_ev(experimental)
     save_dir = _run_model(smiles, model_energies, False, metadata.get('ionization', '[M+H]+'), model,
