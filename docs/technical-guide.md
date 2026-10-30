@@ -1,6 +1,10 @@
 # Technical guide: MS/MS structure elucidation
 
-Portable tools and skills for assigning candidate small-molecule structures from experimental MS/MS. The default path ranks precomputed ICEBERG 2.1 spectra from the public PubChem atlas; expensive local simulation and de novo generation are optional.
+Portable tools and skills for assigning candidate small-molecule structures from experimental MS/MS. The `run` and `batch` CLI path ranks precomputed ICEBERG 2.1 spectra from the public PubChem atlas. Agents can also predict every candidate with the confirmed ICEBERG or GLACIER model, including a mass-only PubChem search that skips formula prediction.
+
+Before prediction, confirm the intended model and exact weights using [msms-setup](../.agents/skills/msms-setup/SKILL.md). Either ICEBERG's generator/intensity checkpoint pair or a GLACIER checkpoint is sufficient. ICEBERG can reuse suitable public atlas spectra; GLACIER predicts every candidate because no open GLACIER atlas is currently available. Keep one model and weight selection across a combined ranking.
+
+The CLI examples below follow the ICEBERG atlas route. For GLACIER or a request to predict everything, use `score_candidates` with an explicit `model` and `formula` for each candidate group. The current `review` command can retain existing ICEBERG candidates and reuse public atlas matches even with `--model glacier`; it does not rescore the entire pool with GLACIER. `run` and `batch` also remain atlas workflows.
 
 ## Manual CLI setup
 
@@ -18,11 +22,22 @@ Ask the spectrum provider whether the supplied collision energies are NCE or abs
 
 Omit `--formula` to search the top three MSBuddy hypotheses. Use `--formulas-file formulas.txt` for a user supplied list, one formula per line. MSBuddy mass tolerances follow the instrument (Q-TOF 10/20 ppm, Orbitrap 5/10 ppm precursor/fragment; `--ms1-ppm`, `--ms2-ppm`). If MSBuddy proposes no formula, formulas of PubChem structures matching the precursor mass are searched instead. A result without atlas coverage records `next_step: iceberg-pubchem` (predict the formula's PubChem structures with `review --proposals pubchem`), and one with no formula anywhere records `next_step: review-frigid`. `--atlas-mgf` is for a single formula offline. The command writes `retrieval.json` and a basic offline `report.html`; use the richer viewer below for fragment inspection and notes. Formula outcomes are recorded separately in `formula_results`. `ranked`, `needs_formula`, `no_atlas_coverage`, and `no_candidates` are valid outcomes with exit code 0; operational errors return nonzero. Entropy similarity is a ranking statistic, not identification confidence. Candidates are ranked by the mean entropy similarity over paired collision energies, with the precursor peak excluded; explained intensity only breaks exact ties and is reported as evidence. On NIST20 and NIST'23 retrieval benchmarks (ICEBERG and GLACIER), reordering near-ties by explained intensity or ranking by coverage lowered top-1 accuracy. Candidates with the same formula, identical matched peaks and entropy within 0.03 of a higher-ranked one are flagged as potentially indistinguishable.
 
+### Mass-only PubChem option
+
+Instead of predicting a formula, search PubChem directly by monoisotopic mass within a chosen ppm tolerance. Skip MSBuddy and other formula-prediction methods entirely; take formulas from the matching PubChem records, then predict and rank the structures for every matched formula:
+
+1. Confirm the precursor m/z, adduct, charge and mass tolerance. Convert the precursor to neutral monoisotopic mass using that adduct and charge, and search PubChem within ±ppm of that neutral mass. Record the mass window and any element or structure filters.
+2. Collect every matched formula and all eligible PubChem structures for each formula. Deduplicate structures and retain their formula, PubChem identifiers and mass error. Do not select only the most common formulas or the top three hypotheses. Check retrieval limits and pagination; report incomplete searches or failed lookups explicitly.
+3. Confirm the prediction model and exact weights as described in [msms-setup](../.agents/skills/msms-setup/SKILL.md), and confirm NCE or eV before scoring. Predict every candidate with that model at the experimental adduct and all supplied collision energies. This route uses fresh predictions throughout, including when ICEBERG is selected. With MCP connected, call `server_info` first, then use `score_candidates` with the selected `model` and an explicit `formula` for each formula's candidates. Request enough results to retain every candidate when processing in batches.
+4. Combine candidates from all matched formulas into one ranking using the same mean entropy similarity over all supplied energies, with the precursor excluded. Keep formula and mass error visible, and use the same weights and scoring settings for every formula. Rank by score across the combined pool rather than by each formula's local rank. Report candidate counts, failed predictions and any unprocessed candidates; do not describe a partial search as exhaustive.
+
+This option is currently agent-orchestrated. `run --ms1-ppm ...` still attempts MSBuddy before its PubChem fallback; `--formulas-file` skips MSBuddy but still follows atlas retrieval. Neither command alone performs the mass-only prediction route above. The PubChem helpers also have default formula and structure limits, which must be addressed when collecting all matches.
+
 The public atlas endpoint is `https://iceberg-ms.mit.edu/download_mgf?formula=...&adduct=...`. Its spectra are ICEBERG predictions for PubChem structures; licensed NIST structures are excluded. No atlas files or model weights are bundled here.
 
 ## Host tuning
 
-`msms-structure-elucidation setup` reads the CPU threads, RAM and GPUs, chooses ms-pred inference settings from measured anchors, and saves them to `configs/local.yaml`, which Git ignores. If ms-pred and ICEBERG checkpoints are available, it also times ICEBERG to choose batch_size. Every command applies that file on top of `configs/default.yaml` unless `--config` or `MSMS_CONFIG` is given. Use `--remote HOST --remote-repo PATH` to tune a GPU host over ssh, adding `--remote-prefix` for environment activation or a scheduler such as `srun`. See the [msms-setup skill](../.agents/skills/msms-setup/SKILL.md).
+`msms-structure-elucidation setup` reads the CPU threads, RAM and GPUs, chooses ms-pred inference settings from measured anchors, and saves them to `configs/local.yaml`, which Git ignores. If ms-pred and ICEBERG checkpoints are available, it also times ICEBERG to choose batch_size. Every command applies that file on top of `configs/default.yaml` unless `--config` or `MSMS_CONFIG` is given. Use `--remote HOST --remote-repo PATH` to tune a GPU host over ssh, adding `--remote-prefix` for environment activation or a scheduler such as `srun`. For GLACIER, use `--no-benchmark` and tune its native `pred_smis` inference settings separately on each machine through the configured prediction path. Start from GLACIER's defaults, measure batch size and CPU worker throughput and memory use, and keep one GPU worker with the current adapter. ICEBERG tuning results do not establish GLACIER performance. Save the selected model, checkpoint and measured settings in `configs/local.yaml`; see the [msms-setup skill](../.agents/skills/msms-setup/SKILL.md).
 
 ## MCP server
 
@@ -49,8 +64,15 @@ The public atlas endpoint is `https://iceberg-ms.mit.edu/download_mgf?formula=..
 - Jobs are detached, so they survive a dropped client connection.
 - An identical request returns the earlier job.
 
-**Backends.** `mcp.backend` selects one.
-- `local`: runs each job on an idle GPU that has at least `gpu_min_free_fraction` of its memory free, and waits while every GPU is busy.
+**Backends and SSH.** `mcp.backend` selects how the MCP server runs jobs. SSH is the connection to that server, configured separately through the client's `execution.mode: remote`, SSH destination and generated `.mcp.json` entry. `local` means local to the MCP server host, which may be a remote GPU machine reached over SSH. There is no `mcp.backend: ssh` value.
+
+| Connection to the MCP server | Server's `mcp.backend` | Where jobs run |
+|---|---|---|
+| Same machine | `local` | On that machine |
+| SSH to a GPU host | `local` | On the remote GPU host |
+| SSH to a Slurm login node | `slurm` | On allocated compute nodes |
+
+- `local`: runs each job on an idle GPU on the server host that has at least `gpu_min_free_fraction` of its memory free, and waits while every GPU is busy.
 - `slurm`: submits each job with `sbatch`, using only the options set under `mcp.slurm`. Those options are `partition`, `account`, `qos`, `gpus`, `cpus_per_task`, `mem`, `time`, `requeue`, `extra_args`, `setup` shell lines, and `cpu` resources for CPU-only tasks.
 
 **Setup.** `setup` writes `configs/local.yaml` and `mcp-config` writes the client entry; see the [msms-setup skill](../.agents/skills/msms-setup/SKILL.md).
@@ -68,9 +90,9 @@ For a remote host, the client entry runs `ssh -o BatchMode=yes <ssh-destination>
 
 ## Optional models
 
-`ms-pred` supplies GLACIER, ICEBERG, and spectral utilities. Clone the [official ms-pred repository](https://github.com/coleygroup/ms-pred), read its README, and follow its environment setup for your host. Set `--ms-pred-dir` to that checkout for local inference; the worker runs there because GLACIER uses a relative script path. Use the open-source MassSpecGym checkpoint links in the [ms-pred README](https://github.com/coleygroup/ms-pred#readme), or provide local licensed NIST checkpoints if your license permits. GLACIER needs one checkpoint; ICEBERG needs generation and intensity checkpoints. Model calls receive rounded integer eV with `nce=False`. The `.ms` `>instrumentation` value is used for model calls, with `--instrument` taking priority. Use `--cuda-devices 0` or `MSMS_CUDA_DEVICES=0` to select a GPU. Batch size and ms-pred worker counts (`--model-batch-size`, `--model-cpu-workers`, `--model-gpu-workers`) should match the GPU memory; the measured anchors (8 GB → 16, 24 GB → 128, 16 CPU and 2 GPU workers) are in `.agents/skills/msms-sim-iceberg/SKILL.md`.
+`ms-pred` supplies GLACIER, ICEBERG, and spectral utilities. Clone the [official ms-pred repository](https://github.com/coleygroup/ms-pred), read its README, and follow its environment setup for your host. Set `--ms-pred-dir` to that checkout for local inference; the worker runs there because GLACIER uses a relative script path. Use the open-source MassSpecGym checkpoint links in the [ms-pred README](https://github.com/coleygroup/ms-pred#readme), or provide local licensed NIST checkpoints if your license permits. GLACIER needs one checkpoint; ICEBERG needs generation and intensity checkpoints. Model calls receive rounded integer eV with `nce=False`. The `.ms` `>instrumentation` value is used for model calls, with `--instrument` taking priority. Use `--cuda-devices 0` or `MSMS_CUDA_DEVICES=0` to select a GPU. Tune batch size and ms-pred worker counts (`--model-batch-size`, `--model-cpu-workers`, `--model-gpu-workers`) for the selected model on each host. The anchors in `.agents/skills/msms-sim-iceberg/SKILL.md` are ICEBERG measurements; tune GLACIER independently as described above.
 
-Put local paths and defaults in [configs/default.yaml](../configs/default.yaml), or pass `--config path/to/config.yaml`. CLI options override config; `MS_PRED_DIR`, `MS_PRED_PYTHON`, and `MSMS_CUDA_DEVICES` are also supported. Paths in the YAML file are relative to that file. The public GLACIER checkpoint can be incompatible with newer ms-pred feature layouts: the preflight compares checkpoint atom feature width with the selected checkout before inference and reports the mismatch. In a local probe, the public checkpoint expected 88 base atom features while ms-pred commit `577b452` produced 89; choose a compatible checkout or checkpoint. The same checkpoint may produce better or different results than other public weights, and licensed NIST weights stay local.
+Put local paths and defaults in the uncommitted `configs/local.yaml`, which overrides the shared [configs/default.yaml](../configs/default.yaml), or pass `--config path/to/config.yaml`. CLI options override config; `MS_PRED_DIR`, `MS_PRED_PYTHON`, and `MSMS_CUDA_DEVICES` are also supported. Paths in the YAML file are relative to that file. The public GLACIER checkpoint can be incompatible with newer ms-pred feature layouts: the preflight compares checkpoint atom feature width with the selected checkout before inference and reports the mismatch. In a local probe, the public checkpoint expected 88 base atom features while ms-pred commit `577b452` produced 89; choose a compatible checkout or checkpoint. Checkpoint compatibility does not establish ranking performance; compare weights on matched data before claiming an improvement. Licensed NIST weights stay local.
 
 FRIGID is installed separately when needed:
 
@@ -90,6 +112,7 @@ For raw files or mzML, export a feature-level `.ms` spectrum with the preprocess
 
 ```bash
 msms-structure-elucidation convert-mgf --input features.mgf --collision-unit eV --raw-mzxml raw_mzxml_folder/ --output-dir converted
+# ICEBERG atlas route; GLACIER and mass-only searches use direct candidate scoring.
 msms-structure-elucidation batch --manifest converted/manifest.csv --output-dir results/batch --ms-pred-dir /path/to/ms-pred
 ```
 

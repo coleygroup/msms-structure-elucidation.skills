@@ -1,10 +1,10 @@
 ---
 name: msms-denovo
-description: Generate formula-constrained structures from an experimental .ms spectrum with FRIGID when public-atlas retrieval and model review are insufficient.
+description: Generate formula-constrained structures from an experimental .ms spectrum with FRIGID when retrieval or direct model scoring leaves no satisfactory candidate.
 ---
 # FRIGID de novo generation
 
-Use after public atlas retrieval, especially when strongest experimental peaks remain unexplained. FRIGID requires a neutral molecular formula and peak subformula assignments. Formula hypotheses inferred from MSBuddy should be treated as hypotheses.
+Use after ICEBERG atlas retrieval or direct candidate scoring with the confirmed model, especially when the strongest experimental peaks remain unexplained. FRIGID requires a neutral molecular formula and peak subformula assignments. The formula may be supplied, inferred with MSBuddy, or taken from a PubChem mass match; treat inferred and mass-matched formulas as hypotheses. A mass-only PubChem search skips formula prediction and does not require FRIGID.
 
 ## Setup
 
@@ -20,7 +20,7 @@ msms-structure-elucidation denovo --result results/sample/retrieval.json \
   --mist-ckpt /path/to/mist.ckpt --dlm-ckpt /path/to/dlm.ckpt
 ```
 
-This writes `denovo.json` and adds unscored FRIGID proposals to the report. Use the `review` command with those SMILES to score them through the atlas or GLACIER/ICEBERG. For direct use of the component scripts:
+This writes `denovo.json` and adds unscored FRIGID proposals to the report. With MCP connected, call `server_info` first and use `generate_structures_frigid`, then `score_candidates` with the confirmed model and weights. For GLACIER or fresh predictions throughout, rescore the whole candidate pool directly; CLI `review` may retain or reuse ICEBERG atlas scores. For the ICEBERG atlas route, CLI `review` can reuse suitable atlas matches and predict missing structures. For direct use of the component scripts without MCP:
 
 ```bash
 "${MS_PRED_PYTHON:-python}" .agents/skills/msms-subformulae/scripts/run.py \

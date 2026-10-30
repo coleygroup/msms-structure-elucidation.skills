@@ -16,24 +16,25 @@ Installation needs no spectrum and no collision-energy information. Never write 
    - an `msms-structure-elucidation` entry in `.mcp.json` or in the client's MCP list. If it is connected, call `server_info` and show the user its host, backend and model status.
    - an `execution` block in `configs/local.yaml`.
 
-   If one is found and the user confirms it, skip to step 6 and fill only the gaps `server_info` reports. Otherwise ask once where the models should run:
+   If one is found and the user confirms its host, intended prediction model and exact weights, skip to step 6 and fill only the gaps `server_info` reports. Apply the model-specific atlas policy in step 3. Otherwise ask once where the models should run:
    - **This machine.**
    - **A GPU host over ssh.** Collect the ssh destination (`user@host` or a `~/.ssh/config` alias) and the path of this repository there. If the checkout is not there yet, ask before cloning or installing anything remotely. Login must work without a prompt, because setup uses `BatchMode=yes`. If the host needs a password or a second factor, ask the user to open a persistent connection first (`ControlMaster`/`ControlPersist`), for example by running `ssh <host>` in another terminal.
    - **A Slurm cluster.** Collect the login-node ssh destination and the checkout path, as for an ssh host. Prefer a project or scratch file system when home quota is small. Jobs run on compute nodes, and the login node only submits and polls them.
 3. **Set up the environment** on that host.
    - Look for:
-     - an ms-pred checkout, and an interpreter that imports `ms_pred`, `msbuddy` and `rdkit`;
-     - ICEBERG generator and intensity checkpoints;
-     - optionally a GLACIER checkpoint;
+     - an [ms-pred checkout](https://github.com/coleygroup/ms-pred), and an interpreter that imports `ms_pred`, `msbuddy` and `rdkit`;
+     - either a complete ICEBERG generator and intensity checkpoint pair, or a GLACIER checkpoint; either model is sufficient;
      - for de novo work, a FRIGID checkout, its interpreter, and MIST and DLM checkpoints;
      - a GPU (`nvidia-smi`, or `sinfo` on a cluster).
-   - For anything missing, follow the ms-pred README **Install & setup** section and `msms-denovo/scripts/setup_env.sh`. `bash setup_envs.sh` is only a CPU venv helper. Public MassSpecGym weights are linked in the [ms-pred README](https://github.com/coleygroup/ms-pred#pretrained-iceberg-21-model-weights-on-massspecgym). Never download or distribute NIST-trained weights; use them only if the user supplies them.
+   - Show the user the available model(s), exact checkpoint paths, and weight provenance when known. If only one model has complete weights, propose using it; if both do, ask which to use. Before benchmarking or prediction, ask the user to confirm that the proposed model and weights are the ones they intend to use. Use the confirmed selection; do not require or download the other model's weights.
+   - Use the confirmed model throughout prediction and scoring. For **ICEBERG**, unless the user requests fresh predictions for every candidate, the public ICEBERG atlas can supply spectra with matching adduct and collision energies; predict missing spectra with the confirmed ICEBERG weights. For **GLACIER**, no open GLACIER atlas is currently available: predict every candidate spectrum with the confirmed GLACIER weights. Do not use public ICEBERG atlas spectra or atlas retrieval scores as GLACIER predictions.
+   - If no ms-pred checkout exists, clone it on the model host with `git clone https://github.com/coleygroup/ms-pred.git` (for remote hosts, obtain permission as described in step 2). For anything missing, follow the checkout's `README.md` **Install & setup** section and `msms-denovo/scripts/setup_env.sh`. `bash setup_envs.sh` is only a CPU venv helper. Public MassSpecGym weights are linked in the [ms-pred README](https://github.com/coleygroup/ms-pred#pretrained-iceberg-21-model-weights-on-massspecgym). Never download or distribute NIST-trained weights; use them only if the user supplies them.
    - Create the server venv from any Python 3.10 or newer, without modifying the user's model environments:
 
      ```bash
      python3 -m venv .cache/mcp-venv && .cache/mcp-venv/bin/pip install -e '.[mcp]'
      ```
-4. **Probe and tune.** Pass every interpreter, checkout and checkpoint found in step 3, so that setup saves them.
+4. **Probe and tune.** Pass the interpreters, checkouts and checkpoints confirmed in step 3, so that setup saves them. The example below uses ICEBERG. For GLACIER, omit `--gen-checkpoint` and `--inten-checkpoint` and use `--no-benchmark`, since the automated benchmark only supports ICEBERG; tune GLACIER separately on that machine as described below. After setup, save the confirmed selection in the model host's `configs/local.yaml`: `models.simulator.model` (`iceberg` or `glacier`) and, for GLACIER, `models.simulator.glacier_ckpt` (the confirmed checkpoint path). Pass the confirmed model explicitly to prediction and scoring tools.
 
    This machine:
 
@@ -83,6 +84,7 @@ Installation needs no spectrum and no collision-energy information. Never write 
    For a local server, run it with the server venv's interpreter (`.cache/mcp-venv/bin/python -m msms_structure_elucidation.cli mcp-config --write`), or pass `--python`. For a remote host, the entry runs the server through `ssh` on the model host. Ask the user to reload MCP servers in their client. Then call `server_info` and check that the expected models report `ready`.
 7. **Report to the user:**
    - where models run and which backend is used;
+   - the confirmed prediction model and checkpoint paths, and whether suitable public ICEBERG atlas spectra will be reused or every candidate will be predicted directly;
    - what is ready and what is missing (environment, checkpoints, GPU);
    - the saved settings, and whether they are `benchmarked` or `heuristic`;
    - what to add to get a benchmark or to enable a missing model.
@@ -91,8 +93,12 @@ Installation needs no spectrum and no collision-energy information. Never write 
 
 With the MCP server connected, call its tools: `predict_spectra`, `score_candidates`, `retrieve_atlas`, `generate_structures_frigid` and `predict_fingerprint_mist`. Pass spectra as `.ms` text, so no files need copying between machines. Confirm NCE or eV with the user before any call.
 
+Follow the confirmed model selection from step 3. With ICEBERG, use `retrieve_atlas` where suitable and predict missing spectra with `model="iceberg"`. If the user requests a [mass-only PubChem search](../../../docs/technical-guide.md#mass-only-pubchem-option) or fresh predictions throughout, skip atlas retrieval even for ICEBERG and score every candidate directly. With GLACIER, skip `retrieve_atlas` and predict or score every candidate using `predict_spectra` or `score_candidates` with `model="glacier"`; do not substitute ICEBERG atlas spectra.
+
 Long jobs, and every job on Slurm, return a `job_id`. Poll it with `get_job(job_id, wait_seconds=...)`. A job keeps running if the client disconnects.
 
 Without MCP, run CLI commands on the host instead: `ssh <host> '<prefix> cd <repo> && <python> -m msms_structure_elucidation.cli …'`. Copy inputs over and results back with `scp` or `rsync`, then open `msms-visualize` locally.
 
-Rerun setup after changing GPUs, drivers, checkpoints, the ms-pred version, or Slurm resources. The benchmark measures ICEBERG. GLACIER uses the same `batch_size` and CPU workers, and always one GPU worker.
+Rerun setup and retune the selected model after changing GPUs, drivers, checkpoints, the ms-pred version, or Slurm resources. The automated setup benchmark measures ICEBERG only.
+
+Tune GLACIER independently on each machine based on its native `pred_smis` inference script. Measure the configured prediction path, using MCP tools when connected. Inspect the installed ms-pred checkout's script options and defaults; its inference configuration differs from ICEBERG, so do not assume the same optimal batch size or CPU worker count. Start from GLACIER's defaults and measure throughput and peak GPU and host memory after a warm-up on a fixed, representative candidate set, keeping the confirmed weights and prediction settings unchanged. Adjust batch size and CPU workers within the host's memory limits, verify that all expected spectra are produced, and save the measured settings in `configs/local.yaml` under `models.simulator`. Keep one GPU worker with the current adapter, which forces that value for GLACIER; do not assume multiple GPU workers improve throughput. Report GLACIER settings as benchmarked only after measuring GLACIER itself; otherwise label them heuristic.

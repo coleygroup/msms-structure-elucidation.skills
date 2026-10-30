@@ -27,7 +27,7 @@ against ground-truth Morgan fingerprints.
 
 ## Prerequisites
 
-Same as `msms-denovo`: clone [coleygroup/FRIGID](https://github.com/coleygroup/FRIGID) with submodules if needed, read its `README.md` **Installation** section, and follow that checkout's environment instructions. Set `mist_ckpt` in `configs/default.yaml`.
+Same as `msms-denovo`: clone [coleygroup/FRIGID](https://github.com/coleygroup/FRIGID) with submodules if needed, read its `README.md` **Installation** section, and follow that checkout's environment instructions. Set `models.denovo.mist_ckpt` in the uncommitted `configs/local.yaml`.
 
 Spectra must already be in `.ms` format with subformulae computed —
 see `msms-atlas-to-ms` (for atlas-derived spectra) and

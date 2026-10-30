@@ -8,7 +8,7 @@ Open Codex or Claude Code in your project and type:
 
 > Install the skills from https://github.com/coleygroup/msms-structure-elucidation.skills. Check which required environments, repository checkouts, and model assets are already available, and tell me what is ready or missing. I am not providing a spectrum yet.
 
-Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. It first finds or asks for the prediction server, which can be this machine, a GPU host reached over ssh, or a Slurm cluster. It then sets up that host's environment, probes and tunes it, saves the settings to `configs/local.yaml`, and registers the [MCP server](docs/technical-guide.md#mcp-server) that exposes ICEBERG, GLACIER, FRIGID, MIST and atlas retrieval as tools.
+Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. It first finds or asks for the prediction server, which can be this machine, a GPU host reached over ssh, or a Slurm cluster. It confirms the intended prediction model and exact weights; either a complete ICEBERG checkpoint pair or a GLACIER checkpoint is sufficient. It then sets up that host's environment, probes and tunes it, saves the settings to `configs/local.yaml`, and registers the [MCP server](docs/technical-guide.md#mcp-server) that exposes ICEBERG, GLACIER, FRIGID, MIST and atlas retrieval as tools.
 
 Installation does not require collision-energy information. When you are ready to analyze a spectrum, attach it or give its path and ask the agent to run the workflow. At that point, the agent should confirm the supplied collision energies and whether their values are **NCE or absolute eV** before scoring; a file header alone does not establish the unit.
 
@@ -27,13 +27,13 @@ In the demo, the mirror plot opens with all paired collision energies merged. Sw
 | Precursor information | Precursor m/z and adduct, when they are not already in the file. |
 | Helpful context | Instrument, sample context, and a molecular formula or formula list if you have one. |
 
-A formula is optional: the workflow can propose formulas from the spectrum. Local model weights are optional for atlas retrieval, but may be needed when the atlas has no prediction at one of your energies or when you ask to score new structures. Licensed NIST weights are never bundled with these skills.
+A formula is optional: supply one or a list, ask for formula hypotheses from the spectrum, or request a [PubChem mass search within a ppm tolerance](docs/technical-guide.md#mass-only-pubchem-option) that skips formula prediction and predicts every matched candidate. With ICEBERG, suitable public atlas spectra can be reused unless you request fresh predictions. GLACIER requires predictions for every candidate because no open GLACIER atlas is currently available. Local model weights are optional for atlas retrieval and required for fresh predictions. Licensed NIST weights are never bundled with these skills.
 
 ## What the agent does
 
 1. Reads or converts the spectrum and checks its precursor, adduct, instrument, and energy labels with you.
-2. Uses a supplied formula or examines multiple inferred formulas, then retrieves public ICEBERG predictions for matching PubChem structures.
-3. Converts confirmed NCE to integer eV for prediction and compares **all** supplied collision energies. When exact atlas energy coverage is missing, it explains the required local model setup.
+2. Uses supplied formulas, inferred hypotheses, or PubChem mass matches within your ppm tolerance. The mass-only route skips formula prediction and ranks candidates across every matched formula.
+3. Uses your confirmed model and weights: ICEBERG can reuse suitable public atlas spectra; GLACIER and mass-only searches predict every candidate. It converts confirmed NCE to integer eV for prediction and compares **all** supplied collision energies.
 4. Ranks candidate structures, checks explained intensity and unmatched peaks, and flags structures these spectra cannot distinguish. If you add candidate structures or review notes, it can refine the analysis.
 
 The public atlas does not contain licensed NIST structures. A good spectral match supports a hypothesis; it does not establish a unique molecular identity.
@@ -43,6 +43,8 @@ The public atlas does not contain licensed NIST structures. A good spectral matc
 - An interactive report with ranked structures, a merged mirror spectrum by default, individual energy views, fragment highlighting, candidate comparison, formula hypotheses, and the evidence behind each rank.
 - `retrieval.json`, the machine-readable record of formulas, energy conversion, candidate scores, sources, and explicit outcomes such as no atlas coverage or missing model assets.
 - A local review page where candidate decisions and fragment notes are saved to `review_notes.json`. A batch of unknowns can be reviewed together in one page.
+
+The CLI atlas path writes these reports. Direct MCP scoring returns job results; assembling the same viewer package for a full GLACIER or mass-only search currently requires agent orchestration.
 
 ## Try the example yourself
 
