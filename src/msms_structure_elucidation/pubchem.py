@@ -1,20 +1,22 @@
-"""PubChem lookups used when formula inference or the public atlas cannot supply candidates.
+"""PubChem structure lookups for direct mass search, formula fallback and candidate review.
 
-Only single-component, uncharged structures are kept: those are what the [M+H]+ precursor can be.
+Mass searches retain neutral, single-component structures after correcting for the precursor adduct.
 """
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
+from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from msms_structure_elucidation.ions import MODEL_ADDUCTS, NEGATIVE, POSITIVE, PROTON
+
 PUBCHEM = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug'
-PROTON = 1.007276
-ADDUCT_SHIFT = {'[M+H]+': PROTON, '[M+Na]+': 22.989218, '[M+K]+': 38.963158, '[M+NH4]+': 18.033823,
-                '[M-H]-': -PROTON}
+ADDUCT_SHIFT = {adduct: shift for adduct, shift in {**POSITIVE, **NEGATIVE}.items() if adduct in MODEL_ADDUCTS}
 DEFAULT_ELEMENTS = 'CHNOPS'
 _BATCH = 500
 
@@ -61,6 +63,80 @@ def _usable(props: dict, elements: str) -> bool:
     # Isotope-labelled records (e.g. [2H]) list the unlabelled formula but a heavier mass.
     return (smiles and '.' not in smiles and not re.search(r'\[\d', smiles) and int(props.get('Charge', 0)) == 0
             and not re.search(r'[+-]', formula) and _elements(formula) <= allowed and _closed_shell(formula))
+
+
+def _search_cids(response: dict) -> list[int]:
+    """Resolve a complete PubChem CID search, including asynchronous list keys."""
+    for _ in range(30):
+        if 'Waiting' not in response:
+            break
+        list_key = response['Waiting'].get('ListKey')
+        if not list_key:
+            raise RuntimeError('PubChem asynchronous search did not provide a list key')
+        key = urllib.parse.quote(str(list_key))
+        time.sleep(2)
+        response = _get(f'compound/listkey/{key}/cids/JSON')
+        if not response:
+            raise RuntimeError('PubChem search list expired before all CIDs were retrieved')
+    if not response:
+        return []  # The initial mass query returned HTTP 404: no matches.
+    identifiers = response.get('IdentifierList', {}).get('CID')
+    if not isinstance(identifiers, list) or any(type(cid) is not int or cid <= 0 for cid in identifiers):
+        raise RuntimeError('PubChem did not return a complete CID list: ' + str(response)[:500])
+    return sorted(set(identifiers))
+
+
+def mass_candidates(precursor_mz: float, adduct: str = '[M+H]+', ppm: float = 10.0,
+                    elements: str = DEFAULT_ELEMENTS) -> dict:
+    """Retrieve every eligible mass-matched PubChem structure, grouped by its recorded formula."""
+    if adduct not in ADDUCT_SHIFT:
+        raise ValueError(f'Unsupported adduct for PubChem mass search: {adduct}; only supported singly charged ions are accepted')
+    neutral = precursor_mz - ADDUCT_SHIFT[adduct]
+    if not all(math.isfinite(x) and x > 0 for x in (precursor_mz, neutral, ppm)):
+        raise ValueError('Precursor mass, neutral mass and ppm tolerance must be positive and finite')
+    if not re.fullmatch(r'(?:[A-Z][a-z]?)+', elements):
+        raise ValueError('PubChem element filter must be an element list such as CHNOPS or CHNOPSClBr')
+    tolerance = neutral * ppm * 1e-6
+    lower, upper = neutral - tolerance, neutral + tolerance
+    if lower <= 0 or not math.isfinite(upper):
+        raise ValueError('PubChem mass window must be positive and finite')
+    query = f'compound/monoisotopic_mass/range/{lower}/{upper}/cids/JSON'
+    cids = _search_cids(_get(query))
+    groups: dict[str, dict[str, dict]] = {}
+    eligible = 0
+    for start in range(0, len(cids), _BATCH):
+        batch = cids[start:start + _BATCH]
+        table = _get('compound/cid/property/MolecularFormula,MonoisotopicMass,Charge,SMILES,InChIKey/JSON',
+                     {'cid': ','.join(map(str, batch))})
+        rows = table.get('PropertyTable', {}).get('Properties', [])
+        received = [row.get('CID') for row in rows]
+        if len(received) != len(batch) or set(received) != set(batch):
+            raise RuntimeError(f'Incomplete PubChem property response: expected {len(batch)} CIDs, received {len(received)}')
+        for props in rows:
+            required = ('MolecularFormula', 'MonoisotopicMass', 'Charge', 'SMILES', 'InChIKey')
+            if any(key not in props for key in required):
+                raise RuntimeError(f'Incomplete PubChem properties for CID {props["CID"]}')
+            mass = float(props['MonoisotopicMass'])
+            if not math.isfinite(mass):
+                raise RuntimeError(f'Non-finite PubChem mass for CID {props["CID"]}')
+            if not lower <= mass <= upper or not _usable(props, elements):
+                continue
+            eligible += 1
+            by_smiles = groups.setdefault(props['MolecularFormula'], {})
+            candidate = by_smiles.setdefault(props['SMILES'], {
+                'smiles': props['SMILES'], 'pubchem_cids': [], 'pubchem_inchikeys': [],
+                'monoisotopic_mass': mass, 'mass_error_ppm': (mass - neutral) / neutral * 1e6})
+            candidate['pubchem_cids'].append(props['CID'])
+            if props['InChIKey'] not in candidate['pubchem_inchikeys']:
+                candidate['pubchem_inchikeys'].append(props['InChIKey'])
+    return {'source': 'PubChem monoisotopic mass search', 'query_url': f'{PUBCHEM}/{query}',
+            'queried_at': datetime.now(timezone.utc).isoformat(), 'precursor_mz': precursor_mz,
+            'adduct': adduct, 'neutral_mass': neutral, 'ppm_tolerance': ppm, 'mass_range': [lower, upper],
+            'elements': elements, 'filters': ['neutral', 'single-component', 'non-isotope-labelled', 'closed-shell'],
+            'matched_cids': len(cids), 'eligible_cids': eligible, 'excluded_cids': len(cids) - eligible,
+            'candidate_structures': sum(map(len, groups.values())), 'complete': True,
+            'formulas': [{'formula': formula, 'candidates': list(by_smiles.values())}
+                         for formula, by_smiles in sorted(groups.items())]}
 
 
 def formulas_by_mass(precursor_mz: float, adduct: str = '[M+H]+', ppm: float = 10.0,

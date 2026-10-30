@@ -7,11 +7,12 @@ Usage:
 
 Requirements:
     - Env: preprocess
-    - mzML/MGF: msconvert in PATH or Docker (proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses)
+    - Raw conversion: native msconvert via --msconvert-bin, MSCONVERT_BIN, or PATH
     - .ms: pyteomics (pure Python, no external tool)
 """
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -19,21 +20,21 @@ from pathlib import Path
 
 SUPPORTED_RAW = {".raw", ".d"}
 SUPPORTED_CONVERTED = {".mzml", ".mgf"}
-DOCKER_IMAGE = "proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses"
 FORMAT_FLAG = {"mzml": "--mzML", "mgf": "--mgf"}
 POLARITY_FILTER = {"positive": "polarity positive", "negative": "polarity negative"}
 
 
-def _find_binary(name: str) -> str | None:
-    """Find a binary via shutil.which or common fallback paths."""
-    found = shutil.which(name)
-    if found:
-        return found
-    for prefix in ("/usr/bin", "/usr/local/bin", "/snap/bin"):
-        candidate = Path(prefix) / name
-        if candidate.exists():
-            return str(candidate)
-    return None
+def _find_msconvert(explicit: str | None = None) -> str:
+    """Resolve the selected native converter without trying another execution backend."""
+    configured = explicit or os.environ.get("MSCONVERT_BIN") or "msconvert"
+    executable = shutil.which(str(Path(configured).expanduser()))
+    if executable:
+        return executable
+    raise FileNotFoundError(
+        f"Native msconvert executable not found: {configured}. "
+        "Pass --msconvert-bin, set MSCONVERT_BIN, or put a working converter on PATH. "
+        "If conversion is unavailable here, provide mzML or MGF exported on an instrument workstation."
+    )
 
 
 def _msconvert_args(
@@ -55,56 +56,22 @@ def _msconvert_args(
 
 
 def convert_system(
-    input_path: Path, output_path: Path, fmt: str, polarity: str
+    input_path: Path, output_path: Path, fmt: str, polarity: str, executable: str
 ) -> None:
-    """Run msconvert from PATH."""
+    """Run the resolved native msconvert executable with argument-safe paths."""
     subprocess.run(
-        ["msconvert"]
-        + _msconvert_args(
-            input_path, output_path.parent, output_path.name, fmt, polarity
-        ),
+        [executable]
+        + _msconvert_args(input_path, output_path.parent, output_path.name, fmt, polarity),
         check=True,
     )
 
 
-def convert_docker(
-    input_path: Path, output_path: Path, fmt: str, polarity: str
-) -> None:
-    """Run msconvert via Docker, mounting input and output directories."""
-    input_abs = input_path.resolve()
-    output_abs = output_path.resolve()
-    cmd = [
-        _find_binary("docker"),
-        "run",
-        "--rm",
-        "-v",
-        f"{input_abs.parent}:/data/in:ro",
-        "-v",
-        f"{output_abs.parent}:/data/out",
-        DOCKER_IMAGE,
-        "wine",
-        "msconvert",
-    ] + _msconvert_args(
-        Path("/data/in") / input_abs.name,
-        Path("/data/out"),
-        output_abs.name,
-        fmt,
-        polarity,
-    )
-    subprocess.run(cmd, check=True)
-
-
-def convert_raw(input_path: Path, output_path: Path, fmt: str, polarity: str) -> None:
-    """Convert .raw/.d to mzML or MGF via msconvert (system binary or Docker)."""
-    if _find_binary("msconvert"):
-        convert_system(input_path, output_path, fmt, polarity)
-    elif _find_binary("docker"):
-        convert_docker(input_path, output_path, fmt, polarity)
-    else:
-        sys.exit(
-            "Neither msconvert nor docker found. "
-            "Install ProteoWizard or Docker to run conversion."
-        )
+def convert_raw(input_path: Path, output_path: Path, fmt: str, polarity: str,
+                msconvert_bin: str | None = None) -> None:
+    """Convert .raw/.d with an existing native msconvert installation."""
+    executable = _find_msconvert(msconvert_bin)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    convert_system(input_path, output_path, fmt, polarity, executable)
 
 
 def _ionization(spectrum: dict) -> str:
@@ -187,7 +154,7 @@ def convert_to_ms(input_path: Path, output_dir: Path) -> None:
     print(f"Wrote {len(best)} .ms files to {output_dir}", file=sys.stderr)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Convert raw MS files to mzML, MGF, or .ms."
     )
@@ -208,10 +175,14 @@ def main() -> None:
         default="any",
         choices=["any", "positive", "negative"],
         help="Filter scans to one polarity during conversion (default: any, no filtering). "
-        "Required for mixed-mode .raw files — run twice (positive, negative) to get two "
-        "single-polarity mzML files before msms-feature-detect.",
+        "Use positive/negative to split during conversion, or select polarity later "
+        "with msms-feature-detect.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--msconvert-bin",
+        help="Native msconvert executable path or command; otherwise MSCONVERT_BIN, then PATH",
+    )
+    args = parser.parse_args(argv)
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -226,16 +197,18 @@ def main() -> None:
         convert_to_ms(input_path, output_path)
     else:
         if input_path.suffix.lower() in SUPPORTED_CONVERTED:
-            print(f"Already in {fmt} format, passing through: {input_path}")
+            print(f"Input is already converted; passing through: {input_path}")
             print(input_path)
             return
         if input_path.suffix.lower() not in SUPPORTED_RAW:
             sys.exit(f"Unsupported input format: {input_path.suffix}")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        convert_raw(input_path, output_path, fmt, args.polarity.lower())
+        convert_raw(input_path, output_path, fmt, args.polarity.lower(), args.msconvert_bin)
 
     print(output_path)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"Error: {exc}")

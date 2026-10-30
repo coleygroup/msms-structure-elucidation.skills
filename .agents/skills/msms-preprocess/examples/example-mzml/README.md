@@ -1,23 +1,12 @@
 # Example: Convert Thermo .raw to mzML
 
-## Goal
-Convert a Thermo `.raw` file from an LC-MS/MS experiment to mzML.
+Use a native msconvert installation with support for the instrument's raw format. Provide your own input file and executable path:
 
-## Prerequisites
-Docker must be available and the pwiz image pulled:
-```bash
-docker pull proteowizard/pwiz-skyline-i-agree-to-the-vendor-licenses
-```
-
-## Steps
 ```bash
 python .agents/skills/msms-preprocess/scripts/run.py \
-    --input examples/example-mzml/input.raw \
-    --output examples/example-mzml/output.mzML
+    --input /path/to/sample.raw \
+    --output results/sample.mzML \
+    --msconvert-bin /path/to/msconvert
 ```
 
-## Expected Output
-`output.mzML` — standard mzML file readable by pyteomics, pymzml, and all downstream skills.
-
-## TODO
-Add a small representative `.raw` file once data is available. Compare spectrum count and precursor masses against a reference conversion.
+The output is `results/sample.mzML`. Verify that it contains the expected scan counts and precursor masses before downstream analysis. If a suitable converter is unavailable on this host, export mzML on the instrument workstation and use the exported file directly.

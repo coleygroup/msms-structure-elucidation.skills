@@ -2,6 +2,8 @@
 
 Give an AI coding agent an experimental tandem mass spectrum and ask it to investigate possible molecular structures. These skills combine formula evidence, the public ICEBERG PubChem spectral atlas, optional structure prediction, and an interactive fragment viewer. They run with Codex or Claude Code; you can also use the Python command line tools directly.
 
+Use [msms-atlas-retrieval](.agents/skills/msms-atlas-retrieval/SKILL.md) to search the public ICEBERG PubChem atlas, and [msms-predict](.agents/skills/msms-predict/SKILL.md) to predict spectra and fragments from SMILES with GLACIER or ICEBERG.
+
 ## Quick start
 
 Open Codex or Claude Code in your project and type:
@@ -27,7 +29,7 @@ In the demo, the mirror plot opens with all paired collision energies merged. Sw
 | Precursor information | Precursor m/z and adduct, when they are not already in the file. |
 | Helpful context | Instrument, sample context, and a molecular formula or formula list if you have one. |
 
-A formula is optional: supply one or a list, ask for formula hypotheses from the spectrum, or request a [PubChem mass search within a ppm tolerance](docs/technical-guide.md#mass-only-pubchem-option) that skips formula prediction and predicts every matched candidate. With ICEBERG, suitable public atlas spectra can be reused unless you request fresh predictions. GLACIER requires predictions for every candidate because no open GLACIER atlas is currently available. Local model weights are optional for atlas retrieval and required for fresh predictions. Licensed NIST weights are never bundled with these skills.
+A formula is optional: supply one or a list, ask for formula hypotheses from the spectrum, or request a [PubChem mass search within a ppm tolerance](docs/technical-guide.md#mass-only-pubchem-option) that skips formula prediction and predicts every matched candidate. With ICEBERG, prefer suitable public atlas spectra unless you request fresh predictions. The atlas uses ICEBERG 2.1 trained on NIST'23; when local weights differ or matching weights have not been verified, the agent explains that combining their predictions may affect ranking comparability. GLACIER requires predictions for every candidate because no open GLACIER atlas is currently available. Local model weights are optional for atlas retrieval and required for fresh predictions. Licensed NIST weights are never bundled with these skills.
 
 ## What the agent does
 
@@ -44,7 +46,7 @@ The public atlas does not contain licensed NIST structures. A good spectral matc
 - `retrieval.json`, the machine-readable record of formulas, energy conversion, candidate scores, sources, and explicit outcomes such as no atlas coverage or missing model assets.
 - A local review page where candidate decisions and fragment notes are saved to `review_notes.json`. A batch of unknowns can be reviewed together in one page.
 
-The CLI atlas path writes these reports. Direct MCP scoring returns job results; assembling the same viewer package for a full GLACIER or mass-only search currently requires agent orchestration.
+Both the CLI atlas route and `run --mass-only`/`batch --mass-only` write these reports. For a ppm search that skips formula prediction, use `run --input sample.ms --collision-unit NCE --mass-only --ms1-ppm 5 --model glacier --output-dir results/sample` after confirming NCE and the model weights. The MCP `search_pubchem_mass` tool runs the same route on the prediction server; individual `score_candidates` calls return job results for explicit candidate lists.
 
 ## Try the example yourself
 
@@ -53,6 +55,6 @@ The CLI atlas path writes these reports. Direct MCP scoring returns job results;
 3. Open the result URL the agent provides. Select a candidate and energy, click a peak, compare another candidate, and inspect the unexplained peaks.
 4. Add a candidate or fragment note in the local viewer, then tell the agent: **“Please review my saved notes and refine the candidates.”**
 
-For plasma 583, the workflow inferred three formulas and scored 158 public-atlas structures. The demo shows its top 20 candidates with all five energy pairs; the leading candidate has 0.615 entropy similarity and 86.7% explained intensity. Those numbers describe the match to this spectrum, not identification confidence. The same demo also includes CSF and plasma 198. See the [demo provenance and build instructions](demo/README.md) for all three spectra and their energy mapping.
+The demo includes `csf_unknown.ms`, `plasma_unknown_198.ms`, and `plasma_unknown_583.ms`. See the [demo guide](demo/README.md) for the input spectra, energy mapping, saved results and build instructions.
 
 For manual installation, batch processing, model checkpoints, and command line options, see the [technical guide](docs/technical-guide.md). The [scientific workflow](.agents/workflows/msms-elucidation.md) and [skills](.agents/skills) contain the agent procedures.

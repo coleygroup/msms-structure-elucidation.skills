@@ -4,7 +4,7 @@ description: Batch lookup predicted spectra by SMILES from a locally mounted ICE
 ---
 # Local atlas lookup by SMILES
 
-This optional batch path looks up SMILES in a locally mounted, indexed MGF atlas and writes HDF5. It is useful when a licensed private atlas mount is available. The default public PubChem atlas workflow is `msms-retrieval`: it downloads formula MGFs through `https://iceberg-ms.mit.edu/download_mgf` and ranks experimental `.ms` spectra locally with ms-pred. The public endpoint excludes licensed NIST structures.
+This optional batch path looks up SMILES in a locally mounted, indexed MGF atlas and writes HDF5. It is useful when a licensed private atlas mount is available. The default public PubChem atlas workflow is `msms-atlas-retrieval`: it downloads formula MGFs through `https://iceberg-ms.mit.edu/download_mgf` and ranks experimental `.ms` spectra locally with ms-pred. The public endpoint excludes licensed NIST structures.
 
 ```bash
 "${MS_PRED_PYTHON:-python}" .agents/skills/msms-atlas-lookup/scripts/run.py \

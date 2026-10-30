@@ -344,7 +344,7 @@ function renderWorkspace() {
 function renderEmpty() {
   const res = S.result, r = S.index[S.r];
   const cmd = kind => `msms-structure-elucidation review --result ${esc(r.path)} --proposals ${kind} --model iceberg`;
-  const why = {
+  let why = {
     'no-formula': 'MSBuddy proposed no molecular formula and PubChem was not searched. Rerun retrieval without <code>--no-pubchem</code> so formulas of PubChem structures matching the precursor mass are tried.',
     'no-pubchem-formula': 'Neither MSBuddy nor a PubChem mass search found a formula for this precursor. Review the spectrum (adduct, in-source fragment, isotope, noise) and decide whether to generate structures de novo with FRIGID (<code>msms-denovo</code>).',
     'not-in-atlas': `${fhtml(res.formula)} has PubChem structures but no ICEBERG Atlas entry. Predict them with ICEBERG:<br><code>${cmd('pubchem')}</code>`,
@@ -353,9 +353,14 @@ function renderEmpty() {
     'no-candidates': 'Atlas or model predictions were available but none could be compared with this spectrum. Check the formula results below.',
     'blocked-model-assets': 'The ICEBERG Atlas lacks an exact collision energy for this formula, so every atlas structure must be predicted with local ICEBERG, but the ms-pred checkout or checkpoints were not available. Set <code>--ms-pred-dir</code> and the ICEBERG checkpoints (or <code>configs/default.yaml</code>) and rerun retrieval.',
   }[r.outcome] || 'No ranked candidates are available.';
+  if (res.search_mode === 'pubchem-mass') {
+    why = res.status === 'no_candidates'
+      ? 'No eligible PubChem structures matched the selected mass window and filters.'
+      : 'The PubChem mass search or model prediction did not complete. Check the errors and model assets in retrieval.json, then resume the same mass-only search.';
+  }
   const hyps = (res.formula_hypotheses || []).map(h => h.formula).filter(f => f && f !== res.formula);
   $('ws-empty').innerHTML = `<h2>No ranked candidates</h2><p>${why}</p>${formulaResults(res)}
-    ${hyps.length ? `<p>Other formula hypotheses — rerun retrieval with one of them:</p>${hypList(hyps)}` : ''}
+    ${hyps.length ? res.search_mode === 'pubchem-mass' ? `<p>PubChem mass-matched formulas: ${hyps.map(fhtml).join(', ')}</p>` : `<p>Other formula hypotheses — rerun retrieval with one of them:</p>${hypList(hyps)}` : ''}
     ${(res.warnings || []).map(w => `<p class="warn">⚠ ${esc(String(w).split('\n')[0])}</p>`).join('')}`;
 }
 function weightsLabel(checkpoint) {
@@ -704,7 +709,7 @@ function renderEvidence() {
   const model = !String(c.source).startsWith('public');
   const unexplained = sp.exp.map((p, i) => i).filter(i => !sp.e2p.has(i) && sp.exp[i][0] <= sp.precursor + 2 && sp.exp[i][1] / sp.expMax >= 0.03)
     .sort((a, b) => sp.exp[b][1] - sp.exp[a][1]).slice(0, 10);
-  const hyps = (res.formula_hypotheses || []).map(h => h.formula).filter(f => f && f !== res.formula);
+  const hyps = (res.formula_hypotheses || []).map(h => h.formula).filter(f => f && f !== (c.formula || res.formula));
   const pair = sp.pair;
   const energyText = sp.merged
     ? `Merged <b>${pair.input_values.map(v => fmt(v, 0)).join('/')} ${esc(pair.input_unit)}</b> experimental spectra with predictions at <b>${pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV</b>. Peaks within 20 ppm are combined by summed intensity and an intensity-weighted m/z centroid.`
@@ -718,9 +723,10 @@ function renderEvidence() {
     <div class="ev-item"><h3>Provenance</h3>
       <p>${model ? `<b>${esc(modelLabel(c))} prediction</b> at ${esc((c.model_collision_energies_ev || []).join(', '))} eV${c.model_instrument ? ` as ${esc(c.model_instrument)}` : ''}${res.review?.proposal_source === 'pubchem' ? ' for PubChem structures' : res.review?.proposal_source === 'atlas' ? ' for ICEBERG Atlas structures' : ''}` : `<b>ICEBERG Atlas</b> (precomputed ${esc(String(c.source).match(/ICEBERG [\d.]+/)?.[0] || 'ICEBERG')} prediction for a PubChem structure)`}</p>
       ${model && c.model_checkpoint ? `<p class="sub" title="${esc([].concat(c.model_checkpoint).join('\n'))}">Weights: ${esc(weightsLabel(c.model_checkpoint))}${c.ms_pred_version ? ` · ms-pred ${esc(c.ms_pred_version)}` : ''}</p>` : ''}
-      <p>Formula <b>${fhtml(res.formula)}</b> <span class="sub">${esc(res.formula_source || '')}</span></p>
+      <p>Formula <b>${fhtml(c.formula || res.formula)}</b> <span class="sub">${esc(res.formula_source || '')}</span></p>
+      ${c.mass_error_ppm != null ? `<p>Mass error: ${fmt(c.mass_error_ppm, 3)} ppm${c.pubchem_cids?.length ? ` · PubChem CIDs: ${c.pubchem_cids.map(cid => `<a href="https://pubchem.ncbi.nlm.nih.gov/compound/${encodeURIComponent(cid)}" target="_blank" rel="noopener noreferrer">${esc(cid)}</a>`).join(', ')}` : ''}</p>` : ''}
       ${formulaResults(res)}
-      ${hyps.length ? `<p>Other formula hypotheses:</p>${hypList(hyps)}` : ''}</div>
+      ${hyps.length ? res.search_mode === 'pubchem-mass' ? `<p>Other mass-matched formulas in this search: ${hyps.map(fhtml).join(', ')}</p>` : `<p>Other formula hypotheses:</p>${hypList(hyps)}` : ''}</div>
     <div class="ev-item"><h3>Strongest unexplained peaks</h3>
       ${unexplained.length ? `<div class="chips">${unexplained.map(i => `<button class="chip" type="button" data-unexplained="${i}">${sp.exp[i][0].toFixed(3)} · ${(100 * sp.exp[i][1] / sp.expMax).toFixed(0)}%</button>`).join('')}</div>` : '<p class="sub">Every peak above 3% is explained by this candidate.</p>'}</div>
   </div>${(res.warnings || []).filter(w => !(res.candidates.length && String(w).startsWith('No comparable atlas'))).map(w => `<p class="warn">⚠ ${esc(String(w).split('\n')[0].slice(0, 240))}</p>`).join('')}`;

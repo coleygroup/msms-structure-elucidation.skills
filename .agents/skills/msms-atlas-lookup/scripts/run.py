@@ -5,7 +5,7 @@ precomputed ICEBERG spectral atlas (MGF library, keyed by formula + InChIKey).
 
 No model inference — this is a direct file lookup against spectra ICEBERG
 already predicted. Molecules absent from the atlas are recorded as failures
-(run msms-sim-iceberg for those instead).
+(run msms-predict for those instead).
 
 Parallelized over rows (multiprocessing.Pool) and checkpointed by chunk:
 progress is written to --checkpoint-dir as one JSONL file per chunk, so a
@@ -255,7 +255,7 @@ def main() -> None:
 
     atlas_value = args.atlas_dir or os.environ.get('MSMS_PRIVATE_ATLAS_DIR') or cfg.get('models', {}).get('atlas', {}).get('atlas_dir')
     if not atlas_value:
-        raise ValueError('Local atlas path required: pass --atlas-dir or set MSMS_PRIVATE_ATLAS_DIR. For the public HTTP atlas, use msms-retrieval.')
+        raise ValueError('Local atlas path required: pass --atlas-dir or set MSMS_PRIVATE_ATLAS_DIR. For the public HTTP atlas, use msms-atlas-retrieval.')
     atlas_dir = Path(atlas_value).expanduser()
     adduct_subdir = {"[M+H]+": "h_plus_out_mgf", "[M-H]-": "h_minus_out_mgf"}[
         args.adduct

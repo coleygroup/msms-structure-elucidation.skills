@@ -7,6 +7,7 @@ import concurrent.futures
 from collections import Counter
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import shutil
@@ -71,7 +72,8 @@ def worker(python: str, action: str, **kwargs):
             return science.formula_candidates(str(kwargs['spectrum']), kwargs['experimental_unit'],
                 ms1_ppm=float(kwargs.get('ms1_ppm') or 5.0), ms2_ppm=float(kwargs.get('ms2_ppm') or 10.0))
         if action == 'validate':
-            return science.validate_smiles(json.loads(Path(kwargs['smiles_json']).read_text()), kwargs['formula'])
+            return science.validate_smiles(json.loads(Path(kwargs['smiles_json']).read_text()), kwargs['formula'],
+                                           bool(kwargs.get('keep_duplicates')), bool(kwargs.get('strip_stereo')))
         if action == 'atlas-smiles':
             return science.atlas_smiles(str(kwargs['mgf']))
         if action == 'atlas-info':
@@ -145,17 +147,20 @@ def _save(result: dict, out: Path, no_report=False) -> None:
         write_report(result, out / 'report.html')
 
 
-def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str,
+def _simulate_shards(python: str, path: Path, mgf: Path | None, formula: str, unit: str,
                      out: Path, options: dict, instrument: str | None, shard_size: int,
                      top_k: int, smiles: list[str] | None = None) -> tuple[list[dict], int]:
     from msms_structure_elucidation.worker import sort_candidates
     if not options['ms_pred_dir']:
         raise FileNotFoundError('Set --ms-pred-dir or models.simulator.ms_pred_src to an ms-pred checkout for local model inference')
-    if options['model'] != 'iceberg':
+    if mgf is not None and options['model'] != 'iceberg':
         raise ValueError('Atlas energy fallback uses ICEBERG on every atlas structure; set --model iceberg')
-    if not all(options.get(k) and Path(options[k]).is_file() for k in ('gen_checkpoint', 'inten_checkpoint')):
-        raise FileNotFoundError('ICEBERG generation and intensity checkpoints are required for exact-energy fallback. Set them in configs/default.yaml or --gen-checkpoint/--inten-checkpoint; see ms-pred README for public weights.')
+    required = ('checkpoint',) if options['model'] == 'glacier' else ('gen_checkpoint', 'inten_checkpoint')
+    if not all(options.get(k) and Path(options[k]).is_file() for k in required):
+        raise FileNotFoundError(f'{options["model"].upper()} checkpoints are required for prediction. Set them in configs/local.yaml or via CLI; see ms-pred README for public weights.')
     if smiles is None:
+        if mgf is None:
+            raise ValueError('Direct prediction requires a candidate SMILES list')
         smiles = worker(python, 'atlas-smiles', mgf=mgf)
     if not smiles:
         return [], 0
@@ -163,11 +168,11 @@ def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str
     shards.mkdir(parents=True, exist_ok=True)
     leaders = []
     input_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    checkpoint_versions = {k: (str(options[k]), Path(options[k]).stat().st_size, Path(options[k]).stat().st_mtime_ns)
+                           for k in required}
     for start in range(0, len(smiles), shard_size):
         chunk = smiles[start:start + shard_size]
-        checkpoint_versions = {k: (str(options.get(k)), Path(options[k]).stat().st_size, Path(options[k]).stat().st_mtime_ns)
-            for k in ('gen_checkpoint', 'inten_checkpoint') if options.get(k)}
-        signature = hashlib.sha256(json.dumps([chunk, input_hash, unit, instrument,
+        signature = hashlib.sha256(json.dumps([chunk, input_hash, formula, unit, instrument,
             {k: str(options.get(k)) for k in ('model', 'ms_pred_dir')},  # batch size, devices and workers do not change predictions
             checkpoint_versions], sort_keys=True).encode()).hexdigest()[:16]
         saved = shards / f'{start:08d}-{signature}.json'
@@ -179,26 +184,89 @@ def _simulate_shards(python: str, path: Path, mgf: Path, formula: str, unit: str
             if _MODEL_SEMAPHORE is None:
                 candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
                     formula=formula, experimental_unit=unit, output_dir=out,
-                    instrument=instrument, top_k=top_k, limit_images=True, **options)
+                    instrument=instrument, top_k=top_k, limit_images=True,
+                    force_recompute=mgf is None, **options)
             else:
                 with _MODEL_SEMAPHORE:
                     candidates = worker(python, 'simulate', spectrum=path, smiles_json=listing,
                         formula=formula, experimental_unit=unit, output_dir=out,
-                        instrument=instrument, top_k=top_k, limit_images=True, **options)
+                        instrument=instrument, top_k=top_k, limit_images=True,
+                        force_recompute=mgf is None, **options)
+            if len(candidates) != len(chunk):
+                raise RuntimeError(f'{options["model"].upper()} returned {len(candidates)} predictions for {len(chunk)} structures')
+            if mgf is None and {c['smiles'] for c in candidates} != set(chunk):
+                raise RuntimeError('Prediction identities differ from the requested structures; shard was not saved')
             temp = saved.with_suffix('.tmp')
             temp.write_text(json.dumps(candidates, allow_nan=False))
             temp.replace(saved)
+        if len(candidates) != len(chunk):
+            raise RuntimeError(f'Incomplete prediction shard: {saved}')
+        if mgf is None and {c['smiles'] for c in candidates} != set(chunk):
+            raise RuntimeError(f'Prediction identities differ from the requested structures: {saved}')
         leaders = sort_candidates(leaders + candidates)[:top_k]
     return leaders, len(smiles)
 
 
+def _check_search_options(args: argparse.Namespace) -> None:
+    """Reject conflicting mass-only inputs before any lookup or scientific work."""
+    if not getattr(args, 'mass_only', False):
+        return
+    for option in ('formula', 'formulas_file', 'atlas_mgf', 'no_pubchem'):
+        if getattr(args, option, None):
+            raise ValueError('--mass-only cannot be combined with --' + option.replace('_', '-'))
+    ppm = getattr(args, 'ms1_ppm', None)
+    if ppm is not None and (not math.isfinite(ppm) or ppm <= 0):
+        raise ValueError('--ms1-ppm must be positive and finite')
+
+
+def _mass_formula_candidates(python: str, path: Path, group: dict, record: dict, unit: str,
+                             out: Path, options: dict, instrument: str | None, shard_size: int,
+                             top_k: int) -> list[dict]:
+    """Validate a PubChem formula group, preserve aliases, and predict every unique structure."""
+    formula = group['formula']
+    folder = out / 'pubchem_candidates'
+    folder.mkdir(exist_ok=True)
+    listing = folder / f'{formula}.input.json'
+    listing.write_text(json.dumps([row['smiles'] for row in group['candidates']]))
+    checked = worker(python, 'validate', smiles_json=listing, formula=formula,
+                     keep_duplicates=True, strip_stereo=True)
+    by_input = {row['input_smiles']: row for row in checked}
+    requested = {row['smiles'] for row in group['candidates']}
+    if set(by_input) != requested or any(not row['formula_match'] for row in checked):
+        record['rejected_structures'] = [row for row in checked if not row['formula_match']]
+        raise RuntimeError(f'PubChem structures for {formula} failed complete SMILES/formula validation')
+    provenance, model_identities = {}, {}
+    for row in group['candidates']:
+        validated = by_input[row['smiles']]
+        identity = validated.get('model_inchikey') or validated['smiles']
+        canonical = model_identities.setdefault(identity, validated['smiles'])
+        entry = provenance.setdefault(canonical, {**row, 'smiles': canonical,
+            'pubchem_smiles': [], 'pubchem_cids': [], 'pubchem_inchikeys': []})
+        entry['pubchem_smiles'].append(row['smiles'])
+        for key in ('pubchem_cids', 'pubchem_inchikeys'):
+            entry[key] = sorted(set(entry[key]) | set(row[key]))
+    manifest = folder / f'{formula}.json'
+    manifest.write_text(json.dumps(list(provenance.values()), indent=2, allow_nan=False))
+    record.update(candidate_manifest=str(manifest), candidate_structures=len(provenance), scored_structures=0)
+    candidates, count = _simulate_shards(python, path, None, formula, unit, out, options,
+                                        instrument, shard_size, top_k, sorted(provenance))
+    for candidate in candidates:
+        candidate.update({key: value for key, value in provenance[candidate['smiles']].items() if key != 'smiles'})
+    record.update(scored_structures=count, status='ranked' if candidates else 'no_candidates')
+    return candidates
+
+
 def run(args):
+    _check_search_options(args)
+    mass_only = getattr(args, 'mass_only', False)
     path = Path(args.input).expanduser().resolve()
     if path.suffix.lower() != '.ms':
         raise ValueError('Use a .ms spectrum. For raw or mzML input, run the preprocess/feature-detect skills first.')
     data = inspect_ms(path, args.collision_unit)
     config = settings(getattr(args, 'config', None))
     model_options = _model_options(args, config)
+    if not mass_only and model_options['model'] != 'iceberg':
+        raise ValueError('The atlas route uses ICEBERG. Use --mass-only for direct PubChem prediction with GLACIER.')
     top_k = getattr(args, 'top_k', None) or config.get('models', {}).get('retrieval', {}).get('top_k', 10)
     shard_size = getattr(args, 'model_shard_size', None) or config.get('models', {}).get('simulator', {}).get('shard_size', 256)
     if shard_size < 1 or top_k < 1:
@@ -211,7 +279,7 @@ def run(args):
               'energy_mapping': data['energy_mapping'], 'status': 'running',
               'instrument': _instrument(getattr(args, 'instrument', None) or data['metadata'].get('instrumentation') or config.get('models', {}).get('simulator', {}).get('instrument')),
               'formula_results': [], 'config': config['_config_path'],
-              'model_settings': model_options}
+              'model_settings': model_options, 'search_mode': 'pubchem-mass' if mass_only else 'atlas'}
     if data['header_units'] and data['header_units'] != [args.collision_unit]:
         result['warnings'].append(
             f"Collision headers say {', '.join(data['header_units'])}; using user-supplied {args.collision_unit}.")
@@ -224,9 +292,33 @@ def run(args):
         result['warnings'].append(
             f"Instrument not recognised; using Q-TOF mass tolerances ({tolerance['ms1_ppm']:g}/{tolerance['ms2_ppm']:g} ppm). "
             'Pass --instrument or --ms1-ppm/--ms2-ppm (Orbitrap: 5/10).')
-    python = model_python(getattr(args, 'ms_pred_python', None))
+    python_option = (getattr(args, 'ms_pred_python', None) or
+                     asset(config.get('models', {}).get('simulator', {}).get('python'), config))
+    python = None if mass_only else model_python(python_option)
     formulas = []
-    if getattr(args, 'formulas_file', None):
+    mass_groups = {}
+    if mass_only:
+        from msms_structure_elucidation import pubchem
+        result['formula_source'] = 'PubChem mass matches (no formula prediction)'
+        if data['metadata'].get('formula'):
+            result['warnings'].append('Ignoring the input >formula for the mass-only PubChem search.')
+        try:
+            found = pubchem.mass_candidates(data['parentmass'], data['adduct'], tolerance['ms1_ppm'],
+                                            getattr(args, 'formula_elements', None) or 'CHNOPS')
+        except (OSError, ValueError, RuntimeError) as exc:
+            result.update(status='error', pubchem_mass_search={'complete': False, 'error': str(exc)})
+            _save(result, out, args.no_report)
+            raise RuntimeError(f'PubChem mass search failed: {exc} (result: {out / "retrieval.json"})') from exc
+        manifest = out / 'pubchem_candidates.json'
+        manifest.write_text(json.dumps(found, indent=2, allow_nan=False))
+        result['pubchem_mass_search'] = {key: value for key, value in found.items() if key != 'formulas'}
+        result['pubchem_mass_search']['candidate_manifest'] = str(manifest)
+        mass_groups = {group['formula']: group for group in found['formulas']}
+        formulas = list(mass_groups)
+        result['formula_hypotheses'] = [{'formula': group['formula'], 'structures': len(group['candidates']),
+            'ppm': group['candidates'][0]['mass_error_ppm'], 'source': result['formula_source']}
+            for group in found['formulas']]
+    elif getattr(args, 'formulas_file', None):
         formulas = [x.strip() for x in Path(args.formulas_file).read_text().splitlines() if x.strip() and not x.startswith('#')]
         result['formula_source'] = 'user list'
     elif args.formula or data['metadata'].get('formula'):
@@ -246,8 +338,9 @@ def run(args):
     formulas = list(dict.fromkeys(formulas))
     result['formula'] = formulas[0] if formulas else None
     if not formulas:
-        result['status'] = 'needs_formula'
-        result['warnings'].append('No formula available. Supply --formula or --formulas-file, or obtain formula hypotheses from isotope/MS1 evidence. FRIGID also requires a formula.')
+        result['status'] = 'no_candidates' if mass_only else 'needs_formula'
+        result['warnings'].append('No eligible PubChem structures matched the mass window and filters.' if mass_only else
+            'No formula available. Supply --formula or --formulas-file, or obtain formula hypotheses from isotope/MS1 evidence. FRIGID also requires a formula.')
         if result.get('pubchem_formula_search') == 'none':
             result['next_step'] = 'review-frigid'
     candidates = []
@@ -256,6 +349,14 @@ def run(args):
         record = {'formula': formula, 'status': 'running'}
         result['formula_results'].append(record)
         try:
+            if mass_only:
+                record['prediction_source'] = f'local {model_options["model"].upper()}'
+                record['reason'] = 'mass_only_direct_prediction'
+                record['pubchem_structures'] = len(mass_groups[formula]['candidates'])
+                python = python or model_python(python_option)
+                candidates.extend(_mass_formula_candidates(python, path, mass_groups[formula], record,
+                    args.collision_unit, out, model_options, result['instrument'], shard_size, top_k))
+                continue
             if args.atlas_mgf and len(formulas) > 1:
                 raise ValueError('--atlas-mgf can only be used with one formula')
             cache_dir = Path(getattr(args, 'atlas_cache_dir', None) or out / 'atlas').resolve()
@@ -296,11 +397,17 @@ def run(args):
                 record['status'] = 'formula_incompatible'
                 record['reason'] = str(exc)
             else:
-                record['status'] = 'blocked_model_assets' if isinstance(exc, FileNotFoundError) and record.get('reason') in ('no_exact_atlas_energy', 'atlas_lacks_adduct') else 'error'
+                record['status'] = 'blocked_model_assets' if isinstance(exc, FileNotFoundError) and record.get('reason') in ('no_exact_atlas_energy', 'atlas_lacks_adduct', 'mass_only_direct_prediction') else 'error'
                 record['error'] = str(exc)
                 operational_error = exc
                 break
     from msms_structure_elucidation.worker import sort_candidates
+    if mass_only and operational_error:
+        attempted = {row['formula'] for row in result['formula_results']}
+        result['formula_results'].extend({'formula': formula, 'status': 'not_processed',
+            'candidate_structures': len(mass_groups[formula]['candidates']),
+            'reason': 'A previous formula failed; resume after resolving the error.'}
+            for formula in formulas if formula not in attempted)
     result['candidates'] = sort_candidates(candidates)[:top_k]
     if result['candidates']:
         best = result['candidates'][0]
@@ -324,7 +431,10 @@ def run(args):
     result['status'] = ('blocked_model_assets' if operational_error and any(r['status'] == 'blocked_model_assets' for r in result['formula_results']) else
         'error' if operational_error else 'ranked' if candidates else
         result['status'] if result['status'] == 'needs_formula' else 'no_atlas_coverage' if
-        all(r['status'] == 'no_atlas_coverage' for r in result['formula_results']) else 'no_candidates')
+        not mass_only and all(r['status'] == 'no_atlas_coverage' for r in result['formula_results']) else 'no_candidates')
+    if mass_only:
+        result['prediction_complete'] = not operational_error
+        result['scored_structures'] = sum(r.get('scored_structures', 0) for r in result['formula_results'])
     if result['status'] == 'no_atlas_coverage':
         result['next_step'] = 'iceberg-pubchem'
         result['warnings'].append(
@@ -485,7 +595,7 @@ def _batch_feature(key, row, context: dict) -> dict:
         old = json.loads((target / 'batch_state.json').read_text()) if (target / 'batch_state.json').exists() else {}
     except (OSError, ValueError):
         old = {}
-    formula = row.get('formula') or None
+    formula = None if getattr(args, 'mass_only', False) else row.get('formula') or None
     unit = row.get('collision_unit') or args.collision_unit
     if not unit:
         return {'feature_id': feature, 'status': 'needs_energy_unit', 'output_dir': str(target)}
@@ -499,7 +609,9 @@ def _batch_feature(key, row, context: dict) -> dict:
     file_hash = digest.hexdigest()
     signature = hashlib.sha256(json.dumps([file_hash, unit, formula,
         formula_list_hash, config_hash, asset_versions, args.model, args.ms_pred_dir,
-        args.instrument, args.cuda_devices, args.top_k, args.atlas_url], sort_keys=True).encode()).hexdigest()
+        row.get('instrument') or args.instrument, args.cuda_devices, args.top_k, args.atlas_url,
+        {key: getattr(args, key, None) for key in ('mass_only', 'ms1_ppm', 'ms2_ppm', 'formula_elements', 'no_pubchem')}],
+        sort_keys=True).encode()).hexdigest()
     if old.get('signature') == signature and (target / 'retrieval.json').is_file():
         previous = json.loads((target / 'retrieval.json').read_text())
         if previous.get('status') in ('ranked', 'needs_formula', 'no_atlas_coverage', 'no_candidates'):
@@ -512,7 +624,8 @@ def _batch_feature(key, row, context: dict) -> dict:
         model_batch_size=args.model_batch_size, model_shard_size=args.model_shard_size,
         model_cpu_workers=args.model_cpu_workers, model_gpu_workers=args.model_gpu_workers,
         atlas_mgf=None, atlas_cache_dir=str(cache), atlas_url=args.atlas_url,
-        top_k=args.top_k, no_report=args.no_report)
+        top_k=args.top_k, no_report=args.no_report,
+        **{key: getattr(args, key, None) for key in ('mass_only', 'ms1_ppm', 'ms2_ppm', 'formula_elements', 'no_pubchem')})
     try:
         run(opts)
         status = json.loads((target / 'retrieval.json').read_text())['status']
@@ -530,10 +643,13 @@ def _batch_worker_init(model_semaphore) -> None:
 
 
 def batch(args):
+    _check_search_options(args)
     config = settings(args.config)
     config_hash = config['_config_digest']
     formula_list_hash = hashlib.sha256(Path(args.formulas_file).read_bytes()).hexdigest() if args.formulas_file else None
     model_options = _model_options(args, config)
+    if not getattr(args, 'mass_only', False) and model_options['model'] != 'iceberg':
+        raise ValueError('The atlas route uses ICEBERG. Use --mass-only for direct PubChem prediction with GLACIER.')
     asset_versions = {key: (model_options[key], Path(model_options[key]).stat().st_size,
         Path(model_options[key]).stat().st_mtime_ns) for key in ('checkpoint', 'gen_checkpoint', 'inten_checkpoint')
         if model_options.get(key) and Path(model_options[key]).is_file()}
@@ -761,10 +877,24 @@ def mcp_config_command(args):
     return 0
 
 
+def _search_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the shared candidate-source and mass-tolerance options to run and batch."""
+    parser.add_argument('--mass-only', action='store_true',
+                        help='search all eligible PubChem mass matches, skip formula prediction and atlas retrieval, and predict every candidate')
+    parser.add_argument('--ms1-ppm', type=float,
+                        help='positive precursor/neutral-mass search tolerance in ppm (Q-TOF 10, Orbitrap 5 by default)')
+    parser.add_argument('--ms2-ppm', type=float,
+                        help='fragment tolerance for MSBuddy; unused with --mass-only')
+    parser.add_argument('--formula-elements', default='CHNOPS',
+                        help='elements allowed in PubChem mass matches (default CHNOPS)')
+    parser.add_argument('--no-pubchem', action='store_true',
+                        help='disable the PubChem fallback after MSBuddy; incompatible with --mass-only')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='msms-structure-elucidation')
     sub = parser.add_subparsers(dest='command', required=True)
-    command = sub.add_parser('run', help='rank public atlas candidates for a .ms spectrum')
+    command = sub.add_parser('run', help='rank atlas candidates or predict all PubChem mass matches for a .ms spectrum')
     command.add_argument('--input', required=True)
     command.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'],
                          help='user-confirmed unit of all experimental collision labels')
@@ -776,7 +906,8 @@ def main(argv=None):
     command.add_argument('--config', help='shared YAML settings (default configs/default.yaml)')
     command.add_argument('--instrument', help='model instrument; otherwise .ms >instrumentation, then config')
     command.add_argument('--cuda-devices', help='GPU IDs, for example 0; or MSMS_CUDA_DEVICES')
-    command.add_argument('--model', choices=['iceberg'], default=None, help='exact-energy atlas fallback')
+    command.add_argument('--model', choices=['iceberg', 'glacier'], default=None,
+                         help='prediction model; GLACIER requires --mass-only')
     command.add_argument('--checkpoint')
     command.add_argument('--gen-checkpoint')
     command.add_argument('--inten-checkpoint')
@@ -789,15 +920,7 @@ def main(argv=None):
     command.add_argument('--atlas-url')
     command.add_argument('--top-k', type=int)
     command.add_argument('--no-report', action='store_true')
-    command.add_argument('--ms1-ppm', type=float,
-                         help='precursor tolerance for MSBuddy and the PubChem fallback '
-                              '(default from the instrument: Q-TOF 10, Orbitrap 5 ppm)')
-    command.add_argument('--ms2-ppm', type=float,
-                         help='fragment tolerance for MSBuddy (default: Q-TOF 20, Orbitrap 10 ppm)')
-    command.add_argument('--formula-elements', default='CHNOPS',
-                         help='elements allowed in PubChem fallback formulas (default CHNOPS)')
-    command.add_argument('--no-pubchem', action='store_true',
-                         help='do not search PubChem by mass when MSBuddy proposes no formula')
+    _search_arguments(command)
     reviewer = sub.add_parser('review', help='validate candidate SMILES and rerank via atlas or a local model')
     reviewer.add_argument('--result', required=True, help='retrieval.json from run')
     proposal_source = reviewer.add_mutually_exclusive_group(required=True)
@@ -848,7 +971,7 @@ def main(argv=None):
     batcher.add_argument('--config')
     batcher.add_argument('--instrument')
     batcher.add_argument('--cuda-devices')
-    batcher.add_argument('--model', choices=['iceberg'])
+    batcher.add_argument('--model', choices=['iceberg', 'glacier'])
     batcher.add_argument('--checkpoint')
     batcher.add_argument('--gen-checkpoint')
     batcher.add_argument('--inten-checkpoint')
@@ -858,6 +981,7 @@ def main(argv=None):
     batcher.add_argument('--model-shard-size', type=int)
     batcher.add_argument('--atlas-url')
     batcher.add_argument('--top-k', type=int)
+    _search_arguments(batcher)
     batcher.add_argument('--max-workers', type=int,
                          help='features processed at once (default: models.batch.max_workers, or auto from CPU threads and RAM)')
     batcher.add_argument('--max-model-jobs', type=int)

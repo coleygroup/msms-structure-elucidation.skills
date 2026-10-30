@@ -6,7 +6,7 @@ Query the public ICEBERG PubChem atlas with an experimental `.ms` spectrum and r
 ## Steps
 ```bash
 # Confirm collision units with the spectrum provider before running.
-python .agents/skills/msms-retrieval/scripts/run.py \
+python .agents/skills/msms-atlas-retrieval/scripts/run.py \
     --spectrum /path/to/sample.ms \
     --collision-unit NCE \
     --top-k 10 \

@@ -237,7 +237,8 @@ def client_result(result: dict, top_k: int | None = None, max_exp_peaks: int | N
     keep = ('smiles', 'canonical_smiles', 'inchikey', 'formula', 'source', 'entropy_similarity',
             'explained_intensity', 'energy_alignment', 'matched_peaks', 'review_key', 'rank', 'ambiguity',
             'model_collision_energies_ev', 'model_instrument', 'model_name', 'model_version',
-            'ms_pred_version', 'model_checkpoint')
+            'ms_pred_version', 'model_checkpoint', 'pubchem_cids', 'pubchem_inchikeys', 'pubchem_smiles',
+            'mass_error_ppm', 'monoisotopic_mass')
     candidates = []
     for candidate in result['candidates'][:top_k]:
         ces = [a.get('prediction_key') or a['atlas_key'] for a in candidate.get('energy_alignment', [])]
@@ -256,7 +257,8 @@ def client_result(result: dict, top_k: int | None = None, max_exp_peaks: int | N
             spectra[ce] = [p for p in peaks if tuple(p) in top or (ce, round(float(p[0]), 5)) in matched]
     fields = ('input', 'parentmass', 'adduct', 'peaks', 'formula', 'formula_source', 'formula_hypotheses',
               'collision_unit', 'energy_mapping', 'warnings', 'library_structures', 'review_evidence', 'review',
-              'next_step', 'status', 'formula_results', 'instrument', 'mass_tolerance')
+              'next_step', 'status', 'formula_results', 'instrument', 'mass_tolerance',
+              'search_mode', 'pubchem_mass_search', 'prediction_complete', 'scored_structures')
     return {**{k: result[k] for k in fields if k in result}, 'spectra': spectra, 'candidates': candidates}
 
 

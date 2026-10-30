@@ -6,7 +6,7 @@ Predict the MS/MS spectrum of 2-aminoethyl benzoate (`c1ccccc1C(=O)OCCN`) at CE=
 ## Steps
 ```bash
 # Env: simulator-iceberg
-python .agents/skills/msms-sim-iceberg/examples/example-2-aminoethyl-benzoate/run_example.py \
+python .agents/skills/msms-predict/examples/example-2-aminoethyl-benzoate/run_example.py \
     --gen_ckpt downloads/iceberg_dag_gen_msg_best.ckpt \
     --inten_ckpt downloads/iceberg_dag_inten_msg_best.ckpt
 ```

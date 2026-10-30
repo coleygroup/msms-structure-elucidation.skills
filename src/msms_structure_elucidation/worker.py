@@ -294,7 +294,9 @@ def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: in
             raise RuntimeError(f'MSBuddy formula inference failed: {exc}. Supply --formula.') from exc
 
 
-def validate_smiles(smiles: list[str], formula: str) -> list[dict]:
+def validate_smiles(smiles: list[str], formula: str, keep_duplicates: bool = False,
+                    strip_stereo: bool = False) -> list[dict]:
+    """Validate formulas and canonicalize structures, optionally retaining aliases for provenance."""
     from rdkit import Chem
     from rdkit.Chem import rdMolDescriptors
     out = []
@@ -302,20 +304,23 @@ def validate_smiles(smiles: list[str], formula: str) -> list[dict]:
     for entry in smiles:
         mol = Chem.MolFromSmiles(entry)
         if mol is None:
-            out.append({'smiles': entry, 'formula': None, 'formula_match': False,
+            out.append({'smiles': entry, 'input_smiles': entry, 'formula': None, 'formula_match': False,
                         'invalid_smiles': True})
             continue
+        if strip_stereo:
+            Chem.RemoveStereochemistry(mol)
         canonical = Chem.MolToSmiles(mol)
-        if canonical in seen:
+        if canonical in seen and not keep_duplicates:
             continue
         seen.add(canonical)
         found = rdMolDescriptors.CalcMolFormula(mol)
         try:  # connectivity block of the InChIKey: matches atlas entries stored without stereochemistry
-            connectivity = Chem.MolToInchiKey(mol)[:14] or None
+            inchikey = Chem.MolToInchiKey(mol) or None
         except Exception:
-            connectivity = None
-        out.append({'smiles': canonical, 'formula': found, 'formula_match': found == formula,
-                    'connectivity': connectivity})
+            inchikey = None
+        out.append({'smiles': canonical, 'input_smiles': entry, 'formula': found, 'formula_match': found == formula,
+                    'connectivity': inchikey[:14] if inchikey else None,
+                    **({'model_inchikey': inchikey} if strip_stereo else {})})
     return out
 
 
@@ -397,7 +402,7 @@ def _require_cuda(cuda_devices: str | None) -> None:
 def _run_model(smiles: list[str], energies: list, nce: bool, adduct: str, model: str,
                checkpoint: str | None, gen_checkpoint: str | None, inten_checkpoint: str | None,
                instrument: str | None, cuda_devices: str | None, batch_size: int,
-               num_cpu_workers: int, num_gpu_workers: int) -> Path:
+               num_cpu_workers: int, num_gpu_workers: int, force_recompute: bool = False) -> Path:
     """Run GLACIER or ICEBERG on SMILES and return the directory holding preds*.hdf5."""
     _require_cuda(cuda_devices)
     if model == 'glacier':
@@ -408,7 +413,7 @@ def _run_model(smiles: list[str], energies: list, nce: bool, adduct: str, model:
         prediction = glacier_prediction(candidate_smiles=smiles, collision_energies=energies,
             nce=nce, adduct=adduct, instrument=instrument, python_path=sys.executable, ckpt=checkpoint,
             cuda_devices=cuda_devices, num_gpu_workers=1,  # >1 shards GLACIER output across GPUs
-            num_cpu_workers=num_cpu_workers, batch_size=batch_size)
+            num_cpu_workers=num_cpu_workers, batch_size=batch_size, force_recompute=force_recompute)
     else:
         if not gen_checkpoint or not inten_checkpoint or not Path(gen_checkpoint).is_file() or not Path(inten_checkpoint).is_file():
             raise FileNotFoundError('ICEBERG generation and intensity checkpoints required; see ms-pred README for public MassSpecGym weights')
@@ -416,6 +421,7 @@ def _run_model(smiles: list[str], energies: list, nce: bool, adduct: str, model:
         prediction = iceberg_prediction(candidate_smiles=smiles, collision_energies=energies,
             nce=nce, adduct=adduct, instrument=instrument, python_path=sys.executable, gen_ckpt=gen_checkpoint,
             inten_ckpt=inten_checkpoint, cuda_devices=cuda_devices, num_gpu_workers=num_gpu_workers,
+            force_recompute=force_recompute,
             num_cpu_workers=num_cpu_workers, batch_size=batch_size)
     save_dir = Path(prediction[0])
     marker = save_dir / f'{model}_run_successful'
@@ -466,7 +472,7 @@ def predict(smiles: list[str], collision_energies: list[float], collision_unit: 
             model: str, checkpoint: str | None, gen_checkpoint: str | None,
             inten_checkpoint: str | None, instrument: str | None = None,
             cuda_devices: str | None = None, batch_size: int = 1, num_cpu_workers: int = 1,
-            num_gpu_workers: int = 1, fragments: bool = False) -> list[dict]:
+            num_gpu_workers: int = 1, fragments: bool = False, force_recompute: bool = False) -> list[dict]:
     """Forward-predict spectra and fragment IDs for SMILES, without an experimental spectrum."""
     if collision_unit not in ('NCE', 'eV'):
         raise ValueError('collision_unit must be NCE or eV')
@@ -476,7 +482,7 @@ def predict(smiles: list[str], collision_energies: list[float], collision_unit: 
     collision_energies = [int(value) if float(value).is_integer() else float(value) for value in collision_energies]
     save_dir = _run_model(smiles, collision_energies, collision_unit == 'NCE', adduct, model,
         checkpoint, gen_checkpoint, inten_checkpoint, instrument, cuda_devices, batch_size,
-        num_cpu_workers, num_gpu_workers)
+        num_cpu_workers, num_gpu_workers, force_recompute)
     from ms_pred import common
     model_version, ms_pred_version = _model_versions(model)
     pred_db = common.PredSpecDB(save_dir / 'preds.hdf5')
@@ -504,8 +510,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
              experimental_unit: str, instrument: str | None = None,
              cuda_devices: str | None = None, batch_size: int = 1,
              num_cpu_workers: int = 1, num_gpu_workers: int = 1,
-             top_k: int | None = None) -> list[dict]:
-    """Run ms-pred only for structures unavailable in the precomputed atlas.
+             top_k: int | None = None, force_recompute: bool = False) -> list[dict]:
+    """Predict supplied structures with ms-pred and score every experimental energy.
 
     With top_k, structure images are drawn only where a merged top_k list can reach: results
     are ranked by entropy similarity."""
@@ -513,7 +519,7 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
     model_energies = model_collision_energies_ev(experimental)
     save_dir = _run_model(smiles, model_energies, False, metadata.get('ionization', '[M+H]+'), model,
         checkpoint, gen_checkpoint, inten_checkpoint, instrument, cuda_devices, batch_size,
-        num_cpu_workers, num_gpu_workers)
+        num_cpu_workers, num_gpu_workers, force_recompute)
     from ms_pred import common
     model_version, ms_pred_version = _model_versions(model)
     pred_db = common.PredSpecDB(save_dir / 'preds.hdf5')
@@ -557,6 +563,9 @@ def main():
     parser.add_argument('--formula')
     parser.add_argument('--top-k', type=int, default=10)
     parser.add_argument('--limit-images', action='store_true', help='simulate: draw structures for --top-k only')
+    parser.add_argument('--keep-duplicates', action='store_true', help='validate: retain canonical aliases for provenance')
+    parser.add_argument('--strip-stereo', action='store_true', help='validate: use the models\' stereo-free structures')
+    parser.add_argument('--force-recompute', action='store_true', help='predict/simulate: bypass ms-pred\'s internal prediction cache')
     parser.add_argument('--smiles-json')
     parser.add_argument('--model', choices=['glacier', 'iceberg'], default='glacier')
     parser.add_argument('--checkpoint')
@@ -590,7 +599,8 @@ def main():
         result = formula_candidates(args.spectrum, args.experimental_unit,
                                     ms1_ppm=args.ms1_ppm, ms2_ppm=args.ms2_ppm)
     elif args.action == 'validate':
-        result = validate_smiles(json.loads(Path(args.smiles_json).read_text()), args.formula)
+        result = validate_smiles(json.loads(Path(args.smiles_json).read_text()), args.formula,
+                                 args.keep_duplicates, args.strip_stereo)
     elif args.action == 'predict':
         if not args.collision_energies or not args.collision_unit:
             parser.error('predict requires --collision-energies and --collision-unit')
@@ -598,13 +608,14 @@ def main():
             [float(value) for value in args.collision_energies.split(',')], args.collision_unit,
             args.adduct, args.model, args.checkpoint, args.gen_checkpoint, args.inten_checkpoint,
             args.instrument, args.cuda_devices, args.batch_size, args.num_cpu_workers, args.num_gpu_workers,
-            args.fragments)
+            args.fragments, args.force_recompute)
     else:
         result = simulate(args.spectrum, json.loads(Path(args.smiles_json).read_text()),
             args.formula, args.model, args.checkpoint, args.gen_checkpoint,
             args.inten_checkpoint, args.output_dir, args.experimental_unit,
             args.instrument, args.cuda_devices, args.batch_size,
-            args.num_cpu_workers, args.num_gpu_workers, args.top_k if args.limit_images else None)
+            args.num_cpu_workers, args.num_gpu_workers, args.top_k if args.limit_images else None,
+            args.force_recompute)
     print('RESULT_JSON=' + json.dumps(result, allow_nan=False))
 
 if __name__ == '__main__':

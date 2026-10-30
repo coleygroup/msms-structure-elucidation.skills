@@ -63,6 +63,22 @@ vm.runInContext('S.pairIdx = 0;', context);
 assert.equal(vm.runInContext('spectraFor(cand()).merged', context), false);
 assert.equal(vm.runInContext('spectraFor(cand()).key', context), '10');
 
+elements.evidence = { innerHTML: '' };
+result.search_mode = 'pubchem-mass';
+result.formula = 'C2H6O';
+result.formula_source = 'PubChem mass matches (no formula prediction)';
+result.formula_hypotheses = [{ formula: 'C2H6O' }, { formula: 'C3H8' }];
+Object.assign(result.candidates[0], {
+  formula: 'C3H8', source: 'GLACIER', model_name: 'GLACIER',
+  mass_error_ppm: -2.5, pubchem_cids: [123, 456],
+});
+vm.runInContext('renderEvidence()', context);
+assert.match(elements.evidence.innerHTML, /Formula <b>C<sub>3<\/sub>H<sub>8<\/sub><\/b>/);
+assert.match(elements.evidence.innerHTML, /Mass error: -2\.500 ppm/);
+assert.match(elements.evidence.innerHTML, /compound\/123/);
+assert.match(elements.evidence.innerHTML, /Other mass-matched formulas in this search/);
+assert.doesNotMatch(elements.evidence.innerHTML, /rerun retrieval/);
+
 const snapshot = JSON.parse(zlib.gunzipSync(fs.readFileSync(path.join(
   root, 'demo/msms-structure-elucidation/source.json.gz'))));
 for (const row of snapshot.results) {

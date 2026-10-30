@@ -157,8 +157,9 @@ async def server_info() -> dict:
     config = runtime['config']
     models = {task: {'ready': not missing, 'missing': missing}
               for task in tasks.KINDS for missing in [tasks.missing_assets(task, config)]}
-    models['predict_spectra(glacier)'] = {'ready': not tasks.missing_assets('predict_spectra', config, model='glacier'),
-                                          'missing': tasks.missing_assets('predict_spectra', config, model='glacier')}
+    for task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass'):
+        missing = tasks.missing_assets(task, config, model='glacier')
+        models[f'{task}(glacier)'] = {'ready': not missing, 'missing': missing}
     return {**await asyncio.to_thread(runtime['backend'].describe), 'job_root': str(runtime['store'].root),
             'config': config.get('_local_config_path') or config['_config_path'], 'models': models,
             'collision_energy_rule': 'Ask the user whether energies are NCE or eV before any model call.'}
@@ -215,6 +216,25 @@ async def retrieve_atlas(
     params = {'collision_unit': collision_unit, 'formula': formula, 'instrument': instrument, 'top_k': top_k}
     inputs = _spectrum_inputs(params, spectrum_ms, spectrum_path, collision_unit)
     return await _submit('retrieve_atlas', params, inputs, wait_seconds, ctx)
+
+
+@tool
+async def search_pubchem_mass(
+        ctx: Context,
+        collision_unit: Unit, model: Model,
+        ppm: Annotated[float, Field(gt=0, allow_inf_nan=False, description='Mass tolerance in ppm about the adduct-corrected neutral monoisotopic mass')],
+        spectrum_ms: SpectrumText = None, spectrum_path: SpectrumPath = None,
+        elements: Annotated[str, Field(pattern=r'^(?:[A-Z][a-z]?)+$', description='Allowed elements; default CHNOPS')] = 'CHNOPS',
+        instrument: Annotated[str | None, Field(description='Instrument; default from spectrum or config')] = None,
+        top_k: Annotated[int, Field(ge=1)] = 10,
+        shard_size: Annotated[int | None, Field(ge=1, description='Candidate structures per resumable prediction shard')] = None,
+        wait_seconds: Wait = None) -> dict:
+    """Search every eligible PubChem mass match, skip formula prediction and atlas retrieval, predict all candidates and rank across formulas."""
+    _require('search_pubchem_mass', model=model)
+    params = {'collision_unit': collision_unit, 'model': model, 'ppm': ppm, 'elements': elements,
+              'instrument': instrument, 'top_k': top_k, 'shard_size': shard_size}
+    inputs = _spectrum_inputs(params, spectrum_ms, spectrum_path, collision_unit)
+    return await _submit('search_pubchem_mass', params, inputs, wait_seconds, ctx)
 
 
 @tool

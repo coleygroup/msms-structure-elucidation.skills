@@ -6,7 +6,7 @@ Runs inference, saves fragment SMILES assignments, and plots the predicted spect
 
 Usage:
     # Env: simulator-iceberg
-    python .agents/skills/msms-sim-iceberg/scripts/predict_msms.py \
+    python .agents/skills/msms-predict/scripts/predict_iceberg.py \
         --smiles "c1ccccc1C(=O)OCCN" \
         --gen_ckpt downloads/iceberg_dag_gen_msg_best.ckpt \
         --inten_ckpt downloads/iceberg_dag_inten_msg_best.ckpt \
