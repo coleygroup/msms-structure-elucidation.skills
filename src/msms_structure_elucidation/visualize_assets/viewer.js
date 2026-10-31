@@ -5,7 +5,8 @@ const DEMO = () => Boolean(STATIC && STATIC.demo_reviews);  // exported page who
 const READONLY = () => Boolean(STATIC && !STATIC.demo_reviews);
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const fmt = (v, d) => (v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d));
+const fmt = (v, d) => (Array.isArray(v) ? v.map(x => fmt(x, d)).join('/') : v == null || Number.isNaN(Number(v)) ? '—' : Number(v).toFixed(d));
+const energyLabel = p => `${p.acquisition_mode === 'stepped' ? 'stepped ' : ''}${fmt(p.input_values ?? p.input_value, 0)}`;
 const pct = v => (v == null ? '—' : `${(100 * Number(v)).toFixed(0)}%`);
 const OUTCOME = { atlas: 'ICEBERG Atlas', model: 'Model prediction', 'no-energy-pair': 'No exact Atlas energy',
   'not-in-atlas': 'Not in ICEBERG Atlas', 'atlas-failed': 'Atlas retrieval failed', 'no-formula': 'No formula',
@@ -335,7 +336,7 @@ function renderWorkspace() {
   const energies = (res.energy_mapping || []).map(m => `${fmt(m.input_value, 0)} ${esc(m.input_unit)}`).join(', ');
   $('ws-meta').innerHTML = [`m/z <b>${fmt(res.parentmass, 4)}</b>`, r.rt_min != null ? `RT <b>${fmt(r.rt_min, 2)} min</b>` : '',
     `${esc(res.adduct || '')}`, res.formula ? `<b>${fhtml(res.formula)}</b> <span class="sub">${esc(res.formula_source || '')}</span>` : 'no formula',
-    energies ? `collision <b>${energies}</b>` : '', `<span class="chip"><span class="outcome-ico ${has ? r.outcome : 'none'}"></span>${esc(outcomeLabel(r))}</span>`]
+    energies ? `collision <b>${res.acquisition_mode === 'stepped' ? 'stepped ' : ''}${energies}</b>` : '', `<span class="chip"><span class="outcome-ico ${has ? r.outcome : 'none'}"></span>${esc(outcomeLabel(r))}</span>`]
     .filter(Boolean).map(x => `<span>${x}</span>`).join('');
   $('ws-grid').hidden = !has; $('verdict').hidden = !has; $('ws-empty').hidden = has;
   if (!has) { renderEmpty(); return; }
@@ -401,8 +402,8 @@ function renderRail() {
 function renderEnergy() {
   const c = cand(), sel = $('energy');
   const align = c.energy_alignment || [];
-  const merged = align.length > 1 ? `<option value="-1">Merged all energies · ${align.map(a => fmt(a.input_value, 0)).join('/')} ${esc(align[0].input_unit)} ↔ ${[...new Set(align.map(a => fmt(a.model_energy_ev ?? a.atlas_ev, 0)))].join('/')} eV</option>` : '';
-  sel.innerHTML = merged + align.map((a, i) => `<option value="${i}">${fmt(a.input_value, 0)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}</option>`).join('');
+  const merged = align.length > 1 ? `<option value="-1">Merged all energies · ${align.map(a => energyLabel(a)).join('/')} ${esc(align[0].input_unit)} ↔ ${[...new Set(align.map(a => fmt(a.model_energies_ev ?? a.model_energy_ev ?? a.atlas_ev, 0)))].join('/')} eV</option>` : '';
+  sel.innerHTML = merged + align.map((a, i) => `<option value="${i}">${energyLabel(a)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energies_ev ?? a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}</option>`).join('');
   sel.value = String(S.pairIdx === -1 && align.length > 1 ? -1 : Math.max(0, Math.min(S.pairIdx, align.length - 1)));
   sel.disabled = align.length < 2;
   $('compare').setAttribute('aria-pressed', String(S.compare != null));
@@ -487,9 +488,9 @@ function drawMirror(el, k, compact) {
   }
   s += `<line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${mid}" y2="${mid}"/>`;
   const expLabel = sp.merged ? `merged ${sp.pair.input_values.map(v => fmt(v, 0)).join('/')} ${esc(sp.pair.input_unit)}`
-    : `${fmt(sp.pair.input_value, 0)} ${esc(sp.pair.input_unit)}`;
+    : `${energyLabel(sp.pair)} ${esc(sp.pair.input_unit)}`;
   const predLabel = sp.merged ? `merged ${sp.pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV · overall similarity ${fmt(c.entropy_similarity, 3)}`
-    : `${fmt(sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}`;
+    : `${fmt(sp.pair.model_energies_ev ?? sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}`;
   s += `<text class="side-label" x="${m.l + 6}" y="${m.t + 10}">Experimental · ${expLabel}</text>`;
   s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${predLabel}</text>`;
   s += '</svg>';
@@ -713,7 +714,8 @@ function renderEvidence() {
   const pair = sp.pair;
   const energyText = sp.merged
     ? `Merged <b>${pair.input_values.map(v => fmt(v, 0)).join('/')} ${esc(pair.input_unit)}</b> experimental spectra with predictions at <b>${pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV</b>. Peaks within 20 ppm are combined by summed intensity and an intensity-weighted m/z centroid.`
-    : `Experimental <b>${fmt(pair.input_value, 0)} ${esc(pair.input_unit)}</b> paired with the prediction at <b>${fmt(pair.model_energy_ev ?? pair.atlas_ev, 0)} eV</b>${pair.delta_ev != null ? ` (Δ ${fmt(pair.delta_ev, 1)} eV)` : ''}`;
+    : pair.acquisition_mode === 'stepped' ? `Measured <b>${energyLabel(pair)} ${esc(pair.input_unit)}</b> compared once with a prediction summed across <b>${fmt(pair.model_energies_ev, 0)} eV</b> and normalized after merging.`
+    : `Experimental <b>${energyLabel(pair)} ${esc(pair.input_unit)}</b> paired with the prediction at <b>${fmt(pair.model_energies_ev ?? pair.model_energy_ev ?? pair.atlas_ev, 0)} eV</b>${pair.delta_ev != null ? ` (Δ ${fmt(pair.delta_ev, 1)} eV)` : ''}`;
   $('evidence').innerHTML = `<div class="ev-grid">
     <div class="ev-item"><h3>Match</h3>
       <p>${sp.merged ? 'Overall ' : ''}entropy similarity <b>${fmt(pair.entropy_similarity ?? c.entropy_similarity, 3)}</b> · explained intensity <b>${pct(c.explained_intensity)}</b></p>

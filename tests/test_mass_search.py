@@ -148,7 +148,8 @@ class MassWorkflowTests(unittest.TestCase):
             return [{'smiles': s, 'formula': kwargs['formula'], 'source': kwargs['model'].upper(),
                      'model_name': kwargs['model'].upper(), 'model_checkpoint': kwargs['checkpoint'],
                      'entropy_similarity': len(s)/10, 'explained_intensity': 0.5, 'matched_peaks': [],
-                     'energy_alignment': [{'experimental_key': str(ce), 'input_value': ce} for ce in (20.0, 40.0)],
+                     'energy_alignment': [{'experimental_key': str(ce), 'input_value': ce,
+                                           'prediction_key': str(int(ce))} for ce in (20.0, 40.0)],
                      'predicted_spectra': {'20': [[50, 1]], '40': [[60, 1]]}}
                     for s in listing]
         return run

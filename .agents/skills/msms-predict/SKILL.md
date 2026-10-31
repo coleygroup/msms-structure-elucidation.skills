@@ -13,11 +13,21 @@ Use this skill to predict spectra and fragments for known candidate SMILES. Read
 
 The public atlas uses ICEBERG 2.1 trained on NIST'23. If local ICEBERG weights differ or matching weights have not been verified, tell the user that combining their predictions may affect ranking comparability, prefer suitable atlas spectra, and identify the local checkpoint. Use `msms-atlas-retrieval` to rank experimental spectra through the atlas or a mass-only PubChem search, and `msms-structure-proposal` for proposed candidates.
 
+## Collision-energy handling
+
+For supplied raw/mzML data, first inspect acquisition metadata yourself using `msms-structure-elucidation inspect-energy --input sample.mzML` and available vendor method/scan records. Use explicit, consistent settings and units for the relevant MS2 scans; ask the user only when they remain unresolved or conflict. Follow [collision-energy handling](../../../docs/collision-energy.md) and save the verified setting with its source/input context.
+
+Distinguish three separate spectra from one stepped acquisition. For a single 20/40/60 stepped-NCE spectrum, predict the three component energies, combine their intensities with equal weights, normalize the combined prediction, and score it once. Preserve all component settings; do not average NCE numbers or average three similarities against the same measured spectrum. Forward prediction uses `--stepped` or MCP `stepped: true`; scoring uses the explicit `.ms` stepped metadata described in the guide.
+
 ## With the prediction server
 
 Call `server_info` first, then `predict_spectra` with the selected `model` (`glacier` or `iceberg`), candidate `smiles`, confirmed `collision_unit`, `collision_energies`, `adduct` and `instrument`. Set `include_fragments: true` for per-peak fragment annotations. For an experimental spectrum and a candidate list, use `score_candidates` with the same selected model and an explicit target formula.
 
-Jobs may return a `job_id`; poll with `get_job`. The full result contains predicted spectra, fragment IDs, model version and checkpoint provenance. For a direct mass-only PubChem search, use `search_pubchem_mass`; it predicts every eligible candidate with the selected model and ranks across formulas.
+Jobs may return a `job_id`; keep polling with `get_job(job_id, wait_seconds=30)` while work is queued or running, following [job monitoring](../../../docs/job-monitoring.md). The full result contains predicted spectra, fragment IDs, model version and checkpoint provenance. For a direct mass-only PubChem search, use `search_pubchem_mass`; it predicts every eligible candidate with the selected model and ranks across formulas.
+
+## Monitor progress and review early
+
+Stay with the job after launch, including detached runs and waits for idle GPUs. Check live job/process states, logs, progress and failures, and keep the user informed. As soon as stable per-feature results are available, use [msms-evidence-review](../msms-evidence-review/SKILL.md) and write a per-feature `evidence_review.json` while other predictions continue. Mark incomplete coverage as provisional and revisit changed results. Resume monitoring between reviews; wait for verified outputs and feature accounting before reporting completion. Follow [job monitoring and early review](../../../docs/job-monitoring.md).
 
 ## Score candidate structures
 

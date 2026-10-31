@@ -31,7 +31,7 @@ Use `msms-preprocess` or files exported on the instrument workstation when conve
 
 ## Export model inputs
 
-Before conversion or scoring, reuse the matching dataset/spectrum confirmation for **NCE or absolute eV**, or ask once and save the answer with its input context. Inspect the MGF's collision-energy fields and spectrum merge settings. A consensus spectrum combining different energies cannot be labelled as one verified energy; obtain an energy-separated export or its original MS2 spectra before model scoring. Do not invent an energy for missing metadata.
+Before conversion or scoring, inspect supplied raw/mzML activation metadata yourself to establish the relevant energies, NCE/eV units and acquisition mode; follow [collision-energy handling](../../../docs/collision-energy.md). Reuse verified settings for matching inputs and ask only when unresolved or conflicting. A known stepped spectrum is scored against a merged component prediction. For arbitrary consensus spectra whose source energies or merge scheme are unknown, obtain their original MS2 records or an energy-separated export. Do not invent a single energy for merged or missing metadata.
 
 For an export whose `SCANS` matches the table's `row ID`, use:
 

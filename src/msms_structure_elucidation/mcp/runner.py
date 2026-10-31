@@ -37,10 +37,10 @@ def main(argv: list[str] | None = None) -> int:
             result = tasks.run(request['task'], request['params'], job_dir, settings(None), devices, log)
         except Exception as exc:  # any task failure is reported to the MCP client through status.json
             traceback.print_exc(file=log)
-            store.set_status(job_id, 'failed', error=f'{type(exc).__name__}: {exc}'[-4000:], finished=now())
+            store.set_status(job_id, 'failed', error=f'{type(exc).__name__}: {exc}'[-4000:], finished=now(), exit_code=1)
             return 1
     write_json(job_dir / 'result.json', result)
-    store.set_status(job_id, 'done', finished=now())
+    store.set_status(job_id, 'done', finished=now(), exit_code=0)
     return 0
 
 

@@ -1,4 +1,4 @@
-"""Persist pipeline settings and user-confirmed answers in a local config."""
+"""Persist pipeline settings and verified answers in a local config."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,8 @@ from pathlib import Path
 from msms_structure_elucidation import config
 from msms_structure_elucidation.hostsetup import save_local
 
-DATASET_QUESTIONS = {'collision_unit', 'collision_energies', 'formula'}
+DATASET_QUESTIONS = {'collision_unit', 'collision_energies', 'stepped_collision_energies', 'acquisition_mode', 'formula'}
+METADATA_QUESTIONS = DATASET_QUESTIONS - {'formula'}
 
 
 def _name(value: str) -> str:
@@ -50,7 +51,9 @@ def confirmed_answer(settings: dict, question: str, scope: str = 'project',
     if question in DATASET_QUESTIONS and scope == 'project':
         return None
     record = ((pipeline.get('answers') or {}).get(scope) or {}).get(question)
-    if not record or record.get('source') != 'user' or record.get('context', {}) != (context or {}):
+    if not record or record.get('source') not in ('user', 'metadata') or record.get('context', {}) != (context or {}):
+        return None
+    if record['source'] == 'metadata' and question not in METADATA_QUESTIONS:
         return None
     return record.get('value')
 
@@ -60,6 +63,8 @@ def command(args) -> int:
     path = Path(args.config).expanduser().resolve() if args.config else config.LOCAL_CONFIG
     scope = _name(args.scope)
     context = json.loads(args.context_json)
+    if args.source == 'metadata' and not context:
+        raise ValueError('Metadata-derived settings need --context-json identifying their acquisition evidence')
     if not isinstance(context, dict):
         raise ValueError('--context-json must be a JSON object')
     _mapping_keys(context)
@@ -78,6 +83,8 @@ def command(args) -> int:
         target[parts[-1]] = _value(raw)
     for question, raw in args.answer or []:
         _name(question)
+        if args.source == 'metadata' and question not in METADATA_QUESTIONS:
+            raise ValueError('Metadata provenance is for explicit acquisition-energy settings, not user workflow choices')
         if question in DATASET_QUESTIONS and (scope == 'project' or not context):
             raise ValueError(f'{question} needs a dataset/spectrum --scope and non-empty --context-json')
         if question == 'model_selection' and not context:
@@ -86,7 +93,7 @@ def command(args) -> int:
         if value is None:
             raise ValueError('A null value is not a confirmed answer')
         answers = update.setdefault('pipeline', {}).setdefault('answers', {}).setdefault(scope, {})
-        answers[question] = {'value': value, 'source': 'user', 'context': context}
+        answers[question] = {'value': value, 'source': args.source, 'context': context}
     if update:
         path.parent.mkdir(parents=True, exist_ok=True)
         save_local(update, path)

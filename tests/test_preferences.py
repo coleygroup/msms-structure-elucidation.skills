@@ -91,6 +91,21 @@ class PreferenceTests(unittest.TestCase):
         packaged = Path(config.__file__).with_name('default.yaml')
         self.assertEqual(config.read_yaml(config.REPO_CONFIG), config.read_yaml(packaged))
 
+    def test_verified_acquisition_metadata_is_not_mislabelled_as_a_user_answer(self):
+        context = '{"input_sha256":"abc","scan_ids":["scan=42"]}'
+        result = self.call('--answer', 'collision_unit', 'NCE', '--source', 'metadata',
+                           '--scope', 'dataset-01', '--context-json', context, '--get', 'collision_unit')
+        self.assertEqual(result['answer'], 'NCE')
+        self.assertEqual(result['pipeline']['answers']['dataset-01']['collision_unit']['source'], 'metadata')
+        self.assertIsNone(self.call('--get', 'collision_unit', '--scope', 'dataset-01',
+                                    '--context-json', '{"input_sha256":"changed","scan_ids":["scan=42"]}')['answer'])
+
+    def test_metadata_cannot_confirm_a_user_workflow_choice(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.call('--answer', 'feature_finder', 'everything_bagel', '--source', 'metadata',
+                      '--context-json', '{"input_sha256":"abc"}')
+        self.assertFalse(self.path.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

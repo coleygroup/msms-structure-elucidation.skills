@@ -24,6 +24,17 @@ On later runs, reuse the saved choice without asking again. Ask only for missing
 
 ## Optional de novo route after evidence review
 
+Use `msms-evidence-review` for the assessment. Review delegation is an operational setting, separate from the user's scientific route choice. `pipeline.evidence_review.mode` accepts `auto` (delegate independent batch work when supported), `main` (direct review), or `delegate` (prefer delegation, with direct fallback). `max_reviewers` and `features_per_task` are positive integers, defaulting to two and one; actual concurrency is bounded by available slots and ready work while the main agent keeps monitoring. Save overrides in the ignored local config, for example:
+
+```bash
+msms-structure-elucidation preferences \
+  --set pipeline.evidence_review.mode auto \
+  --set pipeline.evidence_review.max_reviewers 2 \
+  --set pipeline.evidence_review.features_per_task 1
+```
+
+Reuse these settings without repeated questions. They guide agent dispatch; they do not start an LLM pool inside the Python batch worker or authorize proposals/model runs.
+
 After retrieval/scoring, the agent reviews every result. For weakly supported entries, ask the user whether to use agent proposals scored by ICEBERG/GLACIER (workflow step 4), FRIGID de novo followed by scoring (step 5), both, or skip. Wait for the selection before either optional route. One answer can cover an identified batch or a subset of entries. Reuse an earlier selection only if it explicitly covers the same analysis, inputs, affected entries and model context.
 
 Save the selected answer as `denovo_route` with value `agent`, `frigid`, `both` or `skip`, using an analysis/entry scope and context identifying those inputs and model/weights. Keep the agent's recommended action distinct from the user-selected route in `evidence_review.json`. Do not create a project-wide de novo authorization from one analysis's answer. Selecting both requests both routes; selecting skip proceeds to reporting with the unresolved evidence visible.
@@ -45,9 +56,11 @@ msms-structure-elucidation preferences \
   --context-json '{"manifest_sha256":"<actual-manifest-sha256>"}'
 ```
 
-The command merges updates and keeps unrelated config values. `pipeline.answers.<scope>.<question>` holds the answer, its `source: user` and its context. Values may be JSON or unquoted strings. Reading preferences does not create a config file. `pipeline.reuse_answers: false` disables answer reuse.
+For settings established from raw/mzML acquisition records, use `--source metadata` with an input/scan-specific context; retain the actual source parameters and units. The default `--source user` is for user answers. Both verified sources can be reused in their exact context.
 
-Save genuine user answers, not inferred metadata or suggested defaults. Project-scoped answers suit workflow choices. Collision units, energy values and formulas require a dataset/spectrum scope and non-empty context; never apply one dataset's scientific answers to an unrelated dataset. Use input/manifest hashes to identify that context. Keep an analysis-specific search mode, ppm tolerance, adduct and instrument in its own scope unless the user explicitly establishes a broader preference.
+The command merges updates and keeps unrelated config values. `pipeline.answers.<scope>.<question>` holds the answer, its `source` (`user` or `metadata`) and its context. Values may be JSON or unquoted strings. Reading preferences does not create a config file. `pipeline.reuse_answers: false` disables answer reuse.
+
+Save genuine user answers or settings established from explicit acquisition metadata, with accurate provenance. Do not save guesses or suggested defaults as verified answers. Project-scoped answers suit workflow choices. Collision units, energy values and formulas require a dataset/spectrum scope and non-empty context; never apply one dataset's scientific answers to an unrelated dataset. Use input/manifest hashes to identify that context. Keep an analysis-specific search mode, ppm tolerance, adduct and instrument in its own scope unless the user explicitly establishes a broader preference.
 
 For `model_selection`, include the host, model and exact checkpoint identities in the context, and save actual paths under `models.simulator`. Reuse that confirmation while those assets and the host match; ask again when they change. A matching file path alone does not prove unchanged weights. Existing execution/Slurm settings stay in their normal config sections and should not be requested repeatedly.
 

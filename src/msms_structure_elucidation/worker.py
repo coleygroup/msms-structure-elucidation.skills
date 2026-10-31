@@ -60,6 +60,12 @@ def _experimental_spectra(spectrum: str, unit: str):
         raise ValueError('Supply --experimental-unit as NCE or eV')
     metadata, spectra = common.parse_spectra(spectrum)
     precursor = float(metadata['parentmass'])
+    if metadata.get('stepped_collision_energies'):
+        from msms_structure_elucidation.collision import stepped_components
+        if len(spectra) != 1:
+            raise ValueError('Stepped acquisition requires one measured composite spectrum')
+        info = stepped_components(metadata['stepped_collision_energies'], precursor, unit, common.nce_to_ev)
+        return metadata, {'stepped': next(iter(spectra.values()))}, {'stepped': info}
     mapped = {}
     source = {}
     for key, spec in spectra.items():
@@ -78,6 +84,15 @@ def _experimental_spectra(spectrum: str, unit: str):
 def align_energies(experimental: dict, predicted: dict, source: dict,
                    unit: str) -> list[dict]:
     """Match only equal integer eV labels after rounding both sides."""
+    if 'stepped' in experimental:
+        if 'stepped' not in predicted:
+            return []
+        info = source['stepped']
+        return [{'experimental_key': 'stepped', 'atlas_key': 'stepped', 'prediction_key': 'stepped',
+                 'acquisition_mode': 'stepped', 'input_value': None, 'input_values': info['values'],
+                 'input_unit': unit, 'experimental_ev': None, 'atlas_ev': None, 'model_energy_ev': None,
+                 'model_energies_ev': info['model_energies_ev'], 'component_energies_ev': info['energies_ev'],
+                 'merge_method': info['merge_method'], 'weights': info['weights'], 'delta_ev': None}]
     matched = []
     indexed = {int(round(float(key))): key for key in predicted.keys()}
     for exp_key in sorted(experimental.keys(), key=float):
@@ -95,8 +110,12 @@ def align_energies(experimental: dict, predicted: dict, source: dict,
     return matched
 
 
-def model_collision_energies_ev(experimental: dict) -> list[int]:
+def model_collision_energies_ev(experimental: dict, source: dict | None = None) -> list[int]:
     """Pass only rounded integer eV values to forward models."""
+    if 'stepped' in experimental:
+        if not source or 'stepped' not in source:
+            raise ValueError('Missing stepped collision-energy provenance')
+        return sorted(set(source['stepped']['model_energies_ev']))
     energies = [float(key) for key in experimental.keys()]
     if not energies or any(not math.isfinite(ev) or ev <= 0 for ev in energies):
         raise ValueError('Model collision energies must be positive finite eV values')
@@ -104,6 +123,45 @@ def model_collision_energies_ev(experimental: dict) -> list[int]:
     if rounded[0] <= 0:
         raise ValueError('Rounded model collision energies must be positive integers')
     return rounded
+
+
+def _scoring_prediction(predicted, source: dict):
+    """Merge stepped predictions once, preserving the untouched component spectra."""
+    if 'stepped' not in source:
+        return predicted
+    indexed = {int(round(float(key))): key for key in predicted.keys()}
+    requested = source['stepped']['model_energies_ev']
+    missing = set(requested) - set(indexed)
+    if missing:
+        raise ValueError(f'Missing stepped prediction energies: {sorted(missing)}')
+    from ms_pred import common
+    import numpy as np
+    components, retained = [], set()
+    for key in dict.fromkeys(indexed[ev] for ev in requested):
+        spec = predicted[key]
+        masses, intens = np.asarray(spec.masses), np.asarray(spec.intens)
+        if not np.isfinite(masses).all() or not np.isfinite(intens).all() or (intens < 0).any():
+            raise ValueError('Invalid stepped prediction peaks')
+        keep = intens > 0
+        if not keep.any():
+            continue
+        # Native merging iterates num_peaks (positive count); remove interleaved zeros first.
+        components.append(common.MassSpec(collision_energy=float(key),
+            root_canonical_smiles=spec.root_canonical_smiles, adduct=spec.adduct,
+            masses=masses[keep].copy(), intens=intens[keep].copy(),
+            frags=spec.frags[keep].copy() if spec.frags is not None else None))
+        retained.add(key)
+    if not components:
+        raise ValueError('Stepped prediction has no positive intensity')
+    merged = common.CompositeMassSpec(components).merge_spectra(
+        energies=[indexed[ev] for ev in requested if indexed[ev] in retained], merge_method='sum')
+    return {**dict(predicted.items()), 'stepped': merged}
+
+
+def _input_energies(alignment: list[dict]) -> list[float]:
+    """Keep component settings for stepped data and scalar labels for separate spectra."""
+    return [value for pair in alignment for value in
+            (pair['input_values'] if pair.get('acquisition_mode') == 'stepped' else [pair['input_value']])]
 
 
 def _score(experimental, predicted, alignment, precursor):
@@ -209,14 +267,19 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
                                      intens=peaks[:, 1], root_canonical_smiles=smiles))
         info[key] = meta
     results = []
-    expected_energies = set(model_collision_energies_ev(experimental))
+    expected_energies = set(model_collision_energies_ev(experimental, source))
     missing_energies = set()
     errors = []
     for key, spectra in grouped.items():
         try:
             predicted = CompositeMassSpec(spectra)
+            available = {int(round(float(ce))) for ce in predicted.keys()}
+            missing_energies.update(expected_energies - available)
+            if expected_energies - available:
+                continue
+            predicted = _scoring_prediction(predicted, source)
             alignment = align_energies(experimental, predicted, source, experimental_unit)
-            paired = {pair['model_energy_ev'] for pair in alignment}
+            paired = {ev for pair in alignment for ev in (pair.get('model_energies_ev') or [pair['model_energy_ev']])}
             missing_energies.update(expected_energies - paired)
             if len(alignment) != len(experimental):
                 continue
@@ -227,7 +290,7 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
             results.append({'smiles': info[key]['SMILES'], 'inchikey': info[key].get('INCHIKEY'),
                 'formula': formula, 'source': 'public ICEBERG 2.1 PubChem atlas',
                 'entropy_similarity': float(similarity), 'explained_intensity': explained,
-                'collision_energies': [p['input_value'] for p in alignment],
+                'collision_energies': _input_energies(alignment),
                 'energy_alignment': alignment, 'matched_peaks': matched,
                 '_predicted': (predicted, fragment_ids[key])})
         except (ValueError, AssertionError, KeyError, ZeroDivisionError) as exc:
@@ -472,12 +535,17 @@ def predict(smiles: list[str], collision_energies: list[float], collision_unit: 
             model: str, checkpoint: str | None, gen_checkpoint: str | None,
             inten_checkpoint: str | None, instrument: str | None = None,
             cuda_devices: str | None = None, batch_size: int = 1, num_cpu_workers: int = 1,
-            num_gpu_workers: int = 1, fragments: bool = False, force_recompute: bool = False) -> list[dict]:
+            num_gpu_workers: int = 1, fragments: bool = False, force_recompute: bool = False,
+            stepped: bool = False) -> list[dict]:
     """Forward-predict spectra and fragment IDs for SMILES, without an experimental spectrum."""
     if collision_unit not in ('NCE', 'eV'):
         raise ValueError('collision_unit must be NCE or eV')
     if not smiles or not collision_energies:
         raise ValueError('predict needs at least one SMILES and one collision energy')
+    from msms_structure_elucidation.collision import energy_values
+    collision_energies = energy_values(collision_energies)
+    if stepped and len(collision_energies) < 2:
+        raise ValueError('Stepped prediction requires at least two component energies')
     # ms-pred expects integer energies; keep a fractional value only when it was given.
     collision_energies = [int(value) if float(value).is_integer() else float(value) for value in collision_energies]
     save_dir = _run_model(smiles, collision_energies, collision_unit == 'NCE', adduct, model,
@@ -490,11 +558,19 @@ def predict(smiles: list[str], collision_energies: list[float], collision_unit: 
     try:
         for item in pred_db.get_all_specs():
             pred = item[-1]
+            smi = pred.root_canonical_smiles
+            info = None
+            if stepped:
+                from msms_structure_elucidation.collision import stepped_components
+                precursor = common.mass_from_smi(smi) + common.ion2mass[adduct]
+                info = stepped_components(collision_energies, precursor, collision_unit, common.nce_to_ev)
+                pred = _scoring_prediction(pred, {'stepped': info})
             spectra, fragment_ids = _serial_spec(pred), _serial_fragment_ids(pred)
-            results.append({'smiles': pred.root_canonical_smiles, 'adduct': adduct,
+            results.append({'smiles': smi, 'adduct': adduct,
+                **({'acquisition_mode': 'stepped', 'stepped_collision': info} if stepped else {}),
                 'collision_energies': collision_energies, 'collision_unit': collision_unit,
                 'predicted_spectra': spectra, 'predicted_fragment_ids': fragment_ids,
-                'annotated_peaks': _peak_annotations(pred.root_canonical_smiles, spectra, fragment_ids, adduct)
+                'annotated_peaks': _peak_annotations(smi, spectra, fragment_ids, adduct)
                 if fragments else None,
                 'model_name': model.upper(), 'model_version': model_version, 'ms_pred_version': ms_pred_version,
                 'model_instrument': instrument,
@@ -516,7 +592,7 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
     With top_k, structure images are drawn only where a merged top_k list can reach: results
     are ranked by entropy similarity."""
     metadata, experimental, source = _experimental_spectra(spectrum, experimental_unit)
-    model_energies = model_collision_energies_ev(experimental)
+    model_energies = model_collision_energies_ev(experimental, source)
     save_dir = _run_model(smiles, model_energies, False, metadata.get('ionization', '[M+H]+'), model,
         checkpoint, gen_checkpoint, inten_checkpoint, instrument, cuda_devices, batch_size,
         num_cpu_workers, num_gpu_workers, force_recompute)
@@ -528,6 +604,7 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
         for item in pred_db.get_all_specs():
             pred = item[-1]
             smi = pred.root_canonical_smiles
+            pred = _scoring_prediction(pred, source)
             alignment = align_energies(experimental, pred, source, experimental_unit)
             if len(alignment) != len(experimental):
                 raise RuntimeError(f'{model.upper()} output for {smi} lacks one or more requested energies')
@@ -535,7 +612,7 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
             explained, matched = _explained(experimental, pred, alignment)
             results.append({'smiles': smi, 'formula': formula, 'source': model.upper(),
                 'entropy_similarity': float(score), 'explained_intensity': explained,
-                'collision_energies': [p['input_value'] for p in alignment],
+                'collision_energies': _input_energies(alignment),
                 'energy_alignment': alignment, 'matched_peaks': matched,
                 'predicted_spectra': _serial_spec(pred),
                 'predicted_fragment_ids': _serial_fragment_ids(pred),
@@ -582,6 +659,7 @@ def main():
     parser.add_argument('--collision-energies', help='predict: comma-separated energies')
     parser.add_argument('--collision-unit', choices=['NCE', 'eV'], help='predict: unit of --collision-energies')
     parser.add_argument('--adduct', default='[M+H]+')
+    parser.add_argument('--stepped', action='store_true', help='predict: merge the requested energies before final normalization')
     parser.add_argument('--fragments', action='store_true', help='predict: annotate peaks with fragment formula and SMILES')
     parser.add_argument('--ms1-ppm', type=float, default=5.0)
     parser.add_argument('--ms2-ppm', type=float, default=10.0)
@@ -608,7 +686,7 @@ def main():
             [float(value) for value in args.collision_energies.split(',')], args.collision_unit,
             args.adduct, args.model, args.checkpoint, args.gen_checkpoint, args.inten_checkpoint,
             args.instrument, args.cuda_devices, args.batch_size, args.num_cpu_workers, args.num_gpu_workers,
-            args.fragments, args.force_recompute)
+            args.fragments, args.force_recompute, args.stepped)
     else:
         result = simulate(args.spectrum, json.loads(Path(args.smiles_json).read_text()),
             args.formula, args.model, args.checkpoint, args.gen_checkpoint,

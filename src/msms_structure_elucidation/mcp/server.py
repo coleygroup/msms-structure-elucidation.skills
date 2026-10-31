@@ -29,9 +29,10 @@ from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore
 from msms_structure_elucidation.spectrum import inspect_ms
 
 INSTRUCTIONS = (
-    'MS/MS structure elucidation models. Before scoring or predicting, confirm with the user whether '
-    'collision energies are NCE or absolute eV; never guess the unit. Spectra are ms-pred .ms text '
+    'MS/MS structure elucidation models. Inspect supplied raw/mzML acquisition metadata first for '
+    'energy values, NCE/eV units and stepped acquisition; ask the user only when metadata is unresolved or conflicting. Spectra are ms-pred .ms text '
     '(>compound, >parentmass, >ionization, >formula, then >collision <energy> blocks of "m/z intensity" lines). '
+    'For one stepped acquisition, include >stepped_collision_energies with its component list and one observed collision block; prediction merges components before normalization. '
     'Model tools may return a job id instead of a result; poll it with get_job. Call server_info first to see '
     'which models this server has configured.')
 
@@ -162,7 +163,7 @@ async def server_info() -> dict:
         models[f'{task}(glacier)'] = {'ready': not missing, 'missing': missing}
     return {**await asyncio.to_thread(runtime['backend'].describe), 'job_root': str(runtime['store'].root),
             'config': config.get('_local_config_path') or config['_config_path'], 'models': models,
-            'collision_energy_rule': 'Ask the user whether energies are NCE or eV before any model call.'}
+            'collision_energy_rule': 'Inspect raw/mzML acquisition metadata first; reuse verified settings for matching inputs. Ask only if values, NCE/eV units or stepped mode remain unresolved or conflicting.'}
 
 
 @tool
@@ -176,13 +177,14 @@ async def predict_spectra(
                                                          'default models.simulator.instrument')] = None,
         model: Model = 'iceberg',
         include_fragments: Annotated[bool, Field(description='Annotate peaks with fragment formula and SMILES')] = True,
+        stepped: Annotated[bool, Field(description='Combine component energies into one stepped prediction before normalization')] = False,
         max_peaks: Annotated[int, Field(description='Strongest peaks returned per energy', ge=1)] = 50,
         wait_seconds: Wait = None) -> dict:
     """Forward-predict MS/MS spectra (and fragment assignments) for SMILES with ICEBERG or GLACIER."""
     _require('predict_spectra', model=model)
     params = {'smiles': smiles, 'collision_energies': collision_energies, 'collision_unit': collision_unit,
               'adduct': adduct, 'instrument': instrument, 'model': model,
-              'include_fragments': include_fragments, 'max_peaks': max_peaks}
+              'include_fragments': include_fragments, 'max_peaks': max_peaks, 'stepped': stepped}
     return await _submit('predict_spectra', params, {}, wait_seconds, ctx)
 
 

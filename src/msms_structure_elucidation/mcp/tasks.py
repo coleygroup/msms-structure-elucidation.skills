@@ -106,6 +106,7 @@ def predict_spectra(params: dict, job_dir: Path, config: dict, devices: str | No
         collision_energies=','.join(str(value) for value in params['collision_energies']),
         collision_unit=params['collision_unit'], adduct=params['adduct'],
         instrument=_instrument(params, {}, config), fragments=bool(params.get('include_fragments')),
+        **({'stepped': True} if params.get('stepped') else {}),
         **options)
     return {'model': params['model'].upper(), 'predictions': predictions}
 
@@ -115,6 +116,10 @@ def score_candidates(params: dict, job_dir: Path, config: dict, devices: str | N
     data = inspect_ms(path, params['collision_unit'])
     python = _ms_pred_python(config)
     smiles, rejected = params['smiles'], []
+    observed = {key: data[key] for key in ('parentmass', 'adduct', 'spectra', 'collision_unit', 'energy_mapping')}
+    observed['input'] = str(path)
+    if data.get('acquisition_mode') == 'stepped':
+        observed.update(acquisition_mode='stepped', stepped_collision=data['stepped_collision'])
     formula = params.get('formula') or data['metadata'].get('formula')
     if formula:
         listing = job_dir / 'proposed.json'
@@ -123,13 +128,14 @@ def score_candidates(params: dict, job_dir: Path, config: dict, devices: str | N
         smiles = [row['smiles'] for row in checked if row['formula_match']]
         rejected = [row for row in checked if not row['formula_match']]
     if not smiles:
-        return {'formula': formula, 'candidates': [], 'rejected': rejected}
+        return {**observed, 'status': 'no_candidates', 'formula': formula, 'candidates': [], 'rejected': rejected}
     listing = job_dir / 'smiles.json'
     listing.write_text(json.dumps(smiles))
     candidates = cli.worker(python, 'simulate', spectrum=path, smiles_json=listing, formula=formula or '',
         experimental_unit=params['collision_unit'], output_dir=job_dir, instrument=_instrument(params, data['metadata'], config),
         top_k=params['top_k'], limit_images=True, **_simulator_options(config, params['model'], devices))
-    return {'formula': formula, 'candidates': candidates, 'rejected': rejected}
+    return {**observed, 'status': 'ranked' if candidates else 'no_candidates',
+            'formula': formula, 'candidates': candidates, 'rejected': rejected}
 
 
 def retrieve_atlas(params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:

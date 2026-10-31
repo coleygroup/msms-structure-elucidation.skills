@@ -81,6 +81,7 @@ class RunnerTest(unittest.TestCase):
         store, job_id, code = self.run_job(task)
         self.assertEqual((code, store.status(job_id)['state'], store.result(job_id)), (0, 'done', {'double': 4}))
         self.assertEqual(seen['devices'], '3')
+        self.assertEqual(store.status(job_id)['exit_code'], code)
         with patch.dict(tasks.RUNNERS, {'fake_task': lambda *a: 1 / 0}):
             self.assertEqual(runner.main([str(store.path(job_id))]), 0)  # done jobs are not rerun
 
@@ -90,6 +91,7 @@ class RunnerTest(unittest.TestCase):
         store, job_id, code = self.run_job(task)
         status = store.status(job_id)
         self.assertEqual((code, status['state']), (1, 'failed'))
+        self.assertEqual(status['exit_code'], code)
         self.assertIn('checkpoint missing', status['error'])
         self.assertIn('Traceback', (store.path(job_id) / 'log.txt').read_text())
 

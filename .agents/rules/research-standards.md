@@ -27,7 +27,9 @@ Before starting, classify the user's request:
 
 2. **Plan before running**: Write a brief plan (inputs, which models to run, orchestration mode, expected outputs). Reuse applicable user authorization and saved confirmations; ask only for missing or changed decisions. Save pipeline answers with their scope/context as described in `docs/pipeline-preferences.md`.
 
-3. **Run models**: Use the appropriate skills. Always specify the Python environment.
+Before scientific execution, register the session-owned analysis and requested scope under `docs/workflow-hooks.md`. Maintain evidence-backed state and every launched job; complete it through the shared checker. Ordinary questions and repository edits do not register a run.
+
+3. **Run models and monitor**: Use the appropriate skills and specify the Python environment. Keep monitoring queued/running work after launch, including detached jobs and resource waits. Start per-feature evidence review as results become available while remaining jobs continue; follow `docs/job-monitoring.md`. Verify completion and final artifacts before ending the requested analysis.
 
 4. **Fuse results**: In parallel mode, rank candidates across all three models. In cascade mode, document which model produced the final answer and why earlier models were insufficient.
 

@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "msms-workflow-guard hook",
+            "timeout": 30,
+            "statusMessage": "MS/MS workflow guard"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "msms-workflow-guard hook",
+            "timeout": 30,
+            "statusMessage": "MS/MS workflow guard"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "msms-workflow-guard hook",
+            "timeout": 30,
+            "statusMessage": "MS/MS workflow guard"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -18,6 +18,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--collision-energies', type=float, nargs='+', required=True)
     parser.add_argument('--collision-unit', choices=['NCE', 'eV'], required=True,
                         help='user-confirmed unit of the supplied collision energies')
+    parser.add_argument('--stepped', action='store_true', help='combine the component predictions into one stepped spectrum')
     parser.add_argument('--adduct', default='[M+H]+')
     parser.add_argument('--instrument', help='model instrument; otherwise models.simulator.instrument')
     parser.add_argument('--config')
@@ -68,7 +69,8 @@ def main(argv: list[str] | None = None) -> int:
         predictions = cli.worker(python, 'predict', smiles_json=listing,
             collision_energies=','.join(str(value) for value in args.collision_energies),
             collision_unit=args.collision_unit, adduct=args.adduct, instrument=instrument,
-            fragments=not args.no_fragments, force_recompute=True, **options)
+            fragments=not args.no_fragments, force_recompute=True,
+            **({'stepped': True} if args.stepped else {}), **options)
     if len(predictions) != 1:
         raise RuntimeError(f'{args.model.upper()} returned {len(predictions)} predictions for one input structure')
     result = {'model': args.model.upper(), 'collision_unit': args.collision_unit,

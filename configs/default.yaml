@@ -58,7 +58,11 @@ preprocessing:
   output_format: mzML
 pipeline:
   reuse_answers: true
-  answers: {}  # user confirmations belong in the uncommitted local config, scoped by project/dataset
+  answers: {}  # verified answers belong in the uncommitted local config, scoped by project/dataset
+  evidence_review:
+    mode: auto  # delegate batch evidence reviews when supported; otherwise review in the main agent
+    max_reviewers: 2  # bounded by available agent slots; keep the main agent monitoring jobs
+    features_per_task: 1
 feature_detect:
   backend: everything_bagel  # recommended first-run choice; ask once if no feature list or saved answer
   everything_bagel:

@@ -105,6 +105,8 @@ def convert_to_ms(input_path: Path, output_dir: Path) -> None:
 
     # best scan per precursor m/z: highest total fragment intensity
     best: dict[float, dict] = {}
+    from msms_structure_elucidation.energy_metadata import scan_metadata
+    acquisition = scan_metadata(input_path)
 
     with mzml.MzML(str(input_path)) as reader:
         for spectrum in reader:
@@ -124,8 +126,11 @@ def convert_to_ms(input_path: Path, output_dir: Path) -> None:
                     .get("scan", [{}])[0]
                     .get("scan start time", 0)
                 )
-                act = prec.get("activation", {})
-                ce = act.get("collision energy", "")
+                setting = acquisition.get(spectrum.get('id'), {})
+                if setting.get('status') != 'resolved':
+                    raise ValueError(f"Unresolved energy metadata for {spectrum.get('id')}; inspect acquisition records or ask the user")
+                values, unit = setting['energies'], setting['unit']
+                ce = values[0]
                 best[mz] = {
                     "total_intensity": total_intensity,
                     "meta": {
@@ -133,9 +138,13 @@ def convert_to_ms(input_path: Path, output_dir: Path) -> None:
                         "parentmass": mz,
                         "ionization": _ionization(spectrum),
                         "rt": f"{round(float(rt_min) * 60, 1)}s",
+                        "collision_energy_source": "mzML activation metadata",
+                        "source_scan": spectrum.get('id'),
+                        **({'stepped_collision_energies': ','.join(map(str, values))}
+                           if setting['acquisition_mode'] == 'stepped' else {}),
                     },
                     "spectra_by_ce": {
-                        f"collision {ce} eV" if ce else "collision": list(
+                        f"collision {ce} {unit}": list(
                             zip(
                                 spectrum.get("m/z array", []).tolist(),
                                 int_array.tolist(),

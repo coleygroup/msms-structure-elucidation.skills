@@ -8,6 +8,10 @@ Use this skill to match experimental MS/MS spectra against the public ICEBERG Pu
 
 Read [saved pipeline answers](../../../docs/pipeline-preferences.md) and reuse the collision-energy unit, search route and intended model when their scope/context matches. Ask only for missing or conflicting choices and save the answers. For model-backed work, confirm the exact checkpoint paths with `msms-setup`. With MCP connected, call `server_info` first and use its tools.
 
+## Monitor progress and review early
+
+Keep monitoring queued/running retrieval and prediction jobs, including detached runs and resource waits. With MCP, poll `get_job(job_id, wait_seconds=30)`; otherwise inspect the live process/scheduler, logs and output receipts. Use [msms-evidence-review](../msms-evidence-review/SKILL.md) on each stable per-feature result as it arrives and write its `evidence_review.json` while the remaining jobs continue. Do not wait for the full batch or consolidated report. Label incomplete coverage as provisional, revisit changed results, and verify final coverage and outputs before reporting completion. Follow [job monitoring and early review](../../../docs/job-monitoring.md).
+
 ## Choose the spectrum source
 
 For **ICEBERG**, prefer suitable public atlas spectra. The atlas contains predictions for PubChem structures generated with **ICEBERG 2.1 trained on NIST'23**. This describes the prediction model's training data; licensed NIST structures are excluded from the public candidate library. Use local ICEBERG predictions when the atlas lacks the required structure, adduct or collision energies, or when the user explicitly requests fresh predictions throughout.
@@ -20,7 +24,7 @@ For **GLACIER**, predict every candidate with the confirmed GLACIER weights; no 
 
 ## Atlas retrieval
 
-Reuse the matching dataset/spectrum answer for NCE versus absolute eV, or ask once and save it; do not infer the unit from file headers or numeric values. After NCE is confirmed:
+Inspect supplied raw/mzML acquisition metadata first and reuse verified settings for the same inputs, following [collision-energy handling](../../../docs/collision-energy.md). Ask and save the answer only when metadata cannot resolve the energies or NCE/eV unit; do not infer the unit from file headers or numeric values. After NCE is confirmed:
 
 ```bash
 msms-structure-elucidation run --input sample.ms --collision-unit NCE \

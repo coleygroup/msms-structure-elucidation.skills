@@ -27,6 +27,8 @@ def load_mzml(path: Path):
         sys.exit("pyteomics not installed.")
 
     ms1, ms2 = [], []
+    from msms_structure_elucidation.energy_metadata import scan_metadata
+    acquisition = scan_metadata(path)
     with mzml.MzML(str(path)) as reader:
         for s in reader:
             level = s.get("ms level")
@@ -39,13 +41,13 @@ def load_mzml(path: Path):
             elif level == 2:
                 prec = s.get("precursorList", {}).get("precursor", [{}])[0]
                 sel = prec.get("selectedIonList", {}).get("selectedIon", [{}])[0]
-                act = prec.get("activation", {})
                 ms2.append(
                     {
                         "rt": rt_s,
                         "precursor_mz": sel.get("selected ion m/z", 0),
                         "precursor_intensity": sel.get("peak intensity", 0),
-                        "ce": act.get("collision energy", ""),
+                        "ce": acquisition.get(s.get('id'), {}).get('energy'),
+                        "energy_setting": acquisition.get(s.get('id'), {}),
                         "mz": mz_arr,
                         "intensity": int_arr,
                     }
@@ -74,8 +76,15 @@ def write_ms_file(
     from collections import defaultdict
 
     spectra_by_ce = defaultdict(list)
-    for s in scans:
-        label = f"collision {s['ce']} eV" if s["ce"] else "collision"
+    settings = [s.get('energy_setting', {}) for s in scans]
+    if any(setting.get('status') != 'resolved' for setting in settings):
+        raise ValueError('Unresolved acquisition energies; inspect metadata or ask the user before .ms export')
+    schemes = {(setting['unit'], setting['acquisition_mode'], tuple(setting['energies'])) for setting in settings}
+    stepped = [scheme for scheme in schemes if scheme[1] == 'stepped']
+    if len({scheme[0] for scheme in schemes}) > 1 or (stepped and len(schemes) != 1):
+        raise ValueError('Export conflicting units or distinct stepped acquisitions separately')
+    for s, setting in zip(scans, settings):
+        label = f"collision {setting['energies'][0]} {setting['unit']}"
         spectra_by_ce[label].extend(zip(s["mz"].tolist(), s["intensity"].tolist()))
 
     lines = [
@@ -84,6 +93,8 @@ def write_ms_file(
         ">ionization [M+H]+",
         f">rt {round(rt, 1)}s",
     ]
+    if stepped:
+        lines.append('>stepped_collision_energies ' + ','.join(map(str, stepped[0][2])))
     for label, peaks in spectra_by_ce.items():
         lines += ["", f">{label}"]
         for mz, inten in sorted(peaks):

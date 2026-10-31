@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+from msms_structure_elucidation.collision import stepped_components
+
 
 # Default precursor (MS1) and fragment (MS2) tolerances by mass analyzer, in ppm.
 MASS_TOLERANCE_PPM = {'Q-TOF': (10.0, 20.0), 'Orbitrap': (5.0, 10.0)}
@@ -23,7 +25,7 @@ def mass_tolerance(instrumentation: str | None) -> dict:
 
 
 def inspect_ms(path: Path, collision_unit: str) -> dict:
-    """Read a spectrum using the user-confirmed collision-energy unit."""
+    """Read a spectrum using the verified collision-energy unit."""
     if collision_unit not in ('NCE', 'eV'):
         raise ValueError('Collision energy unit must be explicitly supplied as NCE or eV')
     metadata: dict[str, str] = {}
@@ -59,6 +61,19 @@ def inspect_ms(path: Path, collision_unit: str) -> dict:
     parentmass = float(metadata['parentmass'])
     if not math.isfinite(parentmass) or parentmass <= 0:
         raise ValueError(f'{path}: invalid parentmass')
+    if metadata.get('stepped_collision_energies'):
+        if len(raw_spectra) != 1:
+            raise ValueError('Stepped acquisition requires one measured composite spectrum')
+        info = stepped_components(metadata['stepped_collision_energies'], parentmass, collision_unit)
+        mapping = [{'input_value': value, 'input_unit': collision_unit,
+                    'collision_energy_ev': ev, 'model_energy_ev': model_ev,
+                    'acquisition_mode': 'stepped'}
+                   for value, ev, model_ev in zip(info['values'], info['energies_ev'], info['model_energies_ev'])]
+        return {'metadata': metadata, 'spectra': {'stepped': next(iter(raw_spectra.values()))},
+                'parentmass': parentmass, 'adduct': metadata.get('ionization', '[M+H]+'),
+                'peaks': sum(map(len, raw_spectra.values())), 'collision_unit': collision_unit,
+                'header_units': sorted(header_units), 'energy_mapping': mapping,
+                'acquisition_mode': 'stepped', 'stepped_collision': info}
     spectra = {}
     energy_mapping = []
     for source, peaks in raw_spectra.items():

@@ -11,6 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from msms_structure_elucidation.ions import MODEL_ADDUCTS, annotate
+from msms_structure_elucidation.collision import energy_values
 
 
 def entries(path: Path):
@@ -38,6 +39,11 @@ def entries(path: Path):
 
 def _raw_scans(path: Path) -> dict[str, dict]:
     """MS2 scan tags from mzXML (energy, precursor m/z, retention time in s), without loading peaks."""
+    if path.suffix.lower() == '.mzml':
+        from msms_structure_elucidation.energy_metadata import scan_metadata
+        found = scan_metadata(path)
+        return {(re.search(r'(?:^| )scan=(\d+)', key).group(1) if re.search(r'(?:^| )scan=(\d+)', key) else key): {**row, 'energy': tuple(row['energies']) if row['acquisition_mode'] == 'stepped' else row['energy']}
+                for key, row in found.items()}
     found = {}
     for _, node in ET.iterparse(path, events=('end',)):
         if node.tag.rsplit('}', 1)[-1] == 'scan':
@@ -81,9 +87,18 @@ def _precursor_matches(meta: dict, raw: dict[str, dict], rt_window: float) -> li
 
 
 def _energy(meta: dict, raw: dict[str, dict], override: float | None,
-            rt_window: float = 30.0) -> tuple[float | None, str, str | None, list[str]]:
+            rt_window: float = 30.0) -> tuple[float | tuple[float, ...] | None, str, str | None, list[str]]:
+    if meta.get('STEPPED_COLLISION_ENERGIES'):
+        values = energy_values(re.sub(r'\s*(NCE|eV)\s*$', '', meta['STEPPED_COLLISION_ENERGIES'], flags=re.I))
+        if len(values) < 2:
+            raise ValueError('Stepped acquisition requires an explicit component list')
+        label = meta['STEPPED_COLLISION_ENERGIES'].upper()
+        unit = 'NCE' if 'NCE' in label else 'eV' if 'EV' in label else None
+        return tuple(values), 'mgf:STEPPED_COLLISION_ENERGIES', unit, []
     for field in ('COLLISION_ENERGY', 'COLLISIONENERGY', 'CE', 'NCE'):
         if meta.get(field):
+            if len(re.findall(r'[-+]?\d+(?:\.\d+)?', meta[field])) != 1:
+                return None, 'ambiguous_energy_setting', None, []
             match = re.search(r'[-+]?\d+(?:\.\d+)?', meta[field])
             if match:
                 label = meta[field].upper()
@@ -95,7 +110,12 @@ def _energy(meta: dict, raw: dict[str, dict], override: float | None,
         scans, source = _precursor_matches(meta, raw, rt_window), 'mzXML:MS2_precursor_match'
     values = {raw[s]['energy'] for s in scans if s in raw and raw[s]['energy'] is not None}
     if len(values) == 1:
-        return values.pop(), source, None, scans
+        units = {raw[s].get('unit') for s in scans if s in raw and raw[s].get('unit')}
+        if len(units) > 1 or any(raw[s].get('status') == 'needs_user' for s in scans if s in raw):
+            return None, 'ambiguous_MS2_energy_metadata', None, scans
+        if any(raw[s].get('source') == 'mzML:activation' for s in scans if s in raw):
+            source = source.replace('mzXML:', 'mzML:')
+        return values.pop(), source, next(iter(units)) if units else None, scans
     if override is not None:
         return override, 'user_override', None, scans
     return None, 'ambiguous_MS2_scans' if len(values) > 1 else 'missing_MS2_energy', None, scans
@@ -132,7 +152,7 @@ def _raw_files(raw_mzxml) -> list[Path]:
     files = []
     for item in ([raw_mzxml] if isinstance(raw_mzxml, (str, Path)) else raw_mzxml):
         item = Path(item)
-        files.extend(sorted(p for p in item.iterdir() if p.suffix.lower() == '.mzxml') if item.is_dir() else [item])
+        files.extend(sorted(p for p in item.iterdir() if p.suffix.lower() in ('.mzxml', '.mzml')) if item.is_dir() else [item])
     return files
 
 
@@ -140,7 +160,8 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
                 energy: float | None = None, raw_mzxml: Path | list[Path] | None = None,
                 instrument: str | None = None, rt_window: float = 30.0, feature_ids: set[str] | None = None,
                 ion_identity: bool = True, ion_rt_window: float = 3.0,
-                elucidate_all_ions: bool = False, feature_id_field: str | None = None) -> list[dict]:
+                elucidate_all_ions: bool = False, feature_id_field: str | None = None,
+                stepped_energies: list[float] | None = None) -> list[dict]:
     """Convert MS2 entries to .ms files and a batch manifest.
 
     raw_mzxml: mzXML files or folders; an entry reads the file named by its SOURCE_FILE, or the only file given.
@@ -152,6 +173,9 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
     """
     if unit not in ('NCE', 'eV'):
         raise ValueError('Confirm --collision-unit NCE or eV with the spectrum provider')
+    stepped = tuple(energy_values(stepped_energies)) if stepped_energies is not None else None
+    if stepped is not None and (len(stepped) < 2 or energy is not None):
+        raise ValueError('Use at least two stepped energies, without a scalar --energy override')
     output_dir.mkdir(parents=True, exist_ok=True)
     files = _raw_files(raw_mzxml)
     by_name, parsed = {f.name: f for f in files}, {}
@@ -175,6 +199,10 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
         if feature_ids is not None and feature not in feature_ids:
             continue
         ce, provenance, header_unit, ms2_scans = _energy(meta, raw_for(meta), energy, rt_window)
+        if stepped is not None:
+            ce, provenance, header_unit = stepped, 'verified_stepped_override', unit
+        if header_unit and header_unit != unit:
+            ce, provenance = None, 'conflicting_collision_units'
         ion = ions.get(feature, {})
         default = '[M-H]-' if meta.get('CHARGE', '').strip().endswith('-') else '[M+H]+'
         stated = (meta.get('ADDUCT') or meta.get('ION') or meta.get('IONTYPE') or '').replace(' ', '')
@@ -186,7 +214,8 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             adduct, source = ion.get('adduct') or default, 'ion_identity' if ion else 'default'
         base = {'feature_id': feature, 'feature_id_field': feature_id_field,
             'mgf_entry': index, 'collision_unit': unit,
-            'collision_energy': ce, 'energy_source': provenance,
+            'collision_energy': None if isinstance(ce, tuple) else ce,
+            'stepped_collision_energies': list(ce) if isinstance(ce, tuple) else None, 'energy_source': provenance,
             'header_collision_unit': header_unit, 'unit_conflict': bool(header_unit and header_unit != unit),
             'source_scan': meta.get('SOURCE_SCAN') or meta.get('SCANS'),
             'source_scan_role': 'feature_or_MS1_apex_not_MS2',
@@ -207,11 +236,17 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
         if adduct not in MODEL_ADDUCTS and not elucidate_all_ions:
             manifest.append({**base, 'status': 'unsupported_adduct', 'ms_path': ''})
             continue
-        if ce is None or not math.isfinite(ce) or ce <= 0 or not math.isfinite(parentmass) or parentmass <= 0:
+        if ce is None or any(not math.isfinite(value) or value <= 0 for value in (ce if isinstance(ce, tuple) else [ce])) or not math.isfinite(parentmass) or parentmass <= 0:
             manifest.append({**base, 'status': 'needs_energy' if ce is None else 'needs_parentmass', 'ms_path': ''})
             continue
         grouped[feature].append((base, peaks, meta))
+    def setting(row: tuple) -> tuple[float, ...]:
+        return tuple(row[0]['stepped_collision_energies'] or [row[0]['collision_energy']])
     for feature, records in grouped.items():
+        stepped_sets = {setting(row) for row in records if row[0]['stepped_collision_energies']}
+        if stepped_sets and (len(stepped_sets) != 1 or any(not row[0]['stepped_collision_energies'] for row in records)):
+            manifest.extend({**row, 'status': 'inconsistent_acquisition', 'ms_path': ''} for row, _, _ in records)
+            continue
         masses = [float(row[0]['parentmass']) for row in records]
         if max(masses) - min(masses) > max(0.01, min(masses) * 20e-6):
             manifest.extend({**row, 'status': 'inconsistent_precursor', 'ms_path': ''} for row, _, _ in records)
@@ -222,7 +257,7 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             continue
         blocks = defaultdict(list)
         for row in records:
-            blocks[row[0]['collision_energy']].append(row)
+            blocks[setting(row)].append(row)
         replicates = max(map(len, blocks.values()))
         for replicate in range(replicates):
             selected = [rows[replicate] for rows in blocks.values() if replicate < len(rows)]
@@ -235,18 +270,20 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             first = selected[0][0]
             lines = [f'>compound {feature}', f'>parentmass {first["parentmass"]}',
                 f'>ionization {first["adduct"] if first["adduct"] in MODEL_ADDUCTS else "[M-H]-" if first["adduct"].endswith("-") else "[M+H]+"}']
+            if first['stepped_collision_energies']:
+                lines.append('>stepped_collision_energies ' + ','.join(map(str, first['stepped_collision_energies'])))
             if first['formula']:
                 lines.append(f'>formula {first["formula"]}')
             if first['instrument']:
                 lines.append(f'>instrumentation {first["instrument"]}')
-            for row, peaks, _ in sorted(selected, key=lambda item: item[0]['collision_energy']):
-                lines.extend(['', f'>collision {row["collision_energy"]} {unit}'])
+            for row, peaks, _ in sorted(selected, key=setting):
+                lines.extend(['', f'>collision {(row["stepped_collision_energies"] or [row["collision_energy"]])[0]} {unit}'])
                 lines.extend(f'{mz} {intensity}' for mz, intensity in peaks)
                 manifest.append({**row, 'status': 'ready', 'ms_path': str(path.resolve())})
             path.write_text('\n'.join(lines) + '\n')
     with (output_dir / 'manifest.csv').open('w', newline='') as file:
         columns = ['feature_id', 'feature_id_field', 'mgf_entry', 'status', 'ms_path', 'collision_unit', 'collision_energy',
-            'energy_source', 'header_collision_unit', 'unit_conflict', 'source_scan', 'source_scan_role',
+            'stepped_collision_energies', 'energy_source', 'header_collision_unit', 'unit_conflict', 'source_scan', 'source_scan_role',
             'ms2_scans', 'parentmass', 'formula', 'instrument', 'adduct', 'adduct_source', 'ion_role',
             'related_features', 'adduct_partners', 'ion_evidence']
         writer = csv.DictWriter(file, fieldnames=columns)

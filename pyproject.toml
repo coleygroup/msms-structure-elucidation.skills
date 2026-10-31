@@ -18,6 +18,7 @@ batch = ["psutil>=5.9"]
 
 [project.scripts]
 msms-structure-elucidation = "msms_structure_elucidation.cli:main"
+msms-workflow-guard = "msms_structure_elucidation.workflow_guard:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

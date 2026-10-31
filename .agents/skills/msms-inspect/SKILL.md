@@ -8,6 +8,8 @@ description: Interactive TIC/MS1/MS2 chromatogram viewer for mzML files; lets yo
 ## Goal
 Visually explore an LC-MS/MS run: browse the total ion chromatogram (TIC), inspect MS1 spectra at any retention time, drill into MS2 fragmentation for any precursor, and export selected spectra as ms-pred `.ms` files for downstream elucidation.
 
+The selected Python environment needs this package and `pyteomics` as well as the viewer dependencies. Before export, inspect acquisition records using [collision-energy handling](../../../docs/collision-energy.md). Exports preserve verified NCE/eV units and explicit stepped settings; unresolved or conflicting settings require clarification rather than an invented energy.
+
 ## Instructions
 
 1. **Launch the inspector**:

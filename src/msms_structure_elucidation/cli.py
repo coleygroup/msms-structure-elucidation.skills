@@ -280,6 +280,8 @@ def run(args):
               'instrument': _instrument(getattr(args, 'instrument', None) or data['metadata'].get('instrumentation') or config.get('models', {}).get('simulator', {}).get('instrument')),
               'formula_results': [], 'config': config['_config_path'],
               'model_settings': model_options, 'search_mode': 'pubchem-mass' if mass_only else 'atlas'}
+    if data.get('acquisition_mode') == 'stepped':
+        result.update(acquisition_mode='stepped', stepped_collision=data['stepped_collision'])
     if data['header_units'] and data['header_units'] != [args.collision_unit]:
         result['warnings'].append(
             f"Collision headers say {', '.join(data['header_units'])}; using user-supplied {args.collision_unit}.")
@@ -419,7 +421,8 @@ def run(args):
             'scored_structures': sum(r.get('scored_structures', 0) for r in result['formula_results']),
             'nonzero_top_scores': sum(s > 0 for s in scores), 'top_score_range': [min(scores), max(scores)],
             'top_energy_pairs': len(best['energy_alignment']),
-            'top_predicted_peaks': sum(len(v) for v in best['predicted_spectra'].values())}
+            'top_predicted_peaks': sum(len(best['predicted_spectra'][key]) for key in
+                {pair.get('prediction_key', pair.get('atlas_key')) for pair in best['energy_alignment']})}
         matched = {(str(p['ce']), p['mz']) for p in best['matched_peaks']}
         unexplained = [{'ce': ce, 'mz': mz, 'intensity': intensity} for ce, peaks in data['spectra'].items()
             for mz, intensity in peaks if (str(ce), mz) not in matched]
@@ -574,7 +577,8 @@ def convert_mgf_command(args):
         args.collision_unit, args.energy, [Path(p).expanduser().resolve() for p in args.raw_mzxml or []] or None,
         args.instrument, args.ms2_rt_window, _feature_ids(args.feature_ids) if args.feature_ids else None,
         not args.no_ion_identity, args.ion_rt_window, args.elucidate_all_ions,
-        feature_id_field=getattr(args, 'feature_id_field', None))
+        feature_id_field=getattr(args, 'feature_id_field', None),
+        stepped_energies=getattr(args, 'stepped_energies', None))
     statuses = Counter(r['status'] for r in manifest)
     print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': statuses.pop('ready', 0),
         'needs_energy': statuses.pop('needs_energy', 0), **dict(statuses),
@@ -895,12 +899,21 @@ def _search_arguments(parser: argparse.ArgumentParser) -> None:
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='msms-structure-elucidation')
     sub = parser.add_subparsers(dest='command', required=True)
+    workflow = sub.add_parser('workflow', help='register, inspect and finalize a session-scoped analysis', add_help=False)
+    workflow.add_argument('workflow_args', nargs=argparse.REMAINDER)
+    energy_inspector = sub.add_parser('inspect-energy', help='inspect scan-specific acquisition energies in mzML')
+    energy_inspector.add_argument('--input', required=True)
+    energy_inspector.add_argument('--precursor-mz', type=float)
+    energy_inspector.add_argument('--rt-seconds', type=float)
+    energy_inspector.add_argument('--rt-window', type=float, default=30)
     preferences = sub.add_parser('preferences', help='show pipeline settings or save user-confirmed answers')
     preferences.add_argument('--config', help='config file to read/update; default uncommitted configs/local.yaml')
     preferences.add_argument('--set', nargs=2, action='append', metavar=('KEY', 'VALUE'),
                              help='save a dotted setting key and JSON value or unquoted string; repeatable')
     preferences.add_argument('--answer', nargs=2, action='append', metavar=('QUESTION', 'VALUE'),
-                             help='record an answer explicitly confirmed by the user; repeatable')
+                             help='record a user answer or verified acquisition setting; repeatable')
+    preferences.add_argument('--source', choices=['user', 'metadata'], default='user',
+                             help='answer provenance; metadata needs exact acquisition evidence in context')
     preferences.add_argument('--scope', default='project', help='project or a stable dataset/spectrum label')
     preferences.add_argument('--context-json', default='{}',
                              help='JSON object identifying the inputs, host or weights to which answers apply')
@@ -908,7 +921,7 @@ def main(argv=None):
     command = sub.add_parser('run', help='rank atlas candidates or predict all PubChem mass matches for a .ms spectrum')
     command.add_argument('--input', required=True)
     command.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'],
-                         help='user-confirmed unit of all experimental collision labels')
+                         help='verified unit of all experimental collision labels')
     command.add_argument('--output-dir', required=True)
     command.add_argument('--formula', help='neutral molecular formula; otherwise inferred with MSBuddy')
     command.add_argument('--formulas-file', help='one neutral formula per line; all are searched')
@@ -957,9 +970,11 @@ def main(argv=None):
     converter.add_argument('--input', required=True)
     converter.add_argument('--output-dir', required=True)
     converter.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'])
+    converter.add_argument('--stepped-energies', type=float, nargs='+',
+                           help='verified components of one stepped acquisition, in --collision-unit; not separate scans')
     converter.add_argument('--energy', type=float, help='confirmed energy override for entries without MS2 energy')
-    converter.add_argument('--raw-mzxml', nargs='+',
-                           help='mzXML files or folders; collisionEnergy is read from referenced MS2 scans, or from '
+    converter.add_argument('--raw-mzxml', '--raw-spectra', nargs='+',
+                           help='mzML/mzXML files or folders; activation energy is read from referenced MS2 scans, or from '
                                 'MS2 scans matching the precursor and retention time in the SOURCE_FILE run')
     converter.add_argument('--feature-id-field', type=str.upper,
                            choices=['FEATURE_ID', 'SPECTRUMID', 'TITLE', 'SCANS'],
@@ -1072,6 +1087,13 @@ def main(argv=None):
     viewer.add_argument('--title', help='with --export: page title')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'workflow':
+            from msms_structure_elucidation.workflow_guard import main as workflow_main
+            return workflow_main(args.workflow_args)
+        if args.command == 'inspect-energy':
+            from msms_structure_elucidation.energy_metadata import inspect_energy
+            print(json.dumps(inspect_energy(Path(args.input), args.precursor_mz, args.rt_seconds, args.rt_window), indent=2))
+            return 0
         if args.command == 'preferences':
             from msms_structure_elucidation.preferences import command as preferences_command
             return preferences_command(args)

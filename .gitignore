@@ -220,3 +220,4 @@ __marimo__/
 
 # Host-specific settings written by `msms-structure-elucidation setup`
 configs/local.yaml
+.msms-workflow/

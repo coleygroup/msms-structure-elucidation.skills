@@ -4,6 +4,8 @@ Give an AI coding agent an experimental tandem mass spectrum and ask it to inves
 
 Use [msms-atlas-retrieval](.agents/skills/msms-atlas-retrieval/SKILL.md) to search the public ICEBERG PubChem atlas, and [msms-predict](.agents/skills/msms-predict/SKILL.md) to predict spectra and fragments from SMILES with GLACIER or ICEBERG.
 
+Use [msms-evidence-review](.agents/skills/msms-evidence-review/SKILL.md) to assess existing candidates from their matched and unexplained peaks. It supports delegated batch reviews while the main agent keeps monitoring jobs. New candidate generation belongs to [msms-structure-proposal](.agents/skills/msms-structure-proposal/SKILL.md) after the user selects that route.
+
 ## Quick start
 
 Open Codex or Claude Code in your project and type:
@@ -13,6 +15,8 @@ Open Codex or Claude Code in your project and type:
 Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. It first finds or asks for the prediction server, which can be this machine, a GPU host reached over ssh, or a Slurm cluster. It confirms the intended prediction model and exact weights; either a complete ICEBERG checkpoint pair or a GLACIER checkpoint is sufficient. It then sets up that host's environment, probes and tunes it, saves the settings to `configs/local.yaml`, and registers the [MCP server](docs/technical-guide.md#mcp-server) that exposes ICEBERG, GLACIER, FRIGID, MIST and atlas retrieval as tools.
 
 Installation does not require collision-energy information. When you are ready to analyze a spectrum, attach it or give its path and ask the agent to run the workflow. At that point, the agent should confirm the supplied collision energies and whether their values are **NCE or absolute eV** before scoring; a file header alone does not establish the unit.
+
+The [workflow completion hooks](docs/workflow-hooks.md) help Codex and Claude Code continue unfinished analyses. They check registered jobs, current per-feature evidence reviews, user-selected follow-up routes and final outputs before normal turn completion. Install and review the hooks in the client project; they do not require a `CLAUDE.md` file.
 
 ## Explore a completed example
 
