@@ -24,7 +24,7 @@ In the demo, the mirror plot opens with all paired collision energies merged. Sw
 
 | Input | What the agent needs |
 | --- | --- |
-| Spectrum | A `.ms` file, GNPS/MZmine `.mgf`, or raw/mzML data from which to export MS/MS spectra. |
+| Spectrum | A `.ms` file, GNPS2 Everything Bagel/MZmine `.mgf`, or raw/mzML data from which to export MS/MS spectra. |
 | Collision energies | Every supplied value and your confirmation that the values are NCE or absolute eV. |
 | Precursor information | Precursor m/z and adduct, when they are not already in the file. |
 | Helpful context | Instrument, sample context, and a molecular formula or formula list if you have one. |

@@ -107,7 +107,7 @@ def save_local(update: dict, path: Path | None = None) -> dict:
     path = path or LOCAL_CONFIG
     data = read_yaml(path) if path.is_file() else {}
     overlay(data, update)
-    header = ('# Written by `msms-structure-elucidation setup` for this host; overrides configs/default.yaml.\n'
+    header = ('# Local host settings and saved pipeline answers; overrides configs/default.yaml.\n'
               '# Not committed. Rerun setup after hardware changes.\n')
     path.write_text(header + dump_yaml(data))
     return data

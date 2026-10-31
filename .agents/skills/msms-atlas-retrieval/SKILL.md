@@ -6,7 +6,7 @@ description: Retrieve candidate structures for an experimental MS/MS spectrum fr
 
 Use this skill to match experimental MS/MS spectra against the public ICEBERG PubChem atlas. For spectra predicted directly with GLACIER or ICEBERG, use `msms-predict`; for molecular fingerprint prediction or comparison, use `msms-mist-fingerprint` or `msms-fingerprint-compare`. The direct mass-only PubChem option below searches PubChem and predicts its candidates rather than retrieving stored atlas spectra.
 
-Confirm the collision-energy unit, search route, and intended prediction model with the user. For model-backed work, confirm the exact checkpoint paths with `msms-setup`. With MCP connected, call `server_info` first and use its tools.
+Read [saved pipeline answers](../../../docs/pipeline-preferences.md) and reuse the collision-energy unit, search route and intended model when their scope/context matches. Ask only for missing or conflicting choices and save the answers. For model-backed work, confirm the exact checkpoint paths with `msms-setup`. With MCP connected, call `server_info` first and use its tools.
 
 ## Choose the spectrum source
 
@@ -20,7 +20,7 @@ For **GLACIER**, predict every candidate with the confirmed GLACIER weights; no 
 
 ## Atlas retrieval
 
-Ask whether collision energies are NCE or absolute eV; do not infer the unit from file headers or numeric values. After NCE is confirmed:
+Reuse the matching dataset/spectrum answer for NCE versus absolute eV, or ask once and save it; do not infer the unit from file headers or numeric values. After NCE is confirmed:
 
 ```bash
 msms-structure-elucidation run --input sample.ms --collision-unit NCE \

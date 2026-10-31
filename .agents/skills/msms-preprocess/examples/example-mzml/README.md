@@ -9,4 +9,4 @@ python .agents/skills/msms-preprocess/scripts/run.py \
     --msconvert-bin /path/to/msconvert
 ```
 
-The output is `results/sample.mzML`. Verify that it contains the expected scan counts and precursor masses before downstream analysis. If a suitable converter is unavailable on this host, export mzML on the instrument workstation and use the exported file directly.
+The output is `results/sample.mzML`. Verify that it contains the expected scan counts and precursor masses before downstream analysis. If msconvert is missing, follow the [installation guidance](../../SKILL.md#if-msconvert-is-missing): look up current native or Docker instructions for the conversion host and let the user perform installation and setup. Exporting mzML on the instrument workstation is also an option.

@@ -573,7 +573,8 @@ def convert_mgf_command(args):
     manifest = convert_mgf(Path(args.input).expanduser().resolve(), Path(args.output_dir).expanduser().resolve(),
         args.collision_unit, args.energy, [Path(p).expanduser().resolve() for p in args.raw_mzxml or []] or None,
         args.instrument, args.ms2_rt_window, _feature_ids(args.feature_ids) if args.feature_ids else None,
-        not args.no_ion_identity, args.ion_rt_window, args.elucidate_all_ions)
+        not args.no_ion_identity, args.ion_rt_window, args.elucidate_all_ions,
+        feature_id_field=getattr(args, 'feature_id_field', None))
     statuses = Counter(r['status'] for r in manifest)
     print(json.dumps({'output_dir': str(Path(args.output_dir).resolve()), 'ready': statuses.pop('ready', 0),
         'needs_energy': statuses.pop('needs_energy', 0), **dict(statuses),
@@ -894,6 +895,16 @@ def _search_arguments(parser: argparse.ArgumentParser) -> None:
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='msms-structure-elucidation')
     sub = parser.add_subparsers(dest='command', required=True)
+    preferences = sub.add_parser('preferences', help='show pipeline settings or save user-confirmed answers')
+    preferences.add_argument('--config', help='config file to read/update; default uncommitted configs/local.yaml')
+    preferences.add_argument('--set', nargs=2, action='append', metavar=('KEY', 'VALUE'),
+                             help='save a dotted setting key and JSON value or unquoted string; repeatable')
+    preferences.add_argument('--answer', nargs=2, action='append', metavar=('QUESTION', 'VALUE'),
+                             help='record an answer explicitly confirmed by the user; repeatable')
+    preferences.add_argument('--scope', default='project', help='project or a stable dataset/spectrum label')
+    preferences.add_argument('--context-json', default='{}',
+                             help='JSON object identifying the inputs, host or weights to which answers apply')
+    preferences.add_argument('--get', help='look up a confirmed question in the exact scope and context')
     command = sub.add_parser('run', help='rank atlas candidates or predict all PubChem mass matches for a .ms spectrum')
     command.add_argument('--input', required=True)
     command.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'],
@@ -950,6 +961,9 @@ def main(argv=None):
     converter.add_argument('--raw-mzxml', nargs='+',
                            help='mzXML files or folders; collisionEnergy is read from referenced MS2 scans, or from '
                                 'MS2 scans matching the precursor and retention time in the SOURCE_FILE run')
+    converter.add_argument('--feature-id-field', type=str.upper,
+                           choices=['FEATURE_ID', 'SPECTRUMID', 'TITLE', 'SCANS'],
+                           help='MGF header to use as feature ID; use SCANS for GNPS2 Everything Bagel row IDs')
     converter.add_argument('--feature-ids', help='file of feature IDs to convert (one per line or first CSV column); '
                                                  'ion identity still uses every feature in the MGF')
     converter.add_argument('--no-ion-identity', action='store_true',
@@ -1058,6 +1072,9 @@ def main(argv=None):
     viewer.add_argument('--title', help='with --export: page title')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'preferences':
+            from msms_structure_elucidation.preferences import command as preferences_command
+            return preferences_command(args)
         return {'run': run, 'review': review, 'denovo': denovo,
                 'visualize': visualize, 'convert-mgf': convert_mgf_command,
                 'batch': batch, 'setup': setup_command, 'mcp': mcp_command,

@@ -101,13 +101,25 @@ def _energy(meta: dict, raw: dict[str, dict], override: float | None,
     return None, 'ambiguous_MS2_scans' if len(values) > 1 else 'missing_MS2_energy', None, scans
 
 
-def _ion_identity(spectra: list, rt_window: float) -> dict[str, dict]:
+def _feature_id(meta: dict, index: int, field: str | None = None) -> str:
+    """Read an explicitly selected feature identifier or the default MGF identifier."""
+    if field:
+        value = meta.get(field.upper())
+        if not value:
+            raise ValueError(f'MGF entry {index} is missing selected feature ID field {field}')
+        return value
+    return meta.get('FEATURE_ID') or meta.get('SPECTRUMID') or meta.get('TITLE') or str(index)
+
+
+def _ion_identity(spectra: list, rt_window: float, feature_id_field: str | None = None) -> dict[str, dict]:
     """Ion identity over every MS2 feature with a precursor m/z and retention time."""
     features = {}
     for index, (meta, peaks) in enumerate(spectra, 1):
-        feature = meta.get('FEATURE_ID') or meta.get('SPECTRUMID') or meta.get('TITLE') or str(index)
+        if meta.get('MSLEVEL', '2').strip() not in ('2', '2.0') or not peaks:
+            continue
+        feature = _feature_id(meta, index, feature_id_field)
         mz, rt = _float((meta.get('PEPMASS') or '').split(' ')[0]), _float(meta.get('RTINSECONDS'))
-        if feature in features or mz is None or rt is None or meta.get('MSLEVEL', '2').strip() not in ('2', '2.0'):
+        if feature in features or mz is None or rt is None:
             continue
         features[feature] = {'id': feature, 'mz': mz, 'rt': rt, 'peaks': peaks,
                              'negative': meta.get('CHARGE', '').strip().endswith('-')}
@@ -128,11 +140,12 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
                 energy: float | None = None, raw_mzxml: Path | list[Path] | None = None,
                 instrument: str | None = None, rt_window: float = 30.0, feature_ids: set[str] | None = None,
                 ion_identity: bool = True, ion_rt_window: float = 3.0,
-                elucidate_all_ions: bool = False) -> list[dict]:
+                elucidate_all_ions: bool = False, feature_id_field: str | None = None) -> list[dict]:
     """Convert MS2 entries to .ms files and a batch manifest.
 
     raw_mzxml: mzXML files or folders; an entry reads the file named by its SOURCE_FILE, or the only file given.
     feature_ids: convert only these features; ion identity still uses every feature in the MGF.
+    feature_id_field: use this MGF header as the feature ID (SCANS for GNPS2 Everything Bagel row IDs).
     ion_identity: derive each feature's adduct, and whether it is a multimer or in-source fragment, from
     co-eluting features (ions.annotate). In-source fragments, multimers and adducts the models do not
     support get their own manifest status unless elucidate_all_ions.
@@ -150,7 +163,7 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
     grouped = defaultdict(list)
     manifest = []
     spectra = list(entries(input_path))
-    ions = _ion_identity(spectra, ion_rt_window) if ion_identity else {}
+    ions = _ion_identity(spectra, ion_rt_window, feature_id_field) if ion_identity else {}
     for index, (meta, peaks) in enumerate(spectra, 1):
         try:
             level = int(float(meta.get('MSLEVEL', '2')))
@@ -158,7 +171,7 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             level = 0
         if level != 2 or not peaks:
             continue
-        feature = meta.get('FEATURE_ID') or meta.get('SPECTRUMID') or meta.get('TITLE') or str(index)
+        feature = _feature_id(meta, index, feature_id_field)
         if feature_ids is not None and feature not in feature_ids:
             continue
         ce, provenance, header_unit, ms2_scans = _energy(meta, raw_for(meta), energy, rt_window)
@@ -171,7 +184,8 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
             adduct, source = stated, 'mgf'
         else:
             adduct, source = ion.get('adduct') or default, 'ion_identity' if ion else 'default'
-        base = {'feature_id': feature, 'mgf_entry': index, 'collision_unit': unit,
+        base = {'feature_id': feature, 'feature_id_field': feature_id_field,
+            'mgf_entry': index, 'collision_unit': unit,
             'collision_energy': ce, 'energy_source': provenance,
             'header_collision_unit': header_unit, 'unit_conflict': bool(header_unit and header_unit != unit),
             'source_scan': meta.get('SOURCE_SCAN') or meta.get('SCANS'),
@@ -231,7 +245,7 @@ def convert_mgf(input_path: Path, output_dir: Path, unit: str,
                 manifest.append({**row, 'status': 'ready', 'ms_path': str(path.resolve())})
             path.write_text('\n'.join(lines) + '\n')
     with (output_dir / 'manifest.csv').open('w', newline='') as file:
-        columns = ['feature_id', 'mgf_entry', 'status', 'ms_path', 'collision_unit', 'collision_energy',
+        columns = ['feature_id', 'feature_id_field', 'mgf_entry', 'status', 'ms_path', 'collision_unit', 'collision_energy',
             'energy_source', 'header_collision_unit', 'unit_conflict', 'source_scan', 'source_scan_role',
             'ms2_scans', 'parentmass', 'formula', 'instrument', 'adduct', 'adduct_source', 'ion_role',
             'related_features', 'adduct_partners', 'ion_evidence']

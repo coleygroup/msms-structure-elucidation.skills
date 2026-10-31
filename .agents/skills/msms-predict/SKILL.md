@@ -4,7 +4,7 @@ description: Predict MS/MS spectra and fragment assignments from SMILES with GLA
 ---
 # MS/MS prediction with GLACIER or ICEBERG
 
-Use this skill to predict spectra and fragments for known candidate SMILES. Confirm the model, exact weights, adduct, instrument, collision energies and whether those energies are NCE or absolute eV. Use `msms-setup` to configure the model host and interpreter; either model is sufficient.
+Use this skill to predict spectra and fragments for known candidate SMILES. Read [saved pipeline answers](../../../docs/pipeline-preferences.md) for the model, exact weights, adduct, instrument, collision energies and NCE/eV unit. Reuse confirmations within their recorded scope/context; ask only for missing or conflicting details and save the answers. Use `msms-setup` to configure the model host and interpreter; either model is sufficient.
 
 | Model | Required weights | Prediction route |
 |---|---|---|

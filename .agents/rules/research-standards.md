@@ -25,7 +25,7 @@ Before starting, classify the user's request:
 
 1. **Define output directory**: Create a timestamped results directory under `results/`.
 
-2. **Plan before running**: Write a brief plan (inputs, which models to run, orchestration mode, expected outputs). Get user confirmation before running models.
+2. **Plan before running**: Write a brief plan (inputs, which models to run, orchestration mode, expected outputs). Reuse applicable user authorization and saved confirmations; ask only for missing or changed decisions. Save pipeline answers with their scope/context as described in `docs/pipeline-preferences.md`.
 
 3. **Run models**: Use the appropriate skills. Always specify the Python environment.
 
@@ -35,4 +35,4 @@ Before starting, classify the user's request:
 
 ## Notes
 - Prioritize existing skills over writing new scripts.
-- Always validate that input spectra are in a supported format before running models — use `msms-preprocess` if starting from `.raw`.
+- Validate that input spectra are supported before running models. Use the selected feature workflow directly when it accepts the input; use `msms-preprocess` only when conversion or polarity splitting is needed.

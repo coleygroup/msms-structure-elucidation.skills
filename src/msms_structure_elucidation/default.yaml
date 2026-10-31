@@ -56,6 +56,14 @@ mcp:
 preprocessing:
   converter: msconvert
   output_format: mzML
+pipeline:
+  reuse_answers: true
+  answers: {}  # user confirmations belong in the uncommitted local config, scoped by project/dataset
 feature_detect:
+  backend: everything_bagel  # recommended first-run choice; ask once if no feature list or saved answer
+  everything_bagel:
+    interface: auto  # browser for suitable local files, GNPS2 for server-side processing
+  custom:
+    instructions: ''  # user-supplied workflow or feature-table/MGF handoff
   mzmine_bin: ''
   mzmine_user: ''
