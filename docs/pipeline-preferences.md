@@ -22,6 +22,12 @@ Use `mzmine` or `custom` for the other choices. For a custom route, collect only
 
 On later runs, reuse the saved choice without asking again. Ask only for missing details, changed requirements or a conflict with the current inputs. A new explicit user choice takes precedence; update the settings and confirmation accordingly.
 
+## Optional de novo route after evidence review
+
+After retrieval/scoring, the agent reviews every result. For weakly supported entries, ask the user whether to use agent proposals scored by ICEBERG/GLACIER (workflow step 4), FRIGID de novo followed by scoring (step 5), both, or skip. Wait for the selection before either optional route. One answer can cover an identified batch or a subset of entries. Reuse an earlier selection only if it explicitly covers the same analysis, inputs, affected entries and model context.
+
+Save the selected answer as `denovo_route` with value `agent`, `frigid`, `both` or `skip`, using an analysis/entry scope and context identifying those inputs and model/weights. Keep the agent's recommended action distinct from the user-selected route in `evidence_review.json`. Do not create a project-wide de novo authorization from one analysis's answer. Selecting both requests both routes; selecting skip proceeds to reporting with the unresolved evidence visible.
+
 ## Save and reuse other answers
 
 ```bash
