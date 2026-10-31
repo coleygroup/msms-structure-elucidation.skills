@@ -1,46 +1,67 @@
+[![One natural-language prompt, automatic MS/MS analysis, and an interactive molecular structure report](media/promo/msms-elucidation.gif)](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/)
+
 # MS/MS structure elucidation
 
-Give an AI coding agent an experimental tandem mass spectrum and ask it to investigate possible molecular structures. These skills combine formula evidence, the public ICEBERG PubChem spectral atlas, optional structure prediction, and an interactive fragment viewer. They run with Codex or Claude Code; you can also use the Python command line tools directly.
+Ask Codex or Claude Code to analyze an experimental tandem mass spectrum and explore possible molecular structures. These skills connect your agent to candidate searches, MS/MS prediction with ICEBERG or GLACIER, and an interactive report with spectra and molecular fragments.
 
-Use [msms-atlas-retrieval](.agents/skills/msms-atlas-retrieval/SKILL.md) to search the public ICEBERG PubChem atlas, and [msms-predict](.agents/skills/msms-predict/SKILL.md) to predict spectra and fragments from SMILES with GLACIER or ICEBERG.
-
-Use [msms-evidence-review](.agents/skills/msms-evidence-review/SKILL.md) to assess existing candidates from their matched and unexplained peaks. It supports delegated batch reviews while the main agent keeps monitoring jobs. New candidate generation belongs to [msms-structure-proposal](.agents/skills/msms-structure-proposal/SKILL.md) after the user selects that route.
+[Explore the interactive demo](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/)
 
 ## Quick start
 
-Open Codex or Claude Code in your project and type:
+### 1. Install Codex or Claude Code
 
-> Install the skills from https://github.com/coleygroup/msms-structure-elucidation.skills. Check which required environments, repository checkouts, and model assets are already available, and tell me what is ready or missing. I am not providing a spectrum yet.
+Choose one and follow its official installation guide: [Codex](https://learn.chatgpt.com/docs/quickstart) or [Claude Code](https://code.claude.com/docs/en/quickstart). Install it on your computer and sign in.
 
-Agents: installation follows the [msms-setup](.agents/skills/msms-setup/SKILL.md) skill. It first finds or asks for the prediction server, which can be this machine, a GPU host reached over ssh, or a Slurm cluster. It confirms the intended prediction model and exact weights; either a complete ICEBERG checkpoint pair or a GLACIER checkpoint is sufficient. It then sets up that host's environment, probes and tunes it, saves the settings to `configs/local.yaml`, and registers the [MCP server](docs/technical-guide.md#mcp-server) that exposes ICEBERG, GLACIER, FRIGID, MIST and atlas retrieval as tools.
+Depending on your account and usage, you may need a paid monthly plan or usage credits. See [Codex plans](https://learn.chatgpt.com/docs/pricing) or [Claude Code access options](https://code.claude.com/docs/en/quickstart#before-you-begin).
 
-Installation does not require collision-energy information. When you are ready to analyze a spectrum, attach it or give its path and ask the agent to run the workflow. At that point, the agent should confirm the supplied collision energies and whether their values are **NCE or absolute eV** before scoring; a file header alone does not establish the unit.
+### 2. Ask it to install these skills
 
-The [workflow completion hooks](docs/workflow-hooks.md) help Codex and Claude Code continue unfinished analyses. They check registered jobs, current per-feature evidence reviews, user-selected follow-up routes and final outputs before normal turn completion. Install and review the hooks in the client project; they do not require a `CLAUDE.md` file.
+Create or choose a folder for your analyses. Open Codex or Claude Code in that folder, start a chat, and copy and paste this one-line prompt:
 
-## Explore a completed example
+```text
+Install and set up https://github.com/coleygroup/msms-structure-elucidation.skills for this project. Read its AGENTS.md and follow its msms-setup skill. Check what is already available, guide me through anything missing, and tell me when setup is ready. I am not providing a spectrum yet.
+```
 
-The [clinical unknowns demo](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/) shows the three public unknowns in [ms-pred's clinical spectra directory](https://github.com/coleygroup/ms-pred/tree/main/data/exp_specs/clinical) on one interactive page. The GitHub Pages workflow rebuilds its HTML on every commit; you can also [build it locally](demo/README.md). The provider confirmed that the five energies, 10, 20, 30, 40, and 50, are **NCE** for all three unknowns, despite the files' eV labels.
+Answer the setup questions, including where analyses should run and which available model to use. The agent checks the required software and model files and helps you complete the setup. You do not need to provide your own spectrum yet.
 
-In the demo, the mirror plot opens with all paired collision energies merged. Switch to an individual energy, click or hover over peaks to inspect predicted fragments on a candidate structure, and compare candidates. You can try the review controls; demo notes stay in your browser. Candidates are ranked by entropy similarity; explained intensity is shown as supporting evidence. Neither is a probability of identification.
+### 3. Start a new session and run the example
+
+Once setup is complete, start a new chat/session in the same project so the installed skills and tools are available. Copy and paste:
+
+```text
+Reproduce the public clinical demo using csf_unknown.ms, plasma_unknown_198.ms, and plasma_unknown_583.ms from ms-pred's data/exp_specs/clinical directory. The provider confirmed 10, 20, 30, 40, and 50 NCE for all three. Use BUDDY’s top three formula hypotheses, search the public ICEBERG 2.1 PubChem atlas first, review the evidence for every result, and show me one interactive report with all three unknowns.
+```
+
+These example files are supplied with [ms-pred](https://github.com/coleygroup/ms-pred/tree/main/data/exp_specs/clinical), so you do not need to prepare or upload your own data. Open the report link the agent provides and compare it with the [public demo](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/). The [demo guide](demo/README.md) records the input spectra, energy settings and saved results.
+
+## Explore your results
+
+The report shows ranked molecular structures beside an experimental-versus-predicted mirror spectrum. Select a candidate, then click or hover over a peak to see its predicted fragment highlighted on the molecule. Switch collision energies or compare another candidate to examine the evidence.
+
+In the local viewer, you can save candidate comments and fragment notes, then ask:
+
+> Please review my saved notes and refine the candidates.
+
+The public demo lets you try the same review controls; its trial notes stay in your browser. Similarity scores and explained intensity support structural hypotheses. They are not probabilities of identification, and a good match does not establish a unique molecular identity.
 
 ## What to provide
 
 | Input | What the agent needs |
 | --- | --- |
-| Spectrum | A `.ms` file, GNPS2 Everything Bagel/MZmine `.mgf`, or raw/mzML data from which to export MS/MS spectra. |
-| Collision energies | Every supplied value and your confirmation that the values are NCE or absolute eV. |
+| Spectrum | A `.ms` file, GNPS2 Everything Bagel/MZmine `.mgf`, raw/mzML data, or a public link to spectra or files in GNPS, GNPS2, MassIVE or another repository. For dataset or task links, specify which files or features to analyze. |
+| Collision energies | Values, whether they are NCE or absolute eV, and whether acquisition used separate or stepped energies. For raw/mzML files, the agent checks acquisition metadata first and asks about unresolved settings. |
 | Precursor information | Precursor m/z and adduct, when they are not already in the file. |
 | Helpful context | Instrument, sample context, and a molecular formula or formula list if you have one. |
 
-A formula is optional: supply one or a list, ask for formula hypotheses from the spectrum, or request a [PubChem mass search within a ppm tolerance](docs/technical-guide.md#mass-only-pubchem-option) that skips formula prediction and predicts every matched candidate. With ICEBERG, prefer suitable public atlas spectra unless you request fresh predictions. The atlas uses ICEBERG 2.1 trained on NIST'23; when local weights differ or matching weights have not been verified, the agent explains that combining their predictions may affect ranking comparability. GLACIER requires predictions for every candidate because no open GLACIER atlas is currently available. Local model weights are optional for atlas retrieval and required for fresh predictions. Licensed NIST weights are never bundled with these skills.
+A molecular formula is optional. If you do not supply one, the agent recommends BUDDY’s top three formulas and asks whether you want to use those or a [PubChem mass search within a ppm tolerance](docs/technical-guide.md#mass-only-pubchem-option) that skips formula prediction and predicts candidates across every matched formula. Your choice is saved for the current analysis. Mass filtering includes C, H, N, O, P, S, F, Cl, Br, I, Si, B and Se by default; you can tell the agent to use a different element filter.
 
 ## What the agent does
 
-1. Reads or converts the spectrum and checks its precursor, adduct, instrument, and energy labels with you.
+1. Reads or converts the spectrum, checks available acquisition information, and asks you about missing or ambiguous settings.
 2. Uses supplied formulas, inferred hypotheses, or PubChem mass matches within your ppm tolerance. The mass-only route skips formula prediction and ranks candidates across every matched formula.
 3. Uses your confirmed model and weights: ICEBERG can reuse suitable public atlas spectra; GLACIER and mass-only searches predict every candidate. It converts confirmed NCE to integer eV for prediction and compares **all** supplied collision energies.
-4. Ranks candidate structures, checks explained intensity and unmatched peaks, and flags structures these spectra cannot distinguish. If you add candidate structures or review notes, it can refine the analysis.
+4. Reviews every result, checks matched and unexplained peaks, and flags structures these spectra cannot distinguish. It keeps monitoring running analyses and can review finished results while other jobs continue.
+5. If evidence is weak, asks whether you want proposed new structures, FRIGID de novo generation, both, or neither. You can also add candidate structures or review notes for a follow-up analysis.
 
 The public atlas does not contain licensed NIST structures. A good spectral match supports a hypothesis; it does not establish a unique molecular identity.
 
@@ -50,15 +71,4 @@ The public atlas does not contain licensed NIST structures. A good spectral matc
 - `retrieval.json`, the machine-readable record of formulas, energy conversion, candidate scores, sources, and explicit outcomes such as no atlas coverage or missing model assets.
 - A local review page where candidate decisions and fragment notes are saved to `review_notes.json`. A batch of unknowns can be reviewed together in one page.
 
-Both the CLI atlas route and `run --mass-only`/`batch --mass-only` write these reports. For a ppm search that skips formula prediction, use `run --input sample.ms --collision-unit NCE --mass-only --ms1-ppm 5 --model glacier --output-dir results/sample` after confirming NCE and the model weights. The MCP `search_pubchem_mass` tool runs the same route on the prediction server; individual `score_candidates` calls return job results for explicit candidate lists.
-
-## Try the example yourself
-
-1. Ask your agent to install the skills using the quick-start prompt above.
-2. Give it the [plasma spectrum](https://github.com/coleygroup/ms-pred/blob/main/data/exp_specs/clinical/plasma_unknown_583.ms) and say: **“Analyze this spectrum. Its collision energies are 10, 20, 30, 40, and 50 NCE. Search the public atlas first and show me the interactive fragment viewer.”**
-3. Open the result URL the agent provides. Select a candidate and energy, click a peak, compare another candidate, and inspect the unexplained peaks.
-4. Add a candidate or fragment note in the local viewer, then tell the agent: **“Please review my saved notes and refine the candidates.”**
-
-The demo includes `csf_unknown.ms`, `plasma_unknown_198.ms`, and `plasma_unknown_583.ms`. See the [demo guide](demo/README.md) for the input spectra, energy mapping, saved results and build instructions.
-
-For manual installation, batch processing, model checkpoints, and command line options, see the [technical guide](docs/technical-guide.md). The [scientific workflow](.agents/workflows/msms-elucidation.md) and [skills](.agents/skills) contain the agent procedures.
+For manual installation, batch processing, model files and command-line options, see the [technical guide](docs/technical-guide.md). The [workflow completion hooks](docs/workflow-hooks.md) help the agent track unfinished analyses. The detailed agent procedures live in [AGENTS.md](AGENTS.md), the [scientific workflow](.agents/workflows/msms-elucidation.md), and the [skills](.agents/skills).

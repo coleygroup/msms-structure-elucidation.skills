@@ -180,6 +180,29 @@ class MassWorkflowTests(unittest.TestCase):
                 self.assertTrue((self.root / 'out/pubchem_candidates.json').is_file())
                 self.assertTrue(any('Ignoring' in warning for warning in result['warnings']))
 
+    def test_glacier_formula_guided_search_uses_buddy_and_skips_atlas(self):
+        self.spec.write_text(self.spec.read_text().replace('>formula STALE\n',''))
+        groups=self.matches()['formulas'][:3]
+        calls=[]
+        fake=self.fake_worker(calls)
+        def run(python,action,**kwargs):
+            if action=='formula':
+                return [{'formula':g['formula'],'source':'MSBuddy inferred'} for g in groups]
+            return fake(python,action,**kwargs)
+        argv=self.argv()
+        argv.remove('--mass-only')
+        by_formula={g['formula']:g for g in groups}
+        with patch.object(cli,'worker',side_effect=run), \
+             patch.object(pubchem,'candidates_for_formula',side_effect=lambda f,*args:by_formula[f]) as lookup, \
+             patch.object(pubchem,'mass_candidates',side_effect=AssertionError('No mass-only search')), \
+             patch.object(cli,'download_mgf',side_effect=AssertionError('No ICEBERG atlas for GLACIER')):
+            self.assertEqual(cli.main(argv),0)
+        result=self.result()
+        self.assertEqual(lookup.call_count,3)
+        self.assertEqual(result['search_mode'],'pubchem-formulas')
+        self.assertEqual(result['scored_structures'],3)
+        self.assertTrue(result['prediction_complete'])
+
     def test_resume_reuses_predictions_but_checkpoint_change_invalidates_them(self):
         calls = []
         with patch.object(pubchem, 'mass_candidates', return_value=self.matches()), \
@@ -374,14 +397,14 @@ class WrapperTests(unittest.TestCase):
 
 
 class ModelAdapterTests(unittest.TestCase):
-    def test_new_shards_bypass_native_cache_for_both_models(self):
+    def test_new_iceberg_shards_bypass_native_cache(self):
         from msms_structure_elucidation import worker
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             checkpoint = root / 'weights.ckpt'
             checkpoint.touch()
             (root / 'preds.hdf5').touch()
-            for model in ('glacier', 'iceberg'):
+            for model in ('iceberg',):
                 with self.subTest(model=model):
                     (root / f'{model}_run_successful').touch()
                     module_name = f'ms_pred.{model}.{model}_elucidation'

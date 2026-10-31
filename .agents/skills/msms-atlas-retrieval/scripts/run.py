@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--formulas-file')
     parser.add_argument('--mass-only', action='store_true')
     parser.add_argument('--ms1-ppm', type=float)
-    parser.add_argument('--formula-elements', default='CHNOPS')
+    parser.add_argument('--formula-elements', default=None)
     parser.add_argument('--model', choices=['iceberg', 'glacier'])
     parser.add_argument('--checkpoint')
     parser.add_argument('--gen-checkpoint')

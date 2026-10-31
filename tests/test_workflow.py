@@ -58,7 +58,8 @@ class WorkflowTests(unittest.TestCase):
         mgf.write_text('BEGIN IONS\nSMILES=C\nCOLLISION_ENERGY=30\n15.0 12\nEND IONS\n')
         args = dict(input=str(spec), output_dir=str(root / 'output'), formula=None, ms_pred_python='python',
                     atlas_mgf=str(mgf), atlas_url='https://example.test', top_k=10, no_report=True,
-                    collision_unit='eV', ms1_ppm=None, ms2_ppm=None, formula_elements='CHNOPS', no_pubchem=False)
+                    collision_unit='eV', ms1_ppm=None, ms2_ppm=None, formula_elements='CHNOPS',
+                    no_pubchem=False, pubchem_fallback=True)
         args.update(extra)
         return SimpleNamespace(**args)
 
@@ -84,6 +85,17 @@ class WorkflowTests(unittest.TestCase):
             data = json.loads((root / 'output/retrieval.json').read_text())
             self.assertTrue(data['formula_source'].startswith('PubChem mass match'))
             self.assertEqual(data['status'], 'no_candidates')
+
+    def test_no_formula_does_not_silently_switch_to_mass_filtering(self):
+        from msms_structure_elucidation import pubchem
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(cli,'worker',return_value=[]), patch.object(pubchem,'formulas_by_mass') as search:
+                self.assertEqual(cli.run(self._run_args(root,pubchem_fallback=False)),0)
+            search.assert_not_called()
+            result=json.loads((root/'output/retrieval.json').read_text())
+            self.assertEqual(result['status'],'needs_formula')
+            self.assertEqual(result['next_step'],'choose-formula-or-mass-search')
 
     def test_mass_tolerance_follows_instrument(self):
         from msms_structure_elucidation.spectrum import mass_tolerance
@@ -278,7 +290,10 @@ class WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / 'weights.ckpt'
             checkpoint.touch()
-            with patch.dict(sys.modules, modules), patch.object(worker, '_check_glacier_features'), patch.object(worker, '_require_cuda'), patch.object(worker, '_experimental_spectra',
+            def native_glacier(smiles, energies, nce, adduct, instrument, checkpoint, devices, *runtime):
+                captured.append({'collision_energies':energies,'nce':nce,'instrument':instrument,'cuda_devices':devices})
+                return Path(tmp)
+            with patch.dict(sys.modules, modules), patch('msms_structure_elucidation.glacier.run', side_effect=native_glacier), patch.object(worker, '_check_glacier_features'), patch.object(worker, '_require_cuda'), patch.object(worker, '_experimental_spectra',
                     return_value=({'parentmass': str(precursor), 'ionization': '[M+H]+'},
                                   converted, source)):
                 for model in ('glacier', 'iceberg'):

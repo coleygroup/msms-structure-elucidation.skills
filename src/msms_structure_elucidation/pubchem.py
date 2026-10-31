@@ -17,7 +17,7 @@ from msms_structure_elucidation.ions import MODEL_ADDUCTS, NEGATIVE, POSITIVE, P
 
 PUBCHEM = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug'
 ADDUCT_SHIFT = {adduct: shift for adduct, shift in {**POSITIVE, **NEGATIVE}.items() if adduct in MODEL_ADDUCTS}
-DEFAULT_ELEMENTS = 'CHNOPS'
+DEFAULT_ELEMENTS = 'CHNOPSClBrFISiBSe'
 _BATCH = 500
 
 
@@ -175,6 +175,40 @@ def structures_for_formula(formula: str, limit: int = 500) -> list[str]:
         if len(smiles) >= limit:
             break
     return smiles
+
+
+def candidates_for_formula(formula: str, precursor_mz: float, adduct: str, ppm: float = 20.) -> dict:
+    """Retrieve the complete CID list for one selected formula, without a top-structure cap."""
+    cids = _search_cids(_get(f'compound/fastformula/{urllib.parse.quote(formula)}/cids/JSON'))
+    if len(cids) >= 2_000_000:
+        raise RuntimeError('PubChem formula search reached its record limit; completeness is unverified')
+    neutral = precursor_mz - ADDUCT_SHIFT[adduct]
+    found = {}
+    for start in range(0, len(cids), _BATCH):
+        batch = cids[start:start + _BATCH]
+        table = _get('compound/cid/property/MolecularFormula,MonoisotopicMass,Charge,SMILES,InChIKey/JSON',
+                     {'cid': ','.join(map(str, batch))})
+        rows = table.get('PropertyTable', {}).get('Properties', [])
+        if len(rows) != len(batch) or {r.get('CID') for r in rows} != set(batch):
+            raise RuntimeError('Incomplete PubChem formula candidate property response')
+        for row in rows:
+            if any(k not in row for k in ('MolecularFormula', 'MonoisotopicMass', 'Charge', 'SMILES', 'InChIKey')):
+                raise RuntimeError('Incomplete PubChem formula candidate properties')
+            if row['MolecularFormula'] != formula or not _usable(row, ''.join(_elements(formula))):
+                continue
+            mass = float(row['MonoisotopicMass'])
+            if not math.isfinite(mass) or mass <= 0:
+                raise RuntimeError('Invalid PubChem monoisotopic mass')
+            if abs(mass-neutral) > neutral*ppm*1e-6:
+                raise ValueError(f'Formula/adduct precursor mismatch: {formula} differs by '
+                                 f'{(mass-neutral)/neutral*1e6:.1f} ppm (tolerance {ppm:g})')
+            record = found.setdefault(row['SMILES'], {'smiles': row['SMILES'], 'pubchem_cids': [],
+                'pubchem_inchikeys': [], 'monoisotopic_mass': mass,
+                'mass_error_ppm': (mass - neutral) / neutral * 1e6})
+            record['pubchem_cids'].append(row['CID'])
+            if row['InChIKey'] not in record['pubchem_inchikeys']:
+                record['pubchem_inchikeys'].append(row['InChIKey'])
+    return {'formula': formula, 'candidates': list(found.values()), 'complete': True, 'matched_cids': len(cids)}
 
 
 _PROPERTIES = 'ConnectivitySMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName'

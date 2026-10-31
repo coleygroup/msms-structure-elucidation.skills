@@ -8,8 +8,9 @@ from pathlib import Path
 from msms_structure_elucidation import config
 from msms_structure_elucidation.hostsetup import save_local
 
-DATASET_QUESTIONS = {'collision_unit', 'collision_energies', 'stepped_collision_energies', 'acquisition_mode', 'formula'}
-METADATA_QUESTIONS = DATASET_QUESTIONS - {'formula'}
+DATASET_QUESTIONS = {'collision_unit', 'collision_energies', 'stepped_collision_energies', 'acquisition_mode',
+                     'formula', 'formula_strategy', 'formula_elements', 'mass_tolerance'}
+METADATA_QUESTIONS = {'collision_unit', 'collision_energies', 'stepped_collision_energies', 'acquisition_mode'}
 
 
 def _name(value: str) -> str:

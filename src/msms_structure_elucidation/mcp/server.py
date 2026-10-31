@@ -8,6 +8,7 @@ for `get_job`.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import functools
 import hashlib
 import os
@@ -34,7 +35,11 @@ INSTRUCTIONS = (
     '(>compound, >parentmass, >ionization, >formula, then >collision <energy> blocks of "m/z intensity" lines). '
     'For one stepped acquisition, include >stepped_collision_energies with its component list and one observed collision block; prediction merges components before normalization. '
     'Model tools may return a job id instead of a result; poll it with get_job. Call server_info first to see '
-    'which models this server has configured.')
+    'which models this server has configured. Without a supplied formula, recommend BUDDY top three and '
+    'ask once whether to use that route or PubChem mass filtering unless the user already chose. '
+    'Use infer_formulas for BUDDY, search_pubchem_formulas for selected formulas with GLACIER, and '
+    'search_pubchem_mass for the chosen mass-only route. Reuse compatible raw predictions across '
+    'unknowns, but score and review each experimental spectrum separately.')
 
 server = MCPServer('msms-structure-elucidation', instructions=INSTRUCTIONS)
 _RUNTIME: dict = {}
@@ -142,6 +147,19 @@ async def _wait(job_id: str, wait_seconds: int, ctx: Context | None) -> None:
 
 async def _submit(task: str, params: dict, inputs: dict, wait_seconds: int | None, ctx: Context | None) -> dict:
     runtime = _runtime()
+    from msms_structure_elucidation.prediction_cache import cache_root, file_fingerprint, source_fingerprint
+    config = runtime['config']
+    if task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass', 'search_pubchem_formulas', 'retrieve_atlas'):
+        options = tasks.cli._model_options(argparse.Namespace(model=params.get('model', 'iceberg')), config)
+        required = ('checkpoint',) if options['model'] == 'glacier' else ('gen_checkpoint', 'inten_checkpoint')
+        root = cache_root(options.get('prediction_cache'))
+        identity = {'config': config.get('_config_digest'),
+                    'adapter': source_fingerprint(Path(tasks.cli.__file__).parent),
+                    'weights': {key: file_fingerprint(Path(options[key]), root) for key in required
+                                if options.get(key) and Path(options[key]).is_file()}}
+        if options.get('ms_pred_dir') and Path(options['ms_pred_dir']).is_dir():
+            identity['source'] = source_fingerprint(Path(options['ms_pred_dir'])/'src/ms_pred')
+        params = {**params, '_model_identity': identity}
     job_id, reused = runtime['store'].create(task, params, inputs, kind=tasks.KINDS[task])
     if not reused:
         await asyncio.to_thread(runtime['backend'].submit, job_id)
@@ -158,7 +176,7 @@ async def server_info() -> dict:
     config = runtime['config']
     models = {task: {'ready': not missing, 'missing': missing}
               for task in tasks.KINDS for missing in [tasks.missing_assets(task, config)]}
-    for task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass'):
+    for task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass', 'search_pubchem_formulas'):
         missing = tasks.missing_assets(task, config, model='glacier')
         models[f'{task}(glacier)'] = {'ready': not missing, 'missing': missing}
     return {**await asyncio.to_thread(runtime['backend'].describe), 'job_root': str(runtime['store'].root),
@@ -221,12 +239,44 @@ async def retrieve_atlas(
 
 
 @tool
+async def infer_formulas(
+        ctx: Context, collision_unit: Unit,
+        spectrum_ms: SpectrumText = None, spectrum_path: SpectrumPath = None,
+        instrument: str | None = None,
+        ms1_ppm: Annotated[float | None, Field(gt=0, allow_inf_nan=False)] = None,
+        ms2_ppm: Annotated[float | None, Field(gt=0, allow_inf_nan=False)] = None,
+        wait_seconds: Wait = None) -> dict:
+    """Infer up to three BUDDY/MSBuddy formulas without searching structures or predicting spectra."""
+    params = {'collision_unit':collision_unit, 'instrument':instrument, 'ms1_ppm':ms1_ppm, 'ms2_ppm':ms2_ppm}
+    inputs = _spectrum_inputs(params, spectrum_ms, spectrum_path, collision_unit)
+    return await _submit('infer_formulas', params, inputs, wait_seconds, ctx)
+
+
+@tool
+async def search_pubchem_formulas(
+        ctx: Context, collision_unit: Unit, model: Model,
+        formulas: Annotated[list[Annotated[str, Field(pattern=r'^(?:[A-Z][a-z]?\d*)+$')]],
+                            Field(min_length=1, description='Selected neutral formula hypotheses')],
+        spectrum_ms: SpectrumText = None, spectrum_path: SpectrumPath = None,
+        instrument: str | None = None,
+        top_k: Annotated[int, Field(ge=1)] = 10,
+        shard_size: Annotated[int | None, Field(ge=1)] = None,
+        wait_seconds: Wait = None) -> dict:
+    """Search selected formulas: GLACIER predicts their PubChem candidates; ICEBERG prefers its atlas."""
+    _require('search_pubchem_formulas', model=model)
+    params = {'collision_unit':collision_unit, 'model':model, 'formulas':formulas,
+              'instrument':instrument, 'top_k':top_k, 'shard_size':shard_size}
+    inputs = _spectrum_inputs(params, spectrum_ms, spectrum_path, collision_unit)
+    return await _submit('search_pubchem_formulas', params, inputs, wait_seconds, ctx)
+
+
+@tool
 async def search_pubchem_mass(
         ctx: Context,
         collision_unit: Unit, model: Model,
         ppm: Annotated[float, Field(gt=0, allow_inf_nan=False, description='Mass tolerance in ppm about the adduct-corrected neutral monoisotopic mass')],
         spectrum_ms: SpectrumText = None, spectrum_path: SpectrumPath = None,
-        elements: Annotated[str, Field(pattern=r'^(?:[A-Z][a-z]?)+$', description='Allowed elements; default CHNOPS')] = 'CHNOPS',
+        elements: Annotated[str, Field(pattern=r'^(?:[A-Z][a-z]?)+$', description='Allowed elements; default CHNOPSClBrFISiBSe')] = 'CHNOPSClBrFISiBSe',
         instrument: Annotated[str | None, Field(description='Instrument; default from spectrum or config')] = None,
         top_k: Annotated[int, Field(ge=1)] = 10,
         shard_size: Annotated[int | None, Field(ge=1, description='Candidate structures per resumable prediction shard')] = None,

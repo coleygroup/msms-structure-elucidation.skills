@@ -15,6 +15,7 @@ from pathlib import Path
 from msms_structure_elucidation import cli
 from msms_structure_elucidation.config import asset
 from msms_structure_elucidation.spectrum import inspect_ms
+from msms_structure_elucidation.pubchem import DEFAULT_ELEMENTS
 
 REPO = Path(__file__).resolve().parents[3]
 MIST_SCRIPT = REPO / '.agents/skills/msms-mist-fingerprint/scripts/run.py'
@@ -22,7 +23,8 @@ SUBFORMULAE_SCRIPT = REPO / '.agents/skills/msms-subformulae/scripts/run.py'
 INLINE_SPECTRUM = 'spectrum.ms'
 # Resource class per task: gpu tasks wait for a GPU; any uses a free GPU or else the CPU.
 KINDS = {'predict_spectra': 'gpu', 'score_candidates': 'gpu', 'generate_structures_frigid': 'gpu',
-         'predict_fingerprint_mist': 'gpu', 'retrieve_atlas': 'any', 'search_pubchem_mass': 'gpu'}
+         'predict_fingerprint_mist': 'gpu', 'retrieve_atlas': 'any', 'search_pubchem_mass': 'gpu',
+         'search_pubchem_formulas': 'gpu', 'infer_formulas': 'cpu'}
 
 
 def _section(config: dict, name: str) -> dict:
@@ -49,7 +51,7 @@ def missing_assets(task: str, config: dict, model: str = 'iceberg', num_rounds: 
     """Config keys this server still needs for a task; empty when the task can run."""
     sim, denovo = _section(config, 'simulator'), _section(config, 'denovo')
     missing = []
-    if task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass'):
+    if task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass', 'search_pubchem_formulas'):
         if not _file(sim.get('ms_pred_src'), config):
             missing.append('models.simulator.ms_pred_src')
         keys = ('glacier_ckpt',) if model == 'glacier' else ('gen_ckpt', 'inten_ckpt')
@@ -76,7 +78,7 @@ def _simulator_options(config: dict, model: str, devices: str | None) -> dict:
     tuned = cli._devices(_section(config, 'simulator').get('cuda_devices'))
     per_gpu = max(1, int(options['num_gpu_workers']) // max(1, len(tuned.split(',')) if tuned else 1))
     options['cuda_devices'] = devices
-    options['num_gpu_workers'] = per_gpu * len(devices.split(',')) if devices else 1
+    options['num_gpu_workers'] = per_gpu * len(devices.split(',')) if devices and model != 'glacier' else 1
     return options
 
 
@@ -154,20 +156,29 @@ def retrieve_atlas(params: dict, job_dir: Path, config: dict, devices: str | Non
 
 
 def search_pubchem_mass(params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
-    """Run the mass-only CLI path with this job's model settings and allocated devices."""
+    """Run mass or explicitly selected formula candidates using this job's allocated devices."""
     path = _spectrum(params, job_dir)
     metadata = inspect_ms(path, params['collision_unit'])['metadata']
     out = job_dir / 'retrieval'
-    command = [sys.executable, '-m', 'msms_structure_elucidation.cli', 'run', '--mass-only',
+    command = [sys.executable, '-m', 'msms_structure_elucidation.cli', 'run',
                '--input', str(path), '--collision-unit', params['collision_unit'], '--output-dir', str(out),
-               '--ms-pred-python', _ms_pred_python(config), '--ms1-ppm', str(params['ppm']),
-               '--formula-elements', params.get('elements', 'CHNOPS'), '--top-k', str(params['top_k']),
+               '--ms-pred-python', _ms_pred_python(config), '--ms1-ppm', str(params.get('ppm', 5)),
+               '--formula-elements', params.get('elements', DEFAULT_ELEMENTS), '--top-k', str(params['top_k']),
                '--instrument', _instrument(params, metadata, config)]
+    if params.get('formulas'):
+        listing = job_dir / 'formulas.txt'
+        listing.write_text('\n'.join(params['formulas'])+'\n')
+        command += ['--formulas-file', str(listing)]
+    else:
+        command.append('--mass-only')
     names = {'batch_size': 'model-batch-size', 'num_cpu_workers': 'model-cpu-workers',
              'num_gpu_workers': 'model-gpu-workers'}
-    for key, value in _simulator_options(config, params['model'], devices).items():
+    options = _simulator_options(config, params['model'], devices)
+    for key, value in options.items():
         if value is not None:
             command += ['--' + names.get(key, key.replace('_', '-')), str(value)]
+    if options['prediction_cache'] is None:
+        command.append('--no-prediction-cache')
     # An empty device list explicitly selects CPU even when the host config names GPUs.
     if devices is None:
         command += ['--cuda-devices', '']
@@ -179,6 +190,22 @@ def search_pubchem_mass(params: dict, job_dir: Path, config: dict, devices: str 
         raise RuntimeError(f'PubChem mass search exited with {done.returncode}; see {result_path} and log.txt')
     return {**json.loads(result_path.read_text()), 'retrieval_path': str(result_path),
             'report_path': str(out / 'report.html')}
+
+
+def infer_formulas(params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
+    """Return BUDDY's top three hypotheses without candidate retrieval or spectral prediction."""
+    from msms_structure_elucidation.spectrum import mass_tolerance
+    path = _spectrum(params, job_dir)
+    data = inspect_ms(path, params['collision_unit'])
+    instrument = params.get('instrument') or data['metadata'].get('instrumentation')
+    tolerance = mass_tolerance(instrument)
+    for key in ('ms1_ppm', 'ms2_ppm'):
+        if params.get(key) is not None:
+            tolerance[key] = params[key]
+    hypotheses = cli.worker(_ms_pred_python(config), 'formula', spectrum=path,
+        experimental_unit=params['collision_unit'], ms1_ppm=tolerance['ms1_ppm'], ms2_ppm=tolerance['ms2_ppm'])
+    return {'input': str(path), 'formula_hypotheses': hypotheses[:3], 'mass_tolerance': tolerance,
+            'status': 'ranked' if hypotheses else 'needs_formula'}
 
 
 def _adduct(params: dict, metadata: dict) -> str:
@@ -237,7 +264,8 @@ def predict_fingerprint_mist(params: dict, job_dir: Path, config: dict, devices:
 
 RUNNERS = {'predict_spectra': predict_spectra, 'score_candidates': score_candidates,
            'retrieve_atlas': retrieve_atlas, 'generate_structures_frigid': generate_structures_frigid,
-           'predict_fingerprint_mist': predict_fingerprint_mist, 'search_pubchem_mass': search_pubchem_mass}
+           'predict_fingerprint_mist': predict_fingerprint_mist, 'search_pubchem_mass': search_pubchem_mass,
+           'infer_formulas': infer_formulas, 'search_pubchem_formulas': search_pubchem_mass}
 
 
 def run(task: str, params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
@@ -273,7 +301,7 @@ def summarize(task: str, result: dict, params: dict) -> dict:
     if task == 'score_candidates':
         return {'formula': result['formula'], 'candidates': [_candidate(row) for row in result['candidates']],
                 'rejected': result['rejected']}
-    if task in ('retrieve_atlas', 'search_pubchem_mass'):
+    if task in ('retrieve_atlas', 'search_pubchem_mass', 'search_pubchem_formulas'):
         evidence = dict(result.get('review_evidence') or {})
         evidence.pop('matched_peaks', None)
         evidence['strongest_unexplained_peaks'] = evidence.get('strongest_unexplained_peaks', [])[:10]

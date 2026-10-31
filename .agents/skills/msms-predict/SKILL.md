@@ -25,6 +25,29 @@ Call `server_info` first, then `predict_spectra` with the selected `model` (`gla
 
 Jobs may return a `job_id`; keep polling with `get_job(job_id, wait_seconds=30)` while work is queued or running, following [job monitoring](../../../docs/job-monitoring.md). The full result contains predicted spectra, fragment IDs, model version and checkpoint provenance. For a direct mass-only PubChem search, use `search_pubchem_mass`; it predicts every eligible candidate with the selected model and ranks across formulas.
 
+## Reuse predictions across unknowns
+
+Before launching inference, reuse the shared model-host prediction cache (`models.simulator.reuse_predictions: true`). Unknowns sharing a formula often reuse the same PubChem candidate pool. Deduplicate candidates and retrieve/predict the union of required structures and actual rounded eV energies once where their settings match. The cache stores raw spectra and fragment IDs per structure and energy; score every unknown against its own experimental spectra and write separate evidence reviews.
+
+A formula alone is not a reuse key. Match canonical stereo-free structure, model, exact weight content, model/adapter source, adduct, instrument, sparse-peak settings and actual model eV. Different NCE values can map to the same eV, and identical NCE values with different precursor/adduct settings can map differently. Stepped spectra reuse their component predictions but merge and score for each acquisition separately. Predict missing structure/energy pairs only; never copy another unknown’s matched peaks, scores or review. Candidate locks prevent concurrent unknowns from computing the same missing prediction twice. Cache receipts record reused/new spectrum counts and scientific identities. Keep the cache on the model host, outside Git; configure its path in `models.simulator.prediction_cache`. Set `reuse_predictions: false` only when recomputation is explicitly needed.
+
+## GLACIER defaults
+
+Use `models.simulator.glacier` as GLACIER’s own profile; generic simulator batch/worker settings are ICEBERG settings. Begin with:
+
+| Setting | Default |
+| --- | ---: |
+| Batch size | 128 |
+| CPU workers per prediction process | 4 |
+| GPU workers per prediction process | 1 |
+| Prediction processes per GPU | 1 |
+| HDF5 writers | 2 |
+| HDF5 chunks | 4 |
+| Feature cache size | 256 |
+| Sparse peaks | 100 |
+
+The launcher passes `num_writers`, `num_h5_chunks`, `feat_cache_size` and `sparse_k` to GLACIER’s native `predict_smis_joint.py`, alongside the batch/worker settings. Each visible GPU gets one native prediction process; the backend normally assigns one GPU per job. The reader loads all resulting HDF5 chunk/shard files. Keep one prediction process per GPU. Use a compatible native runtime exposing `--num-writers`, `--num-h5-chunks` and `--feat-cache-size`; the launcher reports missing flags explicitly. Tune batch size, CPU workers and I/O for the machine if measurements justify it, saving overrides under `models.simulator.glacier` in the ignored local config. Sparse peak count changes the prediction and invalidates shared spectra; batch size, CPU workers and I/O tuning do not authorize reuse with different weights or scientific settings.
+
 ## Monitor progress and review early
 
 Stay with the job after launch, including detached runs and waits for idle GPUs. Check live job/process states, logs, progress and failures, and keep the user informed. As soon as stable per-feature results are available, use [msms-evidence-review](../msms-evidence-review/SKILL.md) and write a per-feature `evidence_review.json` while other predictions continue. Mark incomplete coverage as provisional and revisit changed results. Resume monitoring between reviews; wait for verified outputs and feature accounting before reporting completion. Follow [job monitoring and early review](../../../docs/job-monitoring.md).
@@ -88,7 +111,7 @@ Use these ICEBERG starting points in `models.simulator` in the uncommitted `conf
 | 8 GB | `0` | 16 | Up to 16 | 2 |
 | 24 GB | `0` | 128 | Up to 16 | 2 |
 
-These starting points apply to ICEBERG. Tune GLACIER independently on each machine using its native `pred_smis` configuration and the configured prediction path, as described in [msms-setup](../msms-setup/SKILL.md); do not copy ICEBERG batch sizes or CPU worker counts as GLACIER optima. The current GLACIER adapter uses one GPU worker. For ICEBERG on other hosts:
+These starting points apply to ICEBERG. Start GLACIER with its profile above and tune it independently through the native prediction path, as described in [msms-setup](../msms-setup/SKILL.md); do not inherit ICEBERG batch sizes or CPU worker counts. For ICEBERG on other hosts:
 
 - **GPU memory is the batch_size limit.** Each ICEBERG GPU worker loads its own model copy onto the GPU, so each copy gets about (free VRAM) / `num_gpu_workers`. Model weights take a fixed share of VRAM, so the optimal batch size does not necessarily scale linearly with memory. Pick the nearest anchor, check `nvidia-smi` during the first shard, and double batch_size while peak use stays under about 80%. On CUDA OOM, halve batch_size before reducing `num_gpu_workers`. Large molecules or a higher `max_nodes` need smaller batches.
 - **`num_gpu_workers`: use 2 per visible GPU.** Two ICEBERG processes per GPU overlap one worker's CPU-side fragment-DAG work with the other's GPU work. Workers are assigned round-robin across `CUDA_VISIBLE_DEVICES`, so 2 GPUs means 4. The current GLACIER adapter forces 1 GPU worker; tune its other settings separately.

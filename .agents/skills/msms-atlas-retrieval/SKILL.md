@@ -8,6 +8,8 @@ Use this skill to match experimental MS/MS spectra against the public ICEBERG Pu
 
 Read [saved pipeline answers](../../../docs/pipeline-preferences.md) and reuse the collision-energy unit, search route and intended model when their scope/context matches. Ask only for missing or conflicting choices and save the answers. For model-backed work, confirm the exact checkpoint paths with `msms-setup`. With MCP connected, call `server_info` first and use its tools.
 
+For an analysis without a supplied formula, follow [formula search](../../../docs/formula-search.md). Recommend BUDDY’s top three and reuse a matching user choice or ask once between that and mass filtering. With MCP, use `infer_formulas` after BUDDY is selected; with GLACIER, pass the selected hypotheses to `search_pubchem_formulas`. Use `search_pubchem_mass` only for the selected mass-filtering route. Keep the choice and its input context in the local preferences.
+
 ## Monitor progress and review early
 
 Keep monitoring queued/running retrieval and prediction jobs, including detached runs and resource waits. With MCP, poll `get_job(job_id, wait_seconds=30)`; otherwise inspect the live process/scheduler, logs and output receipts. Use [msms-evidence-review](../msms-evidence-review/SKILL.md) on each stable per-feature result as it arrives and write its `evidence_review.json` while the remaining jobs continue. Do not wait for the full batch or consolidated report. Label incomplete coverage as provisional, revisit changed results, and verify final coverage and outputs before reporting completion. Follow [job monitoring and early review](../../../docs/job-monitoring.md).
@@ -31,7 +33,7 @@ msms-structure-elucidation run --input sample.ms --collision-unit NCE \
   --formula C12H21NO5 --output-dir results/sample
 ```
 
-Use `--collision-unit eV` for confirmed absolute eV. Supply `--formula` or `--formulas-file` when formulas are known. Otherwise the CLI searches the top three MSBuddy hypotheses; if none are proposed, it searches up to three formulas from PubChem mass matches. Instrument defaults are Q-TOF 10/20 ppm and Orbitrap 5/10 ppm for precursor/fragments; override with `--ms1-ppm` and `--ms2-ppm`.
+Use `--collision-unit eV` for confirmed absolute eV. Supply `--formula` or `--formulas-file` when formulas are known. Otherwise follow [formula search](../../../docs/formula-search.md): recommend BUDDY’s top three formulas and ask once whether to use them or PubChem mass filtering, unless the user already selected a route for this context. The default CLI searches up to three BUDDY/MSBuddy hypotheses. If none are returned, ask before switching to mass filtering; do not silently change the selected route. Instrument defaults are Q-TOF 10/20 ppm and Orbitrap 5/10 ppm for precursor/fragments; override with `--ms1-ppm` and `--ms2-ppm`.
 
 The local atlas workflow collects candidate formulas, downloads one MGF per formula through `https://iceberg-ms.mit.edu/download_mgf`, then ranks the structures across those files. `--atlas-mgf` supplies a local MGF for a single formula. The [atlas WebUI](https://github.com/rogerwwww/iceberg-atlas-webui#spectrum-retrieval) also offers **Mass ± ppm** retrieval without a supplied formula: it searches the existing atlas's formula/mass index and ranks stored spectra across the matched formulas. This is a separate interface from the local formula-by-formula download workflow.
 
@@ -48,7 +50,7 @@ msms-structure-elucidation run --input sample.ms --collision-unit NCE \
 
 Use the confirmed energy unit, ppm tolerance and model; select `--model iceberg` for fresh ICEBERG predictions. Configure the exact weights and model environment through `msms-setup`. With MCP, use `search_pubchem_mass` with `model`, `ppm` and `collision_unit`. The CLI `batch` command and this skill's `scripts/run.py` also accept `--mass-only`; the script takes `--spectrum` and `--output` in place of `--input` and `--output-dir`.
 
-The route retains all eligible formulas and structures, preserves PubChem identifiers and mass errors, and ranks across formulas. `--top-k` controls the returned shortlist. Do not combine `--mass-only` with `--formula`, `--formulas-file`, `--atlas-mgf` or `--no-pubchem`; an input header formula is ignored with a warning. See the [technical guide](../../../docs/technical-guide.md#mass-only-pubchem-option) for filters, supported adducts and resumable prediction settings.
+The default mass-search elements are C, H, N, O, P, S, F, Cl, Br, I, Si, B and Se (`CHNOPSClBrFISiBSe`); `--formula-elements` or MCP `elements` overrides them. Use one indexed mass-range search and batched CID properties, not theoretical formula enumeration. Check model support for requested elements. Reuse compatible raw predictions across unknowns with the shared prediction cache, and score each experimental spectrum separately. The route retains all eligible formulas and structures, preserves PubChem identifiers and mass errors, and ranks across formulas. `--top-k` controls the returned shortlist. Do not combine `--mass-only` with `--formula`, `--formulas-file`, `--atlas-mgf` or `--no-pubchem`; an input header formula is ignored with a warning. See the [technical guide](../../../docs/technical-guide.md#mass-only-pubchem-option) for filters, supported adducts and resumable prediction settings.
 
 ## Environment and results
 

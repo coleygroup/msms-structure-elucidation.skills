@@ -22,6 +22,10 @@ Use `mzmine` or `custom` for the other choices. For a custom route, collect only
 
 On later runs, reuse the saved choice without asking again. Ask only for missing details, changed requirements or a conflict with the current inputs. A new explicit user choice takes precedence; update the settings and confirmation accordingly.
 
+## Formula search
+
+Follow [formula search](formula-search.md) when no formula was supplied. Recommend BUDDY's top three formulas and let the user choose that route or PubChem mass filtering. Save `formula_strategy` (`buddy_top3` or `pubchem_mass`), `mass_tolerance` and `formula_elements` with a dataset/analysis scope and matching input context. A shared default is not confirmation. Reuse an explicit request or saved choice; if BUDDY returns no formulas, ask before switching to mass filtering.
+
 ## Optional de novo route after evidence review
 
 Use `msms-evidence-review` for the assessment. Review delegation is an operational setting, separate from the user's scientific route choice. `pipeline.evidence_review.mode` accepts `auto` (delegate independent batch work when supported), `main` (direct review), or `delegate` (prefer delegation, with direct fallback). `max_reviewers` and `features_per_task` are positive integers, defaulting to two and one; actual concurrency is bounded by available slots and ready work while the main agent keeps monitoring. Save overrides in the ignored local config, for example:
