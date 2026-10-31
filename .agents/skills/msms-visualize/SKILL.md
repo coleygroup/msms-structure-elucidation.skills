@@ -5,7 +5,7 @@ description: Open a local interactive webpage for ranked MS/MS spectra, fragment
 
 # Interactive fragment review
 
-After `msms-atlas-retrieval` or `msms-structure-review` produces `retrieval.json`, launch the viewer on localhost:
+After `msms-atlas-retrieval` or `msms-structure-proposal` produces `retrieval.json`, launch the viewer on localhost:
 
 ```bash
 msms-structure-elucidation visualize --result results/sample/retrieval.json

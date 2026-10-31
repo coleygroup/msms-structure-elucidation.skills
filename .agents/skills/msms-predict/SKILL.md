@@ -1,6 +1,6 @@
 ---
 name: msms-predict
-description: Predict MS/MS spectra and fragment assignments from SMILES with GLACIER or ICEBERG when atlas spectra are unavailable or direct predictions are requested.
+description: Predict MS/MS spectra and fragment assignments from SMILES with GLACIER or ICEBERG, and score supplied candidate structures against experimental spectra.
 ---
 # MS/MS prediction with GLACIER or ICEBERG
 
@@ -11,13 +11,34 @@ Use this skill to predict spectra and fragments for known candidate SMILES. Read
 | GLACIER | One joint-model checkpoint | Predict every candidate; no open GLACIER atlas is available. |
 | ICEBERG | Generator and intensity checkpoints | Prefer suitable atlas spectra; predict missing spectra or all candidates when direct predictions are requested. |
 
-The public atlas uses ICEBERG 2.1 trained on NIST'23. If local ICEBERG weights differ or matching weights have not been verified, tell the user that combining their predictions may affect ranking comparability, prefer suitable atlas spectra, and identify the local checkpoint. Use `msms-atlas-retrieval` to rank experimental spectra through the atlas or a mass-only PubChem search, and `msms-structure-review` for proposed candidates.
+The public atlas uses ICEBERG 2.1 trained on NIST'23. If local ICEBERG weights differ or matching weights have not been verified, tell the user that combining their predictions may affect ranking comparability, prefer suitable atlas spectra, and identify the local checkpoint. Use `msms-atlas-retrieval` to rank experimental spectra through the atlas or a mass-only PubChem search, and `msms-structure-proposal` for proposed candidates.
 
 ## With the prediction server
 
 Call `server_info` first, then `predict_spectra` with the selected `model` (`glacier` or `iceberg`), candidate `smiles`, confirmed `collision_unit`, `collision_energies`, `adduct` and `instrument`. Set `include_fragments: true` for per-peak fragment annotations. For an experimental spectrum and a candidate list, use `score_candidates` with the same selected model and an explicit target formula.
 
 Jobs may return a `job_id`; poll with `get_job`. The full result contains predicted spectra, fragment IDs, model version and checkpoint provenance. For a direct mass-only PubChem search, use `search_pubchem_mass`; it predicts every eligible candidate with the selected model and ranks across formulas.
+
+## Score candidate structures
+
+Accept the experimental `.ms` spectrum, a target neutral formula, a JSON array of candidate SMILES, and the reference candidates to compare. Reuse confirmed collision units, adduct, instrument, model and exact weights. Validate SMILES/formulas and deduplicate connectivity, retaining proposal origins and rejected-input reasons. Keep separate formula hypotheses in separate scoring groups.
+
+With MCP connected, call `server_info` first, then `score_candidates` with the complete comparison pool, experimental spectrum, explicit `formula`, confirmed `collision_unit`, `instrument` and `model`. Set `top_k` high enough to retain the candidates needed for comparison and check the scored count. For GLACIER or a request for fresh predictions throughout, score the whole pool with the selected model and weights. CLI `review` retains existing scores and can reuse ICEBERG atlas entries even with `--model glacier`, so it does not provide a uniform GLACIER rescore.
+
+For the ICEBERG route, prefer suitable atlas spectra under the checkpoint/provenance policy above. Without MCP, extend an existing result with validated candidate SMILES using:
+
+```bash
+msms-structure-elucidation review \
+  --result results/sample/retrieval.json \
+  --smiles-json results/sample/proposals.json \
+  --ms-pred-dir /path/to/ms-pred \
+  --model iceberg \
+  --gen-checkpoint /path/to/gen.ckpt --inten-checkpoint /path/to/inten.ckpt
+```
+
+This command validates supplied structures, retains existing candidates, reuses suitable atlas matches and predicts missing structures. It updates `retrieval.json` and `report.html`; it does not generate new structures. Use `--formula` to select a formula when the result contains several. For a PubChem candidate expansion, replace `--smiles-json` with `--proposals pubchem`; `--max-structures` defaults to 500 and is a retrieval cap, not exhaustive coverage. Follow the environment and tuning sections below for interpreter, checkpoint and worker settings.
+
+Keep every supplied experimental energy in the comparison. Convert confirmed NCE to rounded integer eV before inference (`nce=False`); when several inputs round to one model energy, predict it once and compare it against each input spectrum. Preserve model version, checkpoint provenance, energy alignment, predicted spectra, matched peaks, entropy similarity and explained intensity with the results. Return those results to the proposing agent to assess newly explained peaks, lost matches and remaining uncertainties, and use `msms-visualize` for inspection.
 
 ## Without MCP
 
