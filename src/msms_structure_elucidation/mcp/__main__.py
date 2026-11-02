@@ -1,4 +1,4 @@
-"""Start the MCP server over stdio: python -m msms_structure_elucidation.mcp [--backend local|slurm]."""
+"""Start MCP over stdio with local, Slurm, Kubernetes or pooled prediction endpoints."""
 from __future__ import annotations
 
 import argparse
@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 
-PUMP_SECONDS = 10
+PUMP_SECONDS = 1
 
 
 def _pump_forever(backend) -> None:
@@ -18,7 +18,7 @@ def _pump_forever(backend) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog='msms-structure-elucidation mcp', description=__doc__)
-    parser.add_argument('--backend', choices=['local', 'slurm'], help='job backend; default mcp.backend in the config')
+    parser.add_argument('--backend', choices=['local', 'slurm', 'kubernetes', 'pool'], help='job backend; default mcp.backend in the config')
     parser.add_argument('--config', help='workflow config; default configs/default.yaml overlaid with configs/local.yaml')
     parser.add_argument('--job-root', help='job directory root; default mcp.job_root')
     args = parser.parse_args(argv)

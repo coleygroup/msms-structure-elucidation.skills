@@ -110,9 +110,15 @@ Batch size, CPU workers, HDF5 writer/chunk counts and feature-cache budget can b
 | Same machine | `local` | On that machine |
 | SSH to a GPU host | `local` | On the remote GPU host |
 | SSH to a Slurm login node | `slurm` | On allocated compute nodes |
+| Coordinator with several endpoints | `pool` | Across configured local, SSH, Slurm or Kubernetes endpoints |
+| Coordinator with a shared Kubernetes workspace | `kubernetes` | In bounded GPU Jobs |
 
-- `local`: runs each job on an idle GPU on the server host that has at least `gpu_min_free_fraction` of its memory free, and waits while every GPU is busy.
-- `slurm`: submits each job with `sbatch`, using only the options set under `mcp.slurm`. Those options are `partition`, `account`, `qos`, `gpus`, `cpus_per_task`, `mem`, `time`, `requeue`, `extra_args`, `setup` shell lines, and `cpu` resources for CPU-only tasks.
+- `local`: runs preparation and scoring in independent CPU slots. Missing predictions wait for an idle GPU on the server host with at least `gpu_min_free_fraction` of its memory free; the GPU is released before experimental scoring. Complete prediction-cache hits need no GPU allocation.
+- `slurm`: submits CPU orchestrators and missing-prediction GPU stages separately with `sbatch`, using only the options set under `mcp.slurm`. Those options are `partition`, `account`, `qos`, `gpus`, `cpus_per_task`, `mem`, `time`, `requeue`, `extra_args`, `setup` shell lines, and `cpu` resources for CPU-only tasks.
+
+Use [prediction server pools](prediction-servers.md) for multiple hosts, Kubernetes configuration, availability observations, grouping, verified result collection and cleanup. SSH remains the transport to individual GPU or Slurm endpoints; `pool` selects among them.
+
+See [MCP execution stages and resource settings](mcp-execution.md) for CPU limits, bounded preparation, prediction group size, shared-node paths, stage monitoring and utilization measurement.
 
 **Setup.** `setup` writes `configs/local.yaml` and `mcp-config` writes the client entry; see the [msms-setup skill](../.agents/skills/msms-setup/SKILL.md).
 
@@ -129,7 +135,7 @@ For a remote host, the client entry runs `ssh -o BatchMode=yes <ssh-destination>
 
 ## Optional models
 
-`ms-pred` supplies GLACIER, ICEBERG, and spectral utilities. Clone the [official ms-pred repository](https://github.com/coleygroup/ms-pred), read its README, and follow its environment setup for your host. Set `--ms-pred-dir` to that checkout for local inference; the worker runs there because GLACIER uses a relative script path. Use the open-source MassSpecGym checkpoint links in the [ms-pred README](https://github.com/coleygroup/ms-pred#readme), or provide local licensed NIST checkpoints if your license permits. GLACIER needs one checkpoint; ICEBERG needs generation and intensity checkpoints. Model calls receive rounded integer eV with `nce=False`. The `.ms` `>instrumentation` value is used for model calls, with `--instrument` taking priority. Use `--cuda-devices 0` or `MSMS_CUDA_DEVICES=0` to select a GPU. Tune batch size and ms-pred worker counts (`--model-batch-size`, `--model-cpu-workers`, `--model-gpu-workers`) for the selected model on each host. The anchors in `.agents/skills/msms-predict/SKILL.md` are ICEBERG starting points; tune GLACIER independently as described above.
+`ms-pred` supplies GLACIER, ICEBERG, and spectral utilities. Clone the [official ms-pred repository](https://github.com/coleygroup/ms-pred), read its README, and follow its environment setup for your host. Set `--ms-pred-dir` to that checkout for local inference; the worker runs there because GLACIER uses a relative script path. Use the open-source MassSpecGym checkpoint links in the [ms-pred README](https://github.com/coleygroup/ms-pred#readme), or provide local licensed NIST checkpoints if your license permits. GLACIER needs one checkpoint; ICEBERG needs generation and intensity checkpoints. Model calls receive rounded integer eV with `nce=False`. The `.ms` `>instrumentation` value is used for model calls, with `--instrument` taking priority. Use `--cuda-devices 0` or `MSMS_CUDA_DEVICES=0` to select a GPU. Tune batch size and ms-pred worker counts (`--model-batch-size`, `--model-cpu-workers`, `--model-gpu-workers`) for the selected model on each host. For ICEBERG, start with two parallel workers per GPU and compare two to four within memory limits. For GLACIER, keep one prediction process per GPU and primarily tune batch size. Use enough candidates to measure sustained inference separately from startup and scoring; see [MCP execution and measurement](mcp-execution.md). Save host-specific measurements in `configs/local.yaml`.
 
 Put local paths and defaults in the uncommitted `configs/local.yaml`, which overrides the shared [configs/default.yaml](../configs/default.yaml), or pass `--config path/to/config.yaml`. CLI options override config; `MS_PRED_DIR`, `MS_PRED_PYTHON`, and `MSMS_CUDA_DEVICES` are also supported. Paths in the YAML file are relative to that file. The GLACIER preflight checks that the checkpoint's atom feature width matches the ms-pred checkout. If it reports a mismatch, select a compatible checkout and checkpoint. Licensed NIST weights stay local.
 

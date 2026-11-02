@@ -7,8 +7,9 @@ import math
 import os
 import sqlite3
 import time
+import uuid
 from collections import defaultdict
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -25,37 +26,123 @@ def digest(value: object) -> str:
 
 
 @contextmanager
-def file_lock(path: Path):
+def file_lock(path: Path, on_wait: Callable | None = None, on_acquired: Callable | None = None):
     """Release an interprocess lock automatically even when its owner exits."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+b') as handle:
+        waited = False
         if os.name == 'nt':
             import msvcrt
             handle.seek(0)
-            if not handle.read(1):
+            if os.fstat(handle.fileno()).st_size == 0:
                 handle.write(b'0')
                 handle.flush()
             handle.seek(0)
             # Nonblocking acquisition with bounded polls; Windows LK_LOCK stops after ten retries.
-            import time
             while True:
                 try:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
+                    if on_wait is not None and not waited:
+                        on_wait()
+                        waited = True
                     time.sleep(.2)
             try:
+                if waited and on_acquired is not None:
+                    on_acquired()
                 yield
             finally:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            if on_wait is None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if not waited:
+                            on_wait()
+                            waited = True
+                        time.sleep(.2)
             try:
+                if waited and on_acquired is not None:
+                    on_acquired()
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _lease_busy(path: Path) -> bool:
+    """An open advisory lock proves liveness even across hosts; no PID or expiry guesses."""
+    with path.open('a+b') as handle:
+        if os.name == 'nt':
+            import msvcrt
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b'0')
+                handle.flush()
+            handle.seek(0)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return False
+
+
+@contextmanager
+def candidate_guard(folder: Path, molecules: list[str], on_wait=None, on_acquired=None):
+    """Protect overlapping sets with one live lease per request, independent of candidate count."""
+    leases = folder / 'leases'
+    leases.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    lock = leases / (token + '.lock')
+    entry = leases / (token + '.json')
+    keys = {digest(smi) for smi in molecules}
+    waited = False
+    try:
+        with file_lock(lock):
+            while True:
+                conflict = False
+                with file_lock(leases / 'registry.lock'):
+                    for other in leases.glob('*.json'):
+                        other_lock = other.with_suffix('.lock')
+                        if not _lease_busy(other_lock):
+                            # A dead writer can leave a partial JSON record. Check
+                            # the kernel lease before attempting to parse it.
+                            other.unlink(missing_ok=True)
+                            other_lock.unlink(missing_ok=True)
+                            continue
+                        if keys.intersection(json.loads(other.read_text())['candidates']):
+                            conflict = True
+                            break
+                    if not conflict:
+                        entry.write_text(json.dumps({'candidates': sorted(keys)}))
+                        break
+                if on_wait and not waited:
+                    on_wait()
+                waited = True
+                time.sleep(.2)
+            try:
+                if waited and on_acquired:
+                    on_acquired()
+                yield
+            finally:
+                with file_lock(leases / 'registry.lock'):
+                    entry.unlink(missing_ok=True)
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def file_fingerprint(path: Path, root: Path) -> str:
@@ -116,10 +203,9 @@ def predictions(root: Path, identity: dict, smiles: list[str], energies: list[in
     unique = list(dict.fromkeys(smiles))
     rows = {}
     hits = 0
-    # All callers acquire candidate locks in the same order, so overlapping pools cannot deadlock.
-    with ExitStack() as locks:
-        for key in sorted(digest(s) for s in unique):
-            locks.enter_context(file_lock(folder / 'locks' / (key + '.lock')))
+    from msms_structure_elucidation.mcp.pipeline import cache_wait_callbacks
+    on_wait, on_acquired = cache_wait_callbacks()
+    with candidate_guard(folder, unique, on_wait, on_acquired):
         with sqlite3.connect(folder / 'spectra.sqlite3', timeout=120) as db:
             db.execute('CREATE TABLE IF NOT EXISTS spectra (smiles TEXT, energy TEXT, payload TEXT, '
                        'PRIMARY KEY(smiles, energy))')

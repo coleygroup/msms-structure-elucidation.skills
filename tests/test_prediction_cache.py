@@ -18,6 +18,40 @@ def produce(molecules, energies):
 
 
 class SharedPredictionTests(unittest.TestCase):
+    def test_large_candidate_batch_uses_bounded_file_descriptors(self):
+        handles = Path('/proc/self/fd')
+        if not handles.is_dir():
+            self.skipTest('open-descriptor accounting requires procfs')
+        before = len(list(handles.iterdir()))
+        def predict(molecules, energies):
+            self.assertLess(len(list(handles.iterdir())), before + 10)
+            return produce(molecules, energies)
+        with tempfile.TemporaryDirectory() as tmp:
+            records, receipt = cache.predictions(Path(tmp), {'model': 'large'},
+                [f'candidate_{index}' for index in range(5000)], [20], predict)
+        self.assertEqual(len(records), 5000)
+        self.assertEqual(receipt['predicted_spectra'], 5000)
+
+    def test_disjoint_candidate_sets_can_predict_concurrently(self):
+        barrier = threading.Barrier(2)
+        def predict(molecules, energies):
+            barrier.wait(timeout=3)
+            return produce(molecules, energies)
+        with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(cache.predictions, Path(tmp), {'model': 'same'}, ['CCO'], [20], predict)
+            second = pool.submit(cache.predictions, Path(tmp), {'model': 'same'}, ['CCC'], [20], predict)
+            self.assertEqual(len(first.result()[0]), 1)
+            self.assertEqual(len(second.result()[0]), 1)
+
+    def test_abandoned_partial_lease_does_not_block_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leases = Path(tmp) / cache.digest({'model': 'same'}) / 'leases'
+            leases.mkdir(parents=True)
+            (leases / 'dead.json').write_text('{partial')
+            (leases / 'dead.lock').touch()
+            result, _ = cache.predictions(Path(tmp), {'model': 'same'}, ['CCO'], [20], produce)
+            self.assertEqual(len(result), 1)
+            self.assertFalse((leases / 'dead.json').exists())
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -103,6 +137,15 @@ class InferenceDefaultsTests(unittest.TestCase):
             'num_writers', 'num_h5_chunks', 'feat_cache_size', 'sparse_k')], [128, 4, 1, 2, 4, 256, 100])
         options = cli._model_options(SimpleNamespace(model='glacier', model_cpu_workers=0), settings)
         self.assertEqual(options['num_cpu_workers'], 0)
+
+    def test_model_worker_defaults_and_saved_tuning(self):
+        self.assertEqual(cli._model_options(SimpleNamespace(model='iceberg'), {})['num_gpu_workers'], 2)
+        self.assertEqual(cli._model_options(SimpleNamespace(model='glacier'), {})['num_gpu_workers'], 1)
+        settings = {'models': {'simulator': {'num_gpu_workers': 4,
+            'glacier': {'batch_size': 512, 'num_gpu_workers': 1}}}}
+        self.assertEqual(cli._model_options(SimpleNamespace(model='iceberg'), settings)['num_gpu_workers'], 4)
+        options = cli._model_options(SimpleNamespace(model='glacier'), settings)
+        self.assertEqual((options['batch_size'], options['num_gpu_workers']), (512, 1))
 
     def test_native_command_receives_io_settings_and_only_one_gpu(self):
         import sys

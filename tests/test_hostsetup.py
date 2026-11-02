@@ -104,6 +104,31 @@ class BatchConcurrencyTest(unittest.TestCase):
 
 
 class TuneTest(unittest.TestCase):
+    def test_glacier_setup_tunes_its_own_batch_and_keeps_one_gpu_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / 'glacier.ckpt'
+            checkpoint.touch()
+            args = SimpleNamespace(remote=None, scheduler=None, no_benchmark=False,
+                                   ms_pred_python=sys.executable, model='glacier', checkpoint=str(checkpoint))
+            options = {'model': 'glacier', 'checkpoint': str(checkpoint), 'ms_pred_dir': tmp,
+                       'batch_size': 128, 'num_gpu_workers': 1, 'num_cpu_workers': 4}
+            tested = []
+            def run(size, molecules=None):
+                tested.append(size)
+                return {'batch_size': size, 'gpu_workers': 1, 'ok': True,
+                        'spectra_per_second': 100 if size == 128 else 104, 'peak_memory_fraction': .2}
+            with patch.object(hostprobe, 'probe', return_value=host([gpu(0, 24., 24.)])), \
+                 patch.object(hostsetup, 'benchmark_trial', return_value=run) as trial, \
+                 patch.object(hostsetup, 'save_local') as save:
+                report = hostsetup.setup(args, options, lambda value: value)
+            self.assertEqual(tested, [128, 128, 256])
+            self.assertEqual(trial.call_args.args[6], 'glacier')
+            self.assertEqual(report['simulator']['glacier']['batch_size'], 128)
+            self.assertEqual(report['simulator']['glacier']['num_gpu_workers'], 1)
+            self.assertEqual(report['simulator']['glacier']['spectra_per_second'], 100)
+            self.assertNotIn('batch_size', report['simulator'])
+            self.assertNotIn('num_gpu_workers', report['simulator'])
+            self.assertEqual(save.call_args.args[0]['models']['simulator']['model'], 'glacier')
     @staticmethod
     def trial(limit, rates):
         def run(size):

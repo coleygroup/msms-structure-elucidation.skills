@@ -1,9 +1,8 @@
 """MCP server exposing ms-pred (ICEBERG, GLACIER), FRIGID, MIST and atlas predictions.
 
-It runs on the host that holds the models. A client on another machine starts it over ssh,
-so stdio carries the protocol across. Model tools submit a job to the configured backend
-(local or Slurm), wait up to `wait_seconds`, and then return either the result or a job id
-for `get_job`.
+It runs on a CPU coordinator, optionally reached over SSH. Model tools use local,
+Slurm or Kubernetes execution, or a pool of compatible prediction endpoints. They
+wait up to `wait_seconds`, then return either the result or a job id for `get_job`.
 """
 from __future__ import annotations
 
@@ -12,7 +11,9 @@ import argparse
 import functools
 import hashlib
 import os
+import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -26,7 +27,7 @@ from msms_structure_elucidation import pubchem
 from msms_structure_elucidation.config import settings
 from msms_structure_elucidation.mcp import tasks
 from msms_structure_elucidation.mcp.backends import make_backend
-from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore
+from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, read_json
 from msms_structure_elucidation.spectrum import inspect_ms
 
 INSTRUCTIONS = (
@@ -68,6 +69,9 @@ def configure(backend: str | None = None, config: str | None = None, job_root: s
     if config:
         os.environ['MSMS_CONFIG'] = str(Path(config).expanduser().resolve())
     loaded = settings(None)
+    loaded.setdefault('mcp', {})['backend'] = backend or loaded.get('mcp', {}).get('backend') or 'local'
+    loaded['_mcp_python'] = sys.executable
+    loaded['_mcp_dispatcher'] = {'host': socket.gethostname(), 'pid': os.getpid()}
     mcp_settings = loaded.get('mcp', {})
     root = Path(job_root or mcp_settings.get('job_root') or 'results/mcp_jobs').expanduser()
     if not root.is_absolute():
@@ -115,7 +119,12 @@ def _response(job_id: str, detail: str = 'summary') -> dict:
     status = runtime['backend'].poll(job_id)
     request = store.request(job_id)
     out = {'job_id': job_id, 'task': request['task'], 'state': status['state'], 'job_dir': str(store.path(job_id))}
-    for key in ('devices', 'slurm_job_id', 'host', 'started', 'finished'):
+    metrics = read_json(store.path(job_id) / 'gpu-metrics.json') or read_json(store.path(job_id) / 'collected/gpu-metrics.json')
+    if metrics:
+        out['gpu_metrics'] = metrics
+    for key in ('devices', 'slurm_job_id', 'host', 'started', 'finished', 'phase', 'phase_seconds',
+                'prediction_job', 'prediction_jobs', 'server', 'transport_error', 'remote_cleanup_error',
+                'remote_cleanup_pending', 'dispatch_errors', 'kubernetes_job', 'scheduler_reason', 'cancel_requested'):
         if status.get(key):
             out[key] = status[key]
     if status['state'] in ACTIVE and status.get('scheduler_state'):
@@ -145,22 +154,28 @@ async def _wait(job_id: str, wait_seconds: int, ctx: Context | None) -> None:
         await asyncio.sleep(min(3.0, max(0.0, deadline - time.monotonic())))
 
 
+def _model_identity(params: dict, config: dict) -> dict:
+    """Fingerprint scientific inputs outside the MCP event loop."""
+    from msms_structure_elucidation.prediction_cache import cache_root, file_fingerprint, source_fingerprint
+    options = tasks.cli._model_options(argparse.Namespace(model=params.get('model', 'iceberg')), config)
+    required = ('checkpoint',) if options['model'] == 'glacier' else ('gen_checkpoint', 'inten_checkpoint')
+    root = cache_root(options.get('prediction_cache'))
+    identity = {'config': config.get('_config_digest'),
+                'adapter': source_fingerprint(Path(tasks.cli.__file__).parent),
+                'weights': {key: file_fingerprint(Path(options[key]), root) for key in required
+                            if options.get(key) and Path(options[key]).is_file()}}
+    if options.get('ms_pred_dir') and Path(options['ms_pred_dir']).is_dir():
+        identity['source'] = source_fingerprint(Path(options['ms_pred_dir'])/'src/ms_pred')
+    return identity
+
+
 async def _submit(task: str, params: dict, inputs: dict, wait_seconds: int | None, ctx: Context | None) -> dict:
     runtime = _runtime()
-    from msms_structure_elucidation.prediction_cache import cache_root, file_fingerprint, source_fingerprint
     config = runtime['config']
-    if task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass', 'search_pubchem_formulas', 'retrieve_atlas'):
-        options = tasks.cli._model_options(argparse.Namespace(model=params.get('model', 'iceberg')), config)
-        required = ('checkpoint',) if options['model'] == 'glacier' else ('gen_checkpoint', 'inten_checkpoint')
-        root = cache_root(options.get('prediction_cache'))
-        identity = {'config': config.get('_config_digest'),
-                    'adapter': source_fingerprint(Path(tasks.cli.__file__).parent),
-                    'weights': {key: file_fingerprint(Path(options[key]), root) for key in required
-                                if options.get(key) and Path(options[key]).is_file()}}
-        if options.get('ms_pred_dir') and Path(options['ms_pred_dir']).is_dir():
-            identity['source'] = source_fingerprint(Path(options['ms_pred_dir'])/'src/ms_pred')
-        params = {**params, '_model_identity': identity}
-    job_id, reused = runtime['store'].create(task, params, inputs, kind=tasks.KINDS[task])
+    if tasks.KINDS[task] == 'pipeline':
+        params = {**params, '_model_identity': await asyncio.to_thread(_model_identity, params, config)}
+    job_id, reused = await asyncio.to_thread(runtime['store'].create, task, params, inputs,
+                                            kind=tasks.KINDS[task], config=config)
     if not reused:
         await asyncio.to_thread(runtime['backend'].submit, job_id)
     await _wait(job_id, runtime['wait_seconds'] if wait_seconds is None else wait_seconds, ctx)
@@ -334,7 +349,11 @@ async def get_job(ctx: Context, job_id: str, wait_seconds: Annotated[int, Field(
 async def cancel_job(job_id: str) -> dict:
     """Cancel a queued or running job."""
     status = await asyncio.to_thread(_runtime()['backend'].cancel, job_id)
-    return {'job_id': job_id, 'state': status['state']}
+    store = _runtime()['store']
+    pending = [child for child in await asyncio.to_thread(store.children, job_id)
+               if store.status(child)['state'] in ACTIVE]
+    return {'job_id': job_id, 'state': status['state'], 'pending_child_cancellations': pending,
+            **({'transport_error': status['transport_error']} if status.get('transport_error') else {})}
 
 
 @tool

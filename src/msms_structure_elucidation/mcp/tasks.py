@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,10 +22,10 @@ REPO = Path(__file__).resolve().parents[3]
 MIST_SCRIPT = REPO / '.agents/skills/msms-mist-fingerprint/scripts/run.py'
 SUBFORMULAE_SCRIPT = REPO / '.agents/skills/msms-subformulae/scripts/run.py'
 INLINE_SPECTRUM = 'spectrum.ms'
-# Resource class per task: gpu tasks wait for a GPU; any uses a free GPU or else the CPU.
-KINDS = {'predict_spectra': 'gpu', 'score_candidates': 'gpu', 'generate_structures_frigid': 'gpu',
-         'predict_fingerprint_mist': 'gpu', 'retrieve_atlas': 'any', 'search_pubchem_mass': 'gpu',
-         'search_pubchem_formulas': 'gpu', 'infer_formulas': 'cpu'}
+# Pipeline tasks prepare and score on CPU; their internal inference jobs acquire GPUs separately.
+KINDS = {'predict_spectra': 'pipeline', 'score_candidates': 'pipeline', 'generate_structures_frigid': 'gpu',
+         'predict_fingerprint_mist': 'gpu', 'retrieve_atlas': 'pipeline', 'search_pubchem_mass': 'pipeline',
+         'search_pubchem_formulas': 'pipeline', 'infer_formulas': 'cpu', 'model_inference': 'gpu'}
 
 
 def _section(config: dict, name: str) -> dict:
@@ -79,6 +80,8 @@ def _simulator_options(config: dict, model: str, devices: str | None) -> dict:
     per_gpu = max(1, int(options['num_gpu_workers']) // max(1, len(tuned.split(',')) if tuned else 1))
     options['cuda_devices'] = devices
     options['num_gpu_workers'] = per_gpu * len(devices.split(',')) if devices and model != 'glacier' else 1
+    if not devices and model != 'glacier' and os.environ.get('MSMS_PIPELINE_JOB'):
+        options['num_gpu_workers'] = per_gpu
     return options
 
 
@@ -141,10 +144,12 @@ def score_candidates(params: dict, job_dir: Path, config: dict, devices: str | N
 
 
 def retrieve_atlas(params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
+    from msms_structure_elucidation.mcp.pipeline import group_size
     out = job_dir / 'retrieval'
     command = [sys.executable, '-m', 'msms_structure_elucidation.cli', 'run', '--input', str(_spectrum(params, job_dir)),
                '--collision-unit', params['collision_unit'], '--output-dir', str(out), '--no-report',
                '--ms-pred-python', _ms_pred_python(config), '--cuda-devices', devices or '']
+    command += ['--model-shard-size', str(group_size(config, 'iceberg'))]
     for key in ('formula', 'top_k', 'instrument'):
         if params.get(key):
             command += ['--' + key.replace('_', '-'), str(params[key])]
@@ -182,7 +187,8 @@ def search_pubchem_mass(params: dict, job_dir: Path, config: dict, devices: str 
     # An empty device list explicitly selects CPU even when the host config names GPUs.
     if devices is None:
         command += ['--cuda-devices', '']
-    shard_size = params.get('shard_size') or _section(config, 'simulator').get('shard_size', 256)
+    from msms_structure_elucidation.mcp.pipeline import group_size
+    shard_size = params.get('shard_size') or group_size(config, params['model'])
     command += ['--model-shard-size', str(shard_size)]
     done = subprocess.run(command, cwd=REPO, stdout=log, stderr=subprocess.STDOUT)
     result_path = out / 'retrieval.json'
@@ -269,6 +275,9 @@ RUNNERS = {'predict_spectra': predict_spectra, 'score_candidates': score_candida
 
 
 def run(task: str, params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
+    if task == 'model_inference':
+        from msms_structure_elucidation.mcp.pipeline import inference
+        return inference(params, job_dir, config, devices, log)
     return RUNNERS[task](params, job_dir, config, devices, log)
 
 

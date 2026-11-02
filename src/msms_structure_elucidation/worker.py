@@ -477,6 +477,10 @@ def _run_model(smiles: list[str], energies: list, nce: bool, adduct: str, model:
                num_writers: int = 2, num_h5_chunks: int = 4, feat_cache_size: int = 256,
                sparse_k: int = 100) -> Path:
     """Run GLACIER or ICEBERG on SMILES and return the directory holding preds*.hdf5."""
+    arguments = locals().copy()
+    from msms_structure_elucidation.mcp import pipeline
+    if pipeline.context() is not None:
+        return pipeline.run_model(arguments)
     _require_cuda(cuda_devices)
     if model == 'glacier':
         if not checkpoint or not Path(checkpoint).is_file():
@@ -519,25 +523,40 @@ def _model_predictions(smiles, energies, nce, adduct, model, checkpoint, gen_che
     """Yield native spectra, reusing only raw model outputs under matching scientific settings."""
     from ms_pred import common
     generated = []
-    def run(molecules, settings, normalized=False):
+    def runs(molecules, settings, normalized=False):
+        from msms_structure_elucidation.mcp import pipeline
+        if pipeline.context() is not None:
+            arguments = dict(smiles=molecules, energies=settings, nce=nce and not normalized,
+                adduct=adduct, model=model, checkpoint=checkpoint, gen_checkpoint=gen_checkpoint,
+                inten_checkpoint=inten_checkpoint, instrument=instrument, cuda_devices=cuda_devices,
+                batch_size=batch_size, num_cpu_workers=num_cpu_workers, num_gpu_workers=num_gpu_workers,
+                force_recompute=True, num_writers=runtime.get('num_writers', 2),
+                num_h5_chunks=runtime.get('num_h5_chunks', 4), feat_cache_size=runtime.get('feat_cache_size', 256),
+                sparse_k=runtime.get('sparse_k', 100))
+            for path in pipeline.run_groups(arguments):
+                generated.append(path)
+                yield path
+            return
         path = _run_model(molecules, settings, nce and not normalized, adduct, model,
             checkpoint, gen_checkpoint, inten_checkpoint, instrument, cuda_devices, batch_size,
             num_cpu_workers, num_gpu_workers, force_recompute or prediction_cache is not None, **runtime)
         generated.append(path)
-        return path
+        yield path
     def cleanup():
         import shutil
         for path in generated:
-            if model == 'glacier' and path.name.startswith('msms-glacier-'):
+            if model == 'glacier' and (path.name.startswith('msms-glacier-') or
+                    (path.name == 'native_outputs' and path.parent.name.startswith('model_inference-'))):
                 shutil.rmtree(path)
         generated.clear()
     if prediction_cache is None:
-        db = common.PredSpecDB(run(smiles, energies) / 'preds.hdf5')
-        try:
-            for item in db.get_all_specs():
-                yield item[-1], None
-        finally:
-            db.close()
+        for folder in runs(smiles, energies):
+            db = common.PredSpecDB(folder / 'preds.hdf5')
+            try:
+                for item in db.get_all_specs():
+                    yield item[-1], None
+            finally:
+                db.close()
         cleanup()
         return
     from msms_structure_elucidation import prediction_cache as cache
@@ -550,7 +569,8 @@ def _model_predictions(smiles, energies, nce, adduct, model, checkpoint, gen_che
                                     adduct, instrument, runtime.get('sparse_k', 100))
     import hashlib
     identity['adapter_sha256'] = hashlib.sha256(Path(__file__).read_bytes() +
-        Path(__file__).with_name('glacier.py').read_bytes()).hexdigest()
+        Path(__file__).with_name('glacier.py').read_bytes() +
+        Path(__file__).with_name('iceberg.py').read_bytes()).hexdigest()
     groups = defaultdict(list)
     for smi in dict.fromkeys(common.rm_stereo(s) for s in smiles):
         precursor = common.mass_from_smi(smi) + common.ion2mass[adduct]
@@ -558,13 +578,16 @@ def _model_predictions(smiles, energies, nce, adduct, model, checkpoint, gen_che
               for e in energies]
         groups[tuple(sorted({int(round(float(e))) for e in ev}))].append(smi)
     def produce(molecules, ev):
-        db = common.PredSpecDB(run(molecules, ev, normalized=True) / 'preds.hdf5')
-        try:
-            return [{'smiles': p.root_canonical_smiles, 'predicted_spectra': _serial_spec(p),
-                     'predicted_fragment_ids': _serial_fragment_ids(p)}
-                    for item in db.get_all_specs() for p in [item[-1]]]
-        finally:
-            db.close()
+        records = []
+        for folder in runs(molecules, ev, normalized=True):
+            db = common.PredSpecDB(folder / 'preds.hdf5')
+            try:
+                records.extend({'smiles': p.root_canonical_smiles, 'predicted_spectra': _serial_spec(p),
+                                'predicted_fragment_ids': _serial_fragment_ids(p)}
+                               for item in db.get_all_specs() for p in [item[-1]])
+            finally:
+                db.close()
+        return records
     for ev, molecules in groups.items():
         records, receipt = cache.predictions(root, identity, molecules, list(ev), produce)
         cleanup()
@@ -708,7 +731,8 @@ def simulate(spectrum: str, smiles: list[str], formula: str, model: str,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['rank', 'formula', 'validate', 'simulate', 'predict', 'atlas-smiles', 'atlas-info'])
+    parser.add_argument('action', choices=['rank', 'formula', 'validate', 'simulate', 'predict', 'atlas-smiles', 'atlas-info', 'run-model'])
+    parser.add_argument('--model-request')
     parser.add_argument('--spectrum')
     parser.add_argument('--mgf')
     parser.add_argument('--formula')
@@ -745,7 +769,36 @@ def main():
     args = parser.parse_args()
     if args.action in ('rank', 'formula', 'simulate') and not args.experimental_unit:
         parser.error('--experimental-unit is required for experimental spectra')
-    if args.action == 'rank':
+    if args.action == 'run-model':
+        payload = json.loads(Path(args.model_request).read_text())
+        arguments = payload['arguments']
+        if payload.get('prepared'):
+            _require_cuda(arguments['cuda_devices'])
+            if arguments['model'] == 'glacier':
+                from msms_structure_elucidation.glacier import run_prepared
+                folder = run_prepared(Path(payload['prepared']), arguments['cuda_devices'])
+            else:
+                from msms_structure_elucidation.iceberg import run_prepared
+                folder = run_prepared(Path(payload['prepared']), arguments)
+        else:
+            folder = _run_model(**arguments)
+        if payload.get('publish_dir'):
+            # A Slurm CPU orchestrator may run on another node. Publish complete
+            # native files after local scratch writes, before returning their path.
+            import shutil
+            destination = Path(payload['publish_dir'])
+            shutil.copytree(folder, destination, dirs_exist_ok=True)
+            if payload.get('prepared') and folder.name.startswith(('msms-glacier-', 'msms-iceberg-')):
+                shutil.rmtree(folder)
+            folder = destination
+        if payload.get('publish_dir'):
+            import shutil
+            logs = Path(payload['publish_dir']).parent / 'native_logs'
+            logs.mkdir(exist_ok=True)
+            for log_path in folder.glob('*.log'):
+                shutil.copy2(log_path, logs / log_path.name)
+        result = {'save_dir': str(folder)}
+    elif args.action == 'rank':
         result = rank(args.spectrum, args.mgf, args.formula, args.top_k, args.experimental_unit)
     elif args.action == 'atlas-smiles':
         result = atlas_smiles(args.mgf)

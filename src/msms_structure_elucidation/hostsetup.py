@@ -58,15 +58,24 @@ def tune_batch_size(run_trial, start: int) -> tuple[int | None, list[dict]]:
     return best['batch_size'], trials
 
 
-def benchmark_trial(python: str, ms_pred_dir: str, gen: str, inten: str, settings: dict, num_smiles: int):
+def benchmark_trial(python: str, ms_pred_dir: str, gen: str | None, inten: str | None, settings: dict,
+                    num_smiles: int, model: str = 'iceberg', checkpoint: str | None = None,
+                    smiles_json: str | None = None):
     """Return a callable that runs one benchmark subprocess for a batch size."""
     script = Path(__file__).with_name('benchmark.py')
 
     def run(batch_size: int, molecules: int = num_smiles) -> dict:
-        cmd = [python, str(script), '--gen-checkpoint', gen, '--inten-checkpoint', inten,
+        cmd = [python, str(script), '--model', model,
                '--cuda-devices', settings['cuda_devices'] or '', '--batch-size', str(batch_size),
                '--num-gpu-workers', str(settings['num_gpu_workers']),
                '--num-cpu-workers', str(settings['num_cpu_workers']), '--num-smiles', str(molecules)]
+        for flag, value in (('--gen-checkpoint', gen), ('--inten-checkpoint', inten),
+                            ('--checkpoint', checkpoint), ('--smiles-json', smiles_json)):
+            if value:
+                cmd += [flag, value]
+        for key in ('num_writers', 'num_h5_chunks', 'feat_cache_size'):
+            if key in settings:
+                cmd += ['--' + key.replace('_', '-'), str(settings[key])]
         print(f'benchmark: batch_size={batch_size} molecules={molecules}', flush=True)
         # A new session lets a timeout stop ms-pred's own worker processes too.
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -160,7 +169,8 @@ def setup_remote(args) -> dict:
     return {**report, 'execution': execution, 'config': str(LOCAL_CONFIG)}
 
 
-VALUE_FLAGS = ('ms_pred_python', 'ms_pred_dir', 'gen_checkpoint', 'inten_checkpoint', 'frigid_python', 'frigid_dir',
+VALUE_FLAGS = ('ms_pred_python', 'ms_pred_dir', 'gen_checkpoint', 'inten_checkpoint', 'model', 'checkpoint',
+               'benchmark_smiles', 'frigid_python', 'frigid_dir',
                'mist_checkpoint', 'dlm_checkpoint', 'scheduler', 'slurm_partition', 'slurm_account', 'slurm_qos',
                'slurm_gpus', 'slurm_cpus', 'slurm_mem', 'slurm_time', 'slurm_cpu_cpus', 'slurm_cpu_mem',
                'mcp_job_root')
@@ -186,12 +196,15 @@ def model_paths(args) -> dict:
     simulator, denovo = {}, {}
     for section, key, option in ((simulator, 'python', 'ms_pred_python'), (simulator, 'ms_pred_src', 'ms_pred_dir'),
                                  (simulator, 'gen_ckpt', 'gen_checkpoint'), (simulator, 'inten_ckpt', 'inten_checkpoint'),
+                                 (simulator, 'glacier_ckpt', 'checkpoint'),
                                  (denovo, 'frigid_python', 'frigid_python'), (denovo, 'frigid_src', 'frigid_dir'),
                                  (denovo, 'mist_ckpt', 'mist_checkpoint'), (denovo, 'dlm_ckpt', 'dlm_checkpoint')):
         if getattr(args, option, None):
             path = Path(getattr(args, option)).expanduser()
             # A bare interpreter name such as python3 stays a name; anything else is saved absolute.
             section[key] = str(path.absolute()) if path.exists() or '/' in str(path) else str(path)
+    if getattr(args, 'model', None):
+        simulator['model'] = args.model
     return {'simulator': simulator, 'denovo': denovo}
 
 
@@ -266,7 +279,8 @@ def setup_slurm(args) -> dict:
     logs.mkdir(parents=True, exist_ok=True)
     # The compute node probes and benchmarks itself; only the ms-pred options matter there.
     node = SimpleNamespace(**{name: getattr(args, name, None) for name in
-                              ('ms_pred_python', 'ms_pred_dir', 'gen_checkpoint', 'inten_checkpoint', 'no_benchmark')})
+                              ('ms_pred_python', 'ms_pred_dir', 'gen_checkpoint', 'inten_checkpoint', 'no_benchmark',
+                               'model', 'checkpoint', 'benchmark_smiles')})
     inner = [sys.executable, '-m', 'msms_structure_elucidation.cli', 'setup', '--json', *forwarded_flags(node)]
     options, script = sbatch_script(slurm, 'gpu', inner)
     (logs / 'setup_job.sh').write_text(script)
@@ -322,27 +336,56 @@ def setup(args, model_options: dict, find_python, batch_defaults: dict | None = 
     recommended = hostprobe.recommend(host)
     notes = recommended.pop('notes')
     simulator = dict(recommended)
+    model = model_options.get('model', 'iceberg')
+    if model == 'glacier':
+        # Tuning GLACIER must not replace a previously measured ICEBERG profile.
+        simulator = {'cuda_devices': recommended['cuda_devices']}
+        simulator['glacier'] = {key: model_options.get(key, default) for key, default in {
+            'batch_size': 128, 'num_cpu_workers': 4, 'num_gpu_workers': 1, 'num_writers': 2,
+            'num_h5_chunks': 4, 'feat_cache_size': 256, 'sparse_k': 100}.items()}
     status, trials = 'heuristic', []
+    required = ('checkpoint',) if model == 'glacier' else ('gen_checkpoint', 'inten_checkpoint')
     ready = model_options.get('ms_pred_dir') and all(model_options.get(k) and Path(model_options[k]).is_file()
-                                                      for k in ('gen_checkpoint', 'inten_checkpoint'))
+                                                      for k in required)
     if args.no_benchmark:
         notes.append('benchmark skipped (--no-benchmark)')
     elif not simulator['cuda_devices']:
         notes.append('no usable GPU; CPU settings are heuristic')
     elif not ready:
-        notes.append('ICEBERG checkpoints or ms-pred checkout not configured; rerun setup after adding them to benchmark')
+        notes.append(f'{model.upper()} checkpoints or ms-pred checkout not configured; rerun setup after adding them to benchmark')
     else:
+        tuned = simulator['glacier'] if model == 'glacier' else simulator
+        trial_settings = {**tuned, 'cuda_devices': simulator['cuda_devices']}
+        if model == 'glacier':
+            trial_settings['num_gpu_workers'] = 1
         run_trial = benchmark_trial(find_python(args.ms_pred_python), model_options['ms_pred_dir'],
-                                    model_options['gen_checkpoint'], model_options['inten_checkpoint'], simulator,
-                                    workload(simulator['batch_size'], simulator['num_gpu_workers']))
+                                    model_options.get('gen_checkpoint'), model_options.get('inten_checkpoint'), trial_settings,
+                                    workload(tuned['batch_size'], tuned['num_gpu_workers']), model,
+                                    model_options.get('checkpoint'), getattr(args, 'benchmark_smiles', None))
         # Untimed warm-up: the first run pays for cold imports and checkpoint reads, which would favour later trials.
-        run_trial(simulator['batch_size'], WARMUP_MOLECULES)
-        best, trials = tune_batch_size(run_trial, simulator['batch_size'])
+        run_trial(tuned['batch_size'], WARMUP_MOLECULES)
+        best, trials = tune_batch_size(run_trial, tuned['batch_size'])
         if best is None:
             raise RuntimeError('every benchmark trial failed; check the ms-pred environment and checkpoints:\n'
                                + json.dumps(trials[-1], indent=2))
-        simulator['batch_size'] = best
-        simulator['shard_size'] = min(2048, max(256, 8 * best))
+        tuned['batch_size'] = best
+        best_trial = next(t for t in trials if t['batch_size'] == best)
+        tuned['spectra_per_second'] = best_trial['spectra_per_second']
+        # ICEBERG worker count is a second independent tuning dimension. Keep
+        # the selected batch and fixed cohort; require a measured throughput gain.
+        if model == 'iceberg':
+            devices = max(1, len(simulator['cuda_devices'].split(',')))
+            chosen_workers = simulator['num_gpu_workers']
+            for per_gpu in (3, 4):
+                trial_settings['num_gpu_workers'] = per_gpu * devices
+                trial = run_trial(best)
+                trials.append(trial)
+                if fits(trial) and trial['spectra_per_second'] >= 1.05 * tuned['spectra_per_second']:
+                    chosen_workers = per_gpu * devices
+                    tuned['spectra_per_second'] = trial['spectra_per_second']
+            simulator['num_gpu_workers'] = chosen_workers
+        if model == 'iceberg':
+            simulator['shard_size'] = min(2048, max(256, 8 * best))
         status = 'benchmarked'
     batch_defaults = batch_defaults or {}
     features = hostprobe.batch_workers(host['cpu_threads'], host['ram_total_gb'],
@@ -358,8 +401,24 @@ def setup(args, model_options: dict, find_python, batch_defaults: dict | None = 
     update['host_profile'] = {'hostname': host['hostname'], 'gpus': [g['name'] for g in host['gpus']],
         'cpu_threads': host['cpu_threads'], 'ram_total_gb': host['ram_total_gb'], 'status': status,
         'configured': datetime.datetime.now().isoformat(timespec='seconds'), 'notes': notes,
+        'tuning_model': model, 'trials': trials,
         'benchmark': {str(t['batch_size']): t.get('spectra_per_second') if fits(t) else 'failed' for t in trials}}
     save_local(update)
     return {'status': status, 'host': host, 'simulator': simulator, 'batch_max_workers': features,
             'notes': notes, 'trials': trials,
             'config': str(LOCAL_CONFIG)}
+
+
+def setup_pool(servers_path: Path, probe: bool = True) -> dict:
+    """Validate private endpoint configuration and save it without copying credentials or weights."""
+    from msms_structure_elucidation.mcp.fleet import Endpoint
+    servers = json.loads(servers_path.read_text())
+    if not isinstance(servers, dict) or not servers:
+        raise ValueError('The servers file must contain a nonempty JSON mapping of endpoint names to settings')
+    reports = {}
+    for name, settings in servers.items():
+        remote = Endpoint(name, settings)
+        if settings.get('enabled', True):
+            reports[name] = remote.call('probe') if probe else {'status': 'not_probed'}
+    save_local({'mcp': {'backend': 'pool', 'servers': servers}, 'execution': {'mode': 'local'}})
+    return {'backend': 'pool', 'servers': reports, 'config': str(LOCAL_CONFIG)}

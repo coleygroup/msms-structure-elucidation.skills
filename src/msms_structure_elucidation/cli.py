@@ -60,6 +60,7 @@ def model_python(explicit: str | None) -> str:
 
 
 def worker(python: str, action: str, **kwargs):
+    log_handle = kwargs.pop('log_handle', None)
     cwd = kwargs.pop('ms_pred_dir', None)
     if cwd:
         cwd = Path(cwd).expanduser().resolve()
@@ -90,6 +91,21 @@ def worker(python: str, action: str, **kwargs):
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join(x for x in (
         str(cwd / 'src') if cwd else None, str(Path(__file__).resolve().parents[1]), env.get('PYTHONPATH')) if x)
+    if log_handle is not None:
+        tail = ''
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=cwd) as process:
+            while block := process.stdout.read1(4096):
+                chunk = block.decode(errors='replace')
+                log_handle.write(chunk)
+                log_handle.flush()
+                tail = (tail + chunk)[-20_000:]
+            code = process.wait()
+        if code:
+            raise RuntimeError(f'{action} failed (exit {code}):\n{tail[-6000:]}')
+        for line in reversed(tail.splitlines()):
+            if line.startswith('RESULT_JSON='):
+                return json.loads(line.removeprefix('RESULT_JSON='))
+        raise RuntimeError(f'No worker result: {tail[-2000:]}')
     run = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd)
     if run.returncode:
         raise RuntimeError(f'{action} failed (exit {run.returncode}):\n{run.stdout[-6000:]}\n{run.stderr[-6000:]}')
@@ -117,7 +133,7 @@ def _model_options(args, config: dict, default_model='iceberg') -> dict:
         'cuda_devices': _devices(choice(getattr(args, 'cuda_devices', None), 'MSMS_CUDA_DEVICES', model_cfg.get('cuda_devices'))),
         'batch_size': choice(getattr(args, 'model_batch_size', None), None, tuned.get('batch_size', 128 if model == 'glacier' else 1)),
         'num_cpu_workers': choice(getattr(args, 'model_cpu_workers', None), None, tuned.get('num_cpu_workers', 4 if model == 'glacier' else 1)),
-        'num_gpu_workers': choice(getattr(args, 'model_gpu_workers', None), None, tuned.get('num_gpu_workers', 1))}
+        'num_gpu_workers': choice(getattr(args, 'model_gpu_workers', None), None, tuned.get('num_gpu_workers', 1 if model == 'glacier' else 2))}
     from msms_structure_elucidation.prediction_cache import cache_root
     options['prediction_cache'] = str(cache_root(getattr(args, 'prediction_cache', None) or
                                                 asset(model_cfg.get('prediction_cache'), config))) \
@@ -1067,7 +1083,10 @@ def main(argv=None):
     installer.add_argument('--ms-pred-dir', help='ms-pred checkout; saved to configs/local.yaml')
     installer.add_argument('--gen-checkpoint', help='ICEBERG generator; saved to configs/local.yaml')
     installer.add_argument('--inten-checkpoint', help='ICEBERG intensity model; saved to configs/local.yaml')
-    installer.add_argument('--no-benchmark', action='store_true', help='save heuristic settings without timing ICEBERG')
+    installer.add_argument('--model', choices=['iceberg', 'glacier'])
+    installer.add_argument('--checkpoint', help='GLACIER checkpoint')
+    installer.add_argument('--benchmark-smiles', help='JSON array of representative unique SMILES, held fixed across tuning trials')
+    installer.add_argument('--no-benchmark', action='store_true', help='save heuristic settings without timing inference')
     installer.add_argument('--json', action='store_true', help='print one SETUP_JSON= line')
     installer.add_argument('--remote', help='ssh destination (user@host or ~/.ssh/config alias) that runs the models')
     installer.add_argument('--remote-repo', help='this repository checked out on the remote host')
@@ -1097,9 +1116,12 @@ def main(argv=None):
     installer.add_argument('--mcp-job-root', help='MCP job directory root on the model host, such as a project or '
                                                  'scratch file system; saved to configs/local.yaml')
     serve = sub.add_parser('mcp', help='serve the model tools over MCP stdio on this host')
-    serve.add_argument('--backend', choices=['local', 'slurm'], help='job backend; default mcp.backend')
+    serve.add_argument('--backend', choices=['local', 'slurm', 'kubernetes', 'pool'], help='job backend; default mcp.backend')
     serve.add_argument('--config', help='workflow config; default configs/default.yaml with configs/local.yaml')
     serve.add_argument('--job-root', help='job directory root; default mcp.job_root')
+    pool = sub.add_parser('setup-pool', help='probe configured prediction servers and save a private dispatch pool')
+    pool.add_argument('--servers', type=Path, required=True, help='private JSON mapping of server names to endpoint settings')
+    pool.add_argument('--no-probe', action='store_true', help='validate configuration without contacting endpoints')
     client = sub.add_parser('mcp-config', help='print or write the .mcp.json entry for the configured model host')
     client.add_argument('--name', default='msms-structure-elucidation', help='server name in .mcp.json')
     client.add_argument('--python', help='server interpreter for a local server (default: this interpreter)')
@@ -1125,6 +1147,10 @@ def main(argv=None):
         prediction_parser.add_argument('--sparse-k', type=int, help='GLACIER peaks retained per predicted spectrum')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'setup-pool':
+            from msms_structure_elucidation.hostsetup import setup_pool
+            print(json.dumps(setup_pool(args.servers, not args.no_probe), indent=2))
+            return 0
         if args.command == 'workflow':
             from msms_structure_elucidation.workflow_guard import main as workflow_main
             return workflow_main(args.workflow_args)

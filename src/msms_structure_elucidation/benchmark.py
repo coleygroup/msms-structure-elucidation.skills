@@ -58,9 +58,12 @@ def gpu_memory(devices: str) -> dict[int, tuple[float, float]]:
 
 
 def trial(args) -> dict:
-    from ms_pred.iceberg.iceberg_elucidation import iceberg_prediction
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from msms_structure_elucidation.worker import _run_model
+    from ms_pred import common
 
-    smiles = molecules(args.num_smiles)
+    smiles = json.loads(Path(args.smiles_json).read_text()) if args.smiles_json else molecules(args.num_smiles)
+    smiles = list(dict.fromkeys(common.rm_stereo(smi) for smi in smiles))
     peak: dict[int, float] = {}
     totals: dict[int, float] = {}
     done = threading.Event()
@@ -75,27 +78,47 @@ def trial(args) -> dict:
     watcher = threading.Thread(target=poll, daemon=True)
     watcher.start()
     start = time.perf_counter()
-    save_dir, _ = iceberg_prediction(candidate_smiles=smiles, collision_energies=ENERGIES, nce=False,
-        adduct='[M+H]+', instrument='Orbitrap', exp_name=f'msms_benchmark_{args.batch_size}_{args.num_smiles}',
-        python_path=sys.executable, gen_ckpt=args.gen_checkpoint, inten_ckpt=args.inten_checkpoint,
-        cuda_devices=args.cuda_devices or None, batch_size=args.batch_size,
-        num_gpu_workers=args.num_gpu_workers, num_cpu_workers=args.num_cpu_workers, force_recompute=True)
+    save_dir = _run_model(smiles=smiles, energies=ENERGIES, nce=False, adduct='[M+H]+',
+        model=args.model, checkpoint=args.checkpoint, gen_checkpoint=args.gen_checkpoint,
+        inten_checkpoint=args.inten_checkpoint, instrument='Orbitrap', cuda_devices=args.cuda_devices or None,
+        batch_size=args.batch_size, num_gpu_workers=args.num_gpu_workers,
+        num_cpu_workers=args.num_cpu_workers, force_recompute=True,
+        num_writers=args.num_writers, num_h5_chunks=args.num_h5_chunks, feat_cache_size=args.feat_cache_size)
     seconds = time.perf_counter() - start
     done.set()
     watcher.join()
-    ok = (Path(save_dir) / 'iceberg_run_successful').is_file()
+    ok = (Path(save_dir) / f'{args.model}_run_successful').is_file()
+    db = common.PredSpecDB(Path(save_dir) / 'preds.hdf5')
+    try:
+        count, identities = 0, set()
+        for item in db.get_all_specs():
+            prediction = item[-1]
+            count += len(prediction.ce_to_ms)
+            identities.add(prediction.root_canonical_smiles)
+        identities_match = identities == set(smiles)
+    finally:
+        db.close()
     fraction = max((peak[i] / totals[i] for i in peak), default=None)
     spectra = len(smiles) * len(ENERGIES)
-    return {'batch_size': args.batch_size, 'ok': ok, 'seconds': round(seconds, 1), 'spectra': spectra,
+    ok = ok and count == spectra and identities_match
+    result = {'batch_size': args.batch_size, 'gpu_workers': args.num_gpu_workers, 'model': args.model,
+            'ok': ok, 'seconds': round(seconds, 1), 'spectra': spectra, 'actual_spectra': count,
             'spectra_per_second': round(spectra / seconds, 2) if ok else None,
             'peak_memory_gb': {str(i): round(v, 2) for i, v in peak.items()},
             'peak_memory_fraction': round(fraction, 3) if fraction is not None else None}
+    return result
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gen-checkpoint', required=True)
-    parser.add_argument('--inten-checkpoint', required=True)
+    parser.add_argument('--model', choices=['iceberg', 'glacier'], default='iceberg')
+    parser.add_argument('--checkpoint')
+    parser.add_argument('--gen-checkpoint')
+    parser.add_argument('--inten-checkpoint')
+    parser.add_argument('--smiles-json', help='fixed representative unique SMILES cohort for all tuning trials')
+    parser.add_argument('--num-writers', type=int, default=2)
+    parser.add_argument('--num-h5-chunks', type=int, default=4)
+    parser.add_argument('--feat-cache-size', type=int, default=256)
     parser.add_argument('--cuda-devices', default='')
     parser.add_argument('--batch-size', type=int, required=True)
     parser.add_argument('--num-gpu-workers', type=int, default=1)

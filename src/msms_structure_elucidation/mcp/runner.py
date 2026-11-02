@@ -15,7 +15,7 @@ from pathlib import Path
 
 from msms_structure_elucidation.config import settings
 from msms_structure_elucidation.mcp import tasks
-from msms_structure_elucidation.mcp.jobs import JobStore, now, write_json
+from msms_structure_elucidation.mcp.jobs import JobStore, now, read_json, write_json
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,15 +32,38 @@ def main(argv: list[str] | None = None) -> int:
     store.set_status(job_id, 'running', host=socket.gethostname(), pid=os.getpid(), started=now(),
                      devices=devices, slurm_job_id=os.environ.get('SLURM_JOB_ID'))
     request = store.request(job_id)
+    config = read_json(job_dir / 'config.json') or settings(None)
+    if request.get('kind') == 'gpu' and config.get('mcp', {}).get('backend') == 'kubernetes' and not devices:
+        # Device plugins expose only the allocated GPUs. Do not set physical GPU
+        # indices in the Pod manifest; some clusters prohibit that env override.
+        devices = ','.join(str(index) for index in range(int(config['mcp']['kubernetes'].get('gpus', 1))))
+    from msms_structure_elucidation.mcp.pipeline import CONTEXT
+    if request.get('kind') == 'pipeline':
+        # CPU parents and every scientific subprocess inherit this stage boundary.
+        os.environ[CONTEXT] = str(job_dir)
+    else:
+        os.environ.pop(CONTEXT, None)
+    store.set_phase(job_id, 'gpu_prediction' if request.get('kind') == 'gpu' else 'cpu_preparation')
     with (job_dir / 'log.txt').open('a') as log:
         try:
-            result = tasks.run(request['task'], request['params'], job_dir, settings(None), devices, log)
+            if request.get('kind') == 'gpu':
+                from msms_structure_elucidation.mcp.metrics import GpuMonitor
+                with GpuMonitor(job_dir, devices, config.get('mcp', {}).get('gpu_monitor_interval_seconds', 1.)):
+                    result = tasks.run(request['task'], request['params'], job_dir, config, devices, log)
+            else:
+                result = tasks.run(request['task'], request['params'], job_dir, config, devices, log)
         except Exception as exc:  # any task failure is reported to the MCP client through status.json
             traceback.print_exc(file=log)
             store.set_status(job_id, 'failed', error=f'{type(exc).__name__}: {exc}'[-4000:], finished=now(), exit_code=1)
+            from msms_structure_elucidation.mcp.pipeline import cancel_children, dispatch_pending
+            cancel_children(store, job_id, config)
+            dispatch_pending(store, config)
             return 1
+    store.set_phase(job_id, 'complete')
     write_json(job_dir / 'result.json', result)
     store.set_status(job_id, 'done', finished=now(), exit_code=0)
+    from msms_structure_elucidation.mcp.pipeline import dispatch_pending
+    dispatch_pending(store, config)
     return 0
 
 

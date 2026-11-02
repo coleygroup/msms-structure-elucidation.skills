@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from pathlib import Path
 
 # Measured anchors (GPU memory GiB -> ICEBERG batch_size, 2 GPU workers, 16 CPU workers):
 # RTX 4070 Laptop 8 GB -> 16; RTX A5000 24 GB -> 128.
@@ -26,9 +27,13 @@ MAX_FEATURES = 8
 
 
 def cpu_threads() -> int:
-    if hasattr(os, 'sched_getaffinity'):
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count() or 1
+    count = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count() or 1
+    quota = Path('/sys/fs/cgroup/cpu.max')
+    if quota.is_file():
+        maximum, period = quota.read_text().split()
+        if maximum != 'max':
+            count = min(count, max(1, math.ceil(int(maximum) / int(period))))
+    return count
 
 
 def ram_gb() -> tuple[float | None, float | None]:
@@ -39,7 +44,13 @@ def ram_gb() -> tuple[float | None, float | None]:
             for line in handle:
                 key, _, value = line.partition(':')
                 info[key] = int(value.split()[0]) / 1024 ** 2
-        return round(info['MemTotal'], 1), round(info.get('MemAvailable', info['MemFree']), 1)
+        total, available = info['MemTotal'], info.get('MemAvailable', info['MemFree'])
+        limit, used = Path('/sys/fs/cgroup/memory.max'), Path('/sys/fs/cgroup/memory.current')
+        if limit.is_file() and used.is_file() and limit.read_text().strip() != 'max':
+            maximum = int(limit.read_text()) / 1024**3
+            total = min(total, maximum)
+            available = min(available, max(0., maximum - int(used.read_text()) / 1024**3))
+        return round(total, 1), round(available, 1)
     if sys.platform == 'darwin':
         total = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True)
         if total.returncode == 0:
@@ -66,8 +77,11 @@ def gpus() -> list[dict]:
 
 def probe() -> dict:
     total, available = ram_gb()
+    load = os.getloadavg()[0] if hasattr(os, 'getloadavg') else None
     return {'hostname': socket.gethostname(), 'platform': platform.platform(),
             'cpu_threads': cpu_threads(), 'ram_total_gb': total, 'ram_available_gb': available,
+            'cpu_load_1m': load,
+            'estimated_idle_cpu_threads': max(0., cpu_threads() - load) if load is not None else None,
             'gpus': gpus()}
 
 

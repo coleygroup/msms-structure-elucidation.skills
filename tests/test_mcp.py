@@ -206,17 +206,27 @@ class SlurmTest(unittest.TestCase):
                 state.write_text('RUNNING')
                 backend.cancel(second)
                 self.assertEqual((tmp / 'scancel.args').read_text().strip(), '4242')
-                self.assertEqual(store.status(second)['state'], 'cancelled')
+                self.assertTrue(store.status(second)['cancel_requested'])
+                state.write_text('CANCELLED')
+                self.assertEqual(backend.poll(second)['state'], 'cancelled')
 
-    def test_a_runner_result_wins_over_the_scheduler(self):
+    def test_runner_result_requires_scheduler_success_and_zero_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
-            env = fake_tools(Path(tmp), {'sacct': 'echo COMPLETED\n'})
+            env = fake_tools(Path(tmp), {'sacct': 'case "$*" in *ExitCode*) echo 0:0 ;; *) echo COMPLETED ;; esac\n'})
             store = JobStore(Path(tmp) / 'jobs')
             job_id, _ = store.create('predict_spectra', {})
             store.set_launch(job_id, backend='slurm', slurm_job_id='7')
             store.set_status(job_id, 'done')
+            (store.path(job_id) / 'result.json').write_text('{}')
             with patch.dict(os.environ, env):
+                result = backends.SlurmBackend(store, {}).poll(job_id)
+                self.assertEqual(result['state'], 'done')
+                self.assertTrue(result['scheduler_confirmed'])
+                frozen = (store.path(job_id) / 'status.json').read_bytes()
                 self.assertEqual(backends.SlurmBackend(store, {}).poll(job_id)['state'], 'done')
+                self.assertEqual((store.path(job_id) / 'status.json').read_bytes(), frozen)
+                with patch.object(backends.subprocess, 'run', side_effect=AssertionError('completed job was cancelled')):
+                    self.assertEqual(backends.SlurmBackend(store, {}).cancel(job_id)['state'], 'done')
 
     def test_partitions_are_summarised_from_sinfo(self):
         out = 'gpu*|gpu:a:4|2-00:00:00|64|512000|up|3\ngpu*|gpu:b:8(S:0-1)|2-00:00:00|128|1024000|up|2\ncpu|(null)|1:00:00|32|128000|up|10\n'

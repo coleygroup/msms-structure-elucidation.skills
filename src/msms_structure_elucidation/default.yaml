@@ -1,19 +1,19 @@
-# Packaged snapshot of configs/default.yaml for installations without a checkout.
+# Shared defaults. Paths are relative to this file; override with CLI or environment.
 models:
   simulator:
-    ms_pred_src: ''
-    python: ''
+    ms_pred_src: ''  # clone ms-pred, then set this checkout path
+    python: ''  # interpreter with ms_pred; empty: MS_PRED_PYTHON, then discovery
     model: iceberg
-    glacier_ckpt: ''
-    gen_ckpt: ''
-    inten_ckpt: ''
+    glacier_ckpt: ''  # Public MassSpecGym weights: see ms-pred README; licensed NIST weights can be supplied locally
+    gen_ckpt: ''      # ICEBERG generator, when --model iceberg
+    inten_ckpt: ''    # ICEBERG intensity, when --model iceberg
     collision_energies: [10, 20, 30, 40, 50]
     adduct: '[M+H]+'
-    instrument: null
+    instrument: null  # use >instrumentation in .ms or --instrument
     cuda_devices: null
-    batch_size: 1
-    num_cpu_workers: 1
-    num_gpu_workers: 1
+    batch_size: 1       # GPU anchors in msms-predict SKILL.md: 8 GB -> 16, 24 GB -> 128
+    num_cpu_workers: 1  # ms-pred featurization/preparation processes
+    num_gpu_workers: 2  # ICEBERG: start 2 per GPU, tune 2-4; total across cuda_devices
     shard_size: 256
     reuse_predictions: true
     prediction_cache: ''  # empty: shared user cache on the model host
@@ -30,38 +30,51 @@ models:
     top_k: 10
     atlas_url: https://iceberg-ms.mit.edu
   batch:
-    max_workers: auto
+    max_workers: auto   # batch worker processes; auto: up to 8 from CPU threads and RAM, setup saves a value
     max_model_jobs: 1
     min_free_memory_gb: 4
   denovo:
     frigid_src: .cache/FRIGID
-    frigid_python: ''
+    frigid_python: ''  # interpreter of the FRIGID environment
     dlm_ckpt: ''
     mist_ckpt: ''
     iceberg_gen_ckpt: ''
     iceberg_inten_ckpt: ''
     top_k: 10
-    num_rounds: 0
+    num_rounds: 0   # FRIGID-base; set >0 when ICEBERG weights and GPU are available
     batch_size: 128
     cuda_devices: null
-mcp:
-  backend: local
-  job_root: results/mcp_jobs
-  wait_seconds: 600
-  gpu_min_free_fraction: 0.8
-  max_concurrent_jobs: auto
-  slurm:
+mcp:  # prediction server; setup writes host-specific values to configs/local.yaml
+  backend: local          # local, slurm, kubernetes, or pool
+  job_root: results/mcp_jobs  # relative to the checkout
+  wait_seconds: 600       # tools wait this long for a result before returning a job id
+  gpu_monitor_interval_seconds: 1  # sampled allocated-task activity; 0 disables recording
+  gpu_min_free_fraction: 0.8  # a GPU is free when idle with this fraction of its memory free
+  gpu_devices: null        # optional list of physical GPU indices; null allows all detected GPUs
+  max_concurrent_jobs: auto  # GPU job limit; auto: one per GPU, or one on CPU-only hosts
+  max_cpu_jobs: 2          # independent local CPU preparation/scoring slots
+  min_free_memory_gb: 2    # RAM admission floor for new local CPU jobs, when measurable
+  max_prepared_jobs: auto  # pause new CPU preparations at two waiting parents per GPU (at least two)
+  prediction_group_size: auto  # measured rate × target duration; fallback 4096 candidates; GPU batch is separate
+  target_prediction_seconds: 600  # scheduling hint, not a minimum runtime or latency
+  max_group_candidates: 32768  # upper bound for a prepared work group
+  prepared_groups: auto    # two groups per endpoint slot, capped at eight per orchestrator
+  coordinator_backend: local  # pool CPU orchestrators: local or slurm
+  poll_seconds: 15         # endpoint inventory refresh interval
+  servers: {}             # named private endpoints; see docs/prediction-servers.md
+  kubernetes: {}          # explicit context, namespace, pinned runtime image and shared storage
+  slurm:  # every unset key is left out of sbatch
     partition: null
     account: null
     qos: null
-    gpus: null
+    gpus: null            # --gpus value, for example 1 or <type>:1
     cpus_per_task: null
     mem: null
     time: null
     requeue: false
-    extra_args: []
-    setup: []
-    cpu:
+    extra_args: []        # further sbatch arguments
+    setup: []             # shell lines run before the job, such as environment activation
+    cpu:                  # resources for CPU preparation/scoring orchestrators and CPU-only tasks
       cpus_per_task: null
       mem: null
 preprocessing:
