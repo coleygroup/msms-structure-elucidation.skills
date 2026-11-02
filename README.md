@@ -29,10 +29,14 @@ Answer the setup questions, including where analyses should run and which availa
 Once setup is complete, start a new chat/session in the same project so the installed skills and tools are available. Copy and paste:
 
 ```text
-Reproduce the public clinical demo using csf_unknown.ms, plasma_unknown_198.ms, and plasma_unknown_583.ms from ms-pred's data/exp_specs/clinical directory. The provider confirmed 10, 20, 30, 40, and 50 NCE for all three. Use BUDDY’s top three formula hypotheses, search the public ICEBERG 2.1 PubChem atlas first, review the evidence for every result, and show me one interactive report with all three unknowns.
+Use msms-structure-elucidation-skills to reproduce the public clinical demo using csf_unknown.ms, plasma_unknown_198.ms, and plasma_unknown_583.ms from ms-pred's data/exp_specs/clinical directory. The provider confirmed 10, 20, 30, 40, and 50 NCE for all three. Use BUDDY’s top three formula hypotheses, search the public ICEBERG 2.1 PubChem atlas first, review the evidence for every result, and show me one interactive report with all three unknowns.
 ```
 
 These example files are supplied with [ms-pred](https://github.com/coleygroup/ms-pred/tree/main/data/exp_specs/clinical), so you do not need to prepare or upload your own data. Open the report link the agent provides and compare it with the [public demo](https://coley.mit.edu/msms-structure-elucidation.skills/demo/msms-structure-elucidation/). The [demo guide](demo/README.md) records the input spectra, energy settings and saved results.
+
+For your own data, ask:
+
+> Use msms-structure-elucidation-skills to elucidate the spectra in sample.mgf and show me one interactive report.
 
 ## Explore your results
 

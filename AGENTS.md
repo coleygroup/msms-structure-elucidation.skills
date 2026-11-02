@@ -2,6 +2,8 @@
 
 This repository contains MS/MS structure elucidation skills and a Python CLI, `msms-structure-elucidation`. The skills are in `.agents/skills`, and `.claude/skills` links to the same folders.
 
+- **Elucidation entrypoint:** use [msms-structure-elucidation-skills](.agents/skills/msms-structure-elucidation-skills/SKILL.md) for end-to-end requests. It coordinates the specialized skills through the scientific workflow; route narrowly scoped requests directly to the relevant skill.
+
 - **Install or set up:** when asked to install these skills, or when `configs/local.yaml` is missing, follow the `msms-setup` skill. It checks the environment, asks whether models run on this machine or a remote host, probes that host, and saves the tuned ms-pred inference settings to `configs/local.yaml`. Do not commit that file.
 - **Remote execution:** if `configs/local.yaml` has `execution.mode: remote`, run model-backed commands on that host as described in `msms-setup`. For multiple model hosts or Kubernetes, follow [prediction server pools](docs/prediction-servers.md). Keep endpoint identities, paths, contexts, namespaces and tuning in ignored local configuration. Collect final results to the user's computer before claiming local delivery.
 - **Model tools:** when the `msms-structure-elucidation` MCP server is connected, call `server_info` first, then use its tools for predictions instead of running the model scripts directly.
