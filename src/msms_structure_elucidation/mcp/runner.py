@@ -46,6 +46,11 @@ def main(argv: list[str] | None = None) -> int:
     store.set_phase(job_id, 'gpu_prediction' if request.get('kind') == 'gpu' else 'cpu_preparation')
     with (job_dir / 'log.txt').open('a') as log:
         try:
+            environment = config.get('mcp', {}).get('worker_environment', {})
+            if any(key in environment for key in ('CUDA_VISIBLE_DEVICES', 'MSMS_PIPELINE_JOB')):
+                raise ValueError('worker_environment must not override scheduler GPU or pipeline ownership')
+            os.environ.update({str(key): str(value) for key, value in environment.items()})
+            os.environ.setdefault('MSMS_PUBCHEM_RATE_FILE', str(store.root / 'pubchem-rate.json'))
             if request.get('kind') == 'gpu':
                 from msms_structure_elucidation.mcp.metrics import GpuMonitor
                 with GpuMonitor(job_dir, devices, config.get('mcp', {}).get('gpu_monitor_interval_seconds', 1.)):
@@ -55,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # any task failure is reported to the MCP client through status.json
             traceback.print_exc(file=log)
             store.set_status(job_id, 'failed', error=f'{type(exc).__name__}: {exc}'[-4000:], finished=now(), exit_code=1)
+            from msms_structure_elucidation.mcp.admission import Admission
+            Admission(store, config).record(job_id, 'failed', str(exc) + '\n' + store.log_tail(job_id, 16000))
             from msms_structure_elucidation.mcp.pipeline import cancel_children, dispatch_pending
             cancel_children(store, job_id, config)
             dispatch_pending(store, config)
@@ -62,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     store.set_phase(job_id, 'complete')
     write_json(job_dir / 'result.json', result)
     store.set_status(job_id, 'done', finished=now(), exit_code=0)
+    from msms_structure_elucidation.mcp.admission import Admission
+    Admission(store, config).record(job_id, 'done')
     from msms_structure_elucidation.mcp.pipeline import dispatch_pending
     dispatch_pending(store, config)
     return 0

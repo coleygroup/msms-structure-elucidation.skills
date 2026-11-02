@@ -181,8 +181,9 @@ def resume_cpu(store: JobStore, parent: str, config: dict, backend=None) -> None
         while store.status(parent).get('phase') == 'waiting_cpu':
             if store.status(parent)['state'] not in ACTIVE:
                 raise RuntimeError('Parent analysis ended while waiting for CPU resources')
-            backend.pump()
-            time.sleep(.1)
+            if not getattr(scheduler, 'managed', False) and getattr(backend, 'dispatcher', True):
+                backend.pump()
+            time.sleep(.25)
 
 
 def cache_wait_callbacks() -> tuple:
@@ -229,5 +230,5 @@ def cancel_children(store: JobStore, job_id: str, config: dict) -> None:
 def dispatch_pending(store: JobStore, config: dict) -> None:
     """Continue detached local queues after a runner finishes, even without a connected client."""
     name = config.get('mcp', {}).get('backend', 'local')
-    if name in ('local', 'pool'):
+    if name in ('local', 'pool') and not config.get('mcp', {}).get('scheduler_process', False):
         make_backend(name, store, config, config.get('_mcp_python')).pump()

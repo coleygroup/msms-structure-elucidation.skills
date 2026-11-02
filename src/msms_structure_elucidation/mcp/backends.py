@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 
 from msms_structure_elucidation import hostprobe
-from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, now
+from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, now, read_json, write_json, timestamp
 from msms_structure_elucidation.prediction_cache import file_lock
 
 RUNNER = 'msms_structure_elucidation.mcp.runner'
@@ -54,13 +54,24 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def pipeline_limit(settings: dict, prepared_default: int = 2) -> int:
+    """Bound all resident CPU parents, including every resource-wait phase."""
+    prepared = settings.get('max_prepared_jobs', 'auto')
+    prepared = prepared_default if prepared in ('auto', None) else int(prepared)
+    limit = settings.get('max_live_pipelines', 'auto')
+    limit = int(settings.get('max_cpu_jobs', 2)) + prepared if limit in ('auto', None) else int(limit)
+    if limit < 1:
+        raise ValueError('max_live_pipelines must be positive or auto')
+    return limit
+
+
 class LocalBackend:
     """Run jobs as detached processes on this host, one GPU per GPU job."""
     name = 'local'
 
     def __init__(self, store: JobStore, config: dict, python: str | None = None):
         settings = config.get('mcp', {})
-        self.store, self.python = store, python
+        self.store, self.python, self.config = store, python, config
         self.min_free_fraction = float(settings.get('gpu_min_free_fraction', 0.8))
         devices = settings.get('gpu_devices')
         self.devices = None if devices is None else {int(i) for i in devices}
@@ -76,7 +87,12 @@ class LocalBackend:
         prepared = settings.get('max_prepared_jobs', 'auto')
         self.max_prepared_jobs = max(2, 2 * self.gpu_count) if prepared in (None, 'auto') else int(prepared)
         self.min_free_memory_gb = float(settings.get('min_free_memory_gb', 2.))
-        if min(self.max_jobs, self.max_cpu_jobs, self.max_prepared_jobs) < 1:
+        self.max_live_pipelines = pipeline_limit(settings, self.max_prepared_jobs)
+        self.managed = bool(settings.get('scheduler_process', False))
+        self.queue_snapshot = []
+        from msms_structure_elucidation.mcp.admission import Admission
+        self.admission = Admission(store, config)
+        if min(self.max_jobs, self.max_cpu_jobs, self.max_prepared_jobs, self.max_live_pipelines) < 1:
             raise ValueError('MCP concurrency and preparation limits must be positive')
         if not math.isfinite(self.min_free_memory_gb) or self.min_free_memory_gb < 0:
             raise ValueError('MCP free-RAM floor must be finite and non-negative')
@@ -89,9 +105,15 @@ class LocalBackend:
     def submit(self, job_id: str) -> None:
         self.pump()
 
+    @property
+    def dispatcher(self) -> bool:
+        """Only the recorded driver schedules; scientific subprocesses remain passive."""
+        owner = self.config.get('_mcp_cpu_dispatcher') or self.config.get('_mcp_dispatcher')
+        return not owner or owner == {'host': self.host, 'pid': os.getpid()}
+
     def _running(self) -> list[dict]:
         rows = []
-        for job in self.store.list(limit=10_000):
+        for job in self.store.active():
             if job['state'] in ('submitted', 'running'):
                 launch = self.store.launch(job['job_id'])
                 if launch.get('backend') == self.name and launch.get('host') == self.host:
@@ -100,27 +122,47 @@ class LocalBackend:
         return rows
 
     def pump(self) -> None:
-        """Launch queued jobs, oldest first, while GPUs and job slots are free."""
+        """Schedule from one live snapshot; waiters never scan or lock the queue."""
+        owner = self.config.get('_mcp_cpu_dispatcher')
+        if self.managed and owner != {'host': self.host, 'pid': os.getpid()}:
+            if not os.environ.get('MSMS_PIPELINE_JOB'):
+                if not any(row['task'] not in self.exclude_tasks for row in self.store.active()):
+                    return
+                from msms_structure_elucidation.mcp.scheduling import ensure
+                ensure(self.store, self.config, self.python, self.exclude_tasks)
+            return
+        if not self.dispatcher:
+            return
         with self.lock, file_lock(self.store.root / 'scheduler.lock'):
-            for row in self._running():
+            snapshot = self.store.active()
+            self.queue_snapshot = snapshot
+            running = []
+            for row in snapshot:
+                if row['state'] not in ('running', 'submitted'):
+                    continue
+                launch = self.store.launch(row['job_id'])
+                if launch.get('backend') != self.name or launch.get('host') != self.host:
+                    continue
                 self._reconcile(row['job_id'])
+                status = self.store.status(row['job_id'])
+                if status['state'] in ('running', 'submitted'):
+                    running.append({**row, **launch, **status})
             for job_id in list(self.processes):
                 if self.processes[job_id].poll() is not None:
                     del self.processes[job_id]
             # Resume scoring before starting new preparation. Sleeping orchestrators do
             # not consume CPU slots, and CPU work never consumes the GPU concurrency limit.
-            running = self._running()
             cpu = sum(row['kind'] != 'gpu' and row.get('phase') not in ('waiting_gpu', 'waiting_cpu', 'waiting_cache')
                       for row in running)
-            for row in running:
+            for row in sorted(running, key=lambda r: (r.get('cpu_ready_at', r.get('phase_started', 0)), r['job_id'])):
                 if row.get('phase') == 'waiting_cpu' and cpu < self.max_cpu_jobs:
                     self.store.set_phase(row['job_id'], 'cpu_scoring')
+                    row['phase'] = 'cpu_scoring'
                     cpu += 1
-            queued = [job for job in self.store.list(limit=10_000) if job['state'] == 'queued']
-            for job in sorted(queued, key=lambda job: job.get('updated', '')):
+            queued = [job for job in snapshot if job['state'] == 'queued']
+            for job in sorted(queued, key=lambda job: (timestamp(job.get('created')), job['job_id'])):
                 if job['task'] in self.exclude_tasks:
                     continue
-                running = self._running()
                 request = self.store.request(job['job_id'])
                 kind = request.get('kind', 'gpu')
                 parent = request['params'].get('_parent_job')
@@ -131,6 +173,8 @@ class LocalBackend:
                     if sum(row['kind'] == 'gpu' for row in running) >= self.max_jobs:
                         continue
                 else:
+                    if sum(row['kind'] != 'gpu' for row in running) >= self.max_live_pipelines:
+                        continue
                     cpu = sum(row['kind'] != 'gpu' and row.get('phase') not in ('waiting_gpu', 'waiting_cpu', 'waiting_cache')
                               for row in running)
                     prepared = sum(row.get('phase') == 'waiting_gpu' for row in running)
@@ -145,19 +189,30 @@ class LocalBackend:
                     gpus = [i for i in gpus if i in self.devices]
                 if kind == 'gpu' and self.gpu_count and not gpus:
                     continue  # wait for a GPU; CPU-capable jobs behind it may still start
+                if not self.admission.admit(job['job_id']):
+                    continue
                 self._launch(job['job_id'], str(gpus[0]) if gpus else '')
+                running.append({**job, **self.store.launch(job['job_id']), **self.store.status(job['job_id']), 'kind': kind})
 
     def _launch(self, job_id: str, devices: str) -> None:
         job_dir = self.store.path(job_id)
+        snapshot = read_json(job_dir / 'config.json') or dict(self.config)
+        owner = {'host': self.host, 'pid': os.getpid()}
+        snapshot['_mcp_cpu_dispatcher'] = owner
+        if snapshot.get('mcp', {}).get('backend', 'local') == 'local':
+            snapshot['_mcp_dispatcher'] = owner
+        write_json(job_dir / 'config.json', snapshot)
         env = {**os.environ, 'CUDA_VISIBLE_DEVICES': devices}
         with (job_dir / 'runner.log').open('a') as log:
             process = subprocess.Popen(runner_command(job_dir, self.python), cwd=REPO, env=env,
                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         self.processes[job_id] = process
         self.store.set_launch(job_id, backend=self.name, host=self.host, pid=process.pid, devices=devices)
-        self.store.set_status(job_id, 'submitted', devices=devices or None, submitted=now())
+        self.store.set_status(job_id, 'submitted', devices=devices or None, submitted=now(), admission_hold=None)
 
     def poll(self, job_id: str) -> dict:
+        if self.managed or not self.dispatcher:
+            return self.store.status(job_id)
         status = self._reconcile(job_id)
         if status['state'] == 'queued':
             self.pump()
@@ -175,6 +230,7 @@ class LocalBackend:
             if ended and status['state'] in ('submitted', 'running'):
                 status = self.store.set_status(job_id, 'failed', finished=now(),
                     error='runner exited without a result; see runner.log and log.txt')
+                self.admission.record(job_id, 'failed', self.store.log_tail(job_id))
                 for child in self.store.children(job_id):
                     if self.store.status(child)['state'] in ACTIVE:
                         self.child_cancel(child)
@@ -199,6 +255,8 @@ class LocalBackend:
         return {'backend': self.name, 'host': self.host, 'max_concurrent_jobs': self.max_jobs,
                 'cpu': hostprobe.probe(),
                 'max_cpu_jobs': self.max_cpu_jobs, 'max_prepared_jobs': self.max_prepared_jobs,
+                'max_live_pipelines': self.max_live_pipelines, 'admission': self.admission.summary(),
+                'scheduler': read_json(self.store.root / 'scheduler-service.json'),
                 'min_free_memory_gb': self.min_free_memory_gb,
                 'gpu_devices': sorted(self.devices) if self.devices is not None else None,
                 'gpu_min_free_fraction': self.min_free_fraction, 'gpus': hostprobe.gpus(),
@@ -217,10 +275,10 @@ def sbatch_script(slurm: dict, kind: str, command: list[str]) -> tuple[list[str]
                       ('time', '--time'), ('gpus', '--gpus'), ('cpus_per_task', '--cpus-per-task'), ('mem', '--mem')):
         if resources.get(key) not in (None, ''):
             options.append(f'{flag}={resources[key]}')
-    if slurm.get('requeue'):
+    if resources.get('requeue'):
         options.append('--requeue')
-    options += [str(arg) for arg in slurm.get('extra_args') or []]
-    lines = ['#!/bin/bash', *[str(line) for line in slurm.get('setup') or []],
+    options += [str(arg) for arg in resources.get('extra_args') or []]
+    lines = ['#!/bin/bash', *[str(line) for line in resources.get('setup') or []],
              'exec ' + ' '.join(shlex.quote(part) for part in command)]
     return options, '\n'.join(lines) + '\n'
 
@@ -245,17 +303,58 @@ SLURM_FAILED = {'FAILED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'BOOT_FAIL', 
 
 
 class SlurmBackend:
-    """Submit each job with sbatch; the runner's status.json is authoritative once it exists."""
+    """Submit bounded CPU parents and GPU stages; require runner and Slurm completion."""
     name = 'slurm'
 
     def __init__(self, store: JobStore, config: dict, python: str | None = None):
         self.store, self.python = store, python
+        self.config = config
         self.slurm = config.get('mcp', {}).get('slurm') or {}
         self.child_cancel = self.cancel
+        self.exclude_tasks: set[str] = set()
+        self._last_poll = 0.
+        self.lock = threading.Lock()
+        from msms_structure_elucidation.mcp.admission import Admission
+        self.admission = Admission(store, config)
+        self.max_live_pipelines = pipeline_limit(config.get('mcp', {}))
+
+    @property
+    def dispatcher(self) -> bool:
+        owner = self.config.get('_mcp_dispatcher')
+        return not owner or owner == {'host': socket.gethostname(), 'pid': os.getpid()}
+
+    def pump(self) -> None:
+        """Bound CPU allocations and canary admission before submitting queued work."""
+        if not self.dispatcher:
+            return
+        import time
+        rows = self.store.active()
+        if time.monotonic() - self._last_poll >= float(self.config.get('mcp', {}).get('poll_seconds', 15)):
+            self._last_poll = time.monotonic()
+            for row in rows:
+                if self.store.launch(row['job_id']).get('backend') == self.name:
+                    self.poll(row['job_id'])
+        for row in sorted(rows, key=lambda r: (timestamp(r.get('created')), r['job_id'])):
+            if row['state'] == 'queued' and row['task'] not in self.exclude_tasks:
+                self.submit(row['job_id'])
 
     def submit(self, job_id: str) -> None:
+        if not self.dispatcher:
+            return
+        with self.lock, file_lock(self.store.path(job_id) / 'submission.lock'):
+            self._submit(job_id)
+
+    def _submit(self, job_id: str) -> None:
+        """Serialize submission of one durable request across reconnecting clients."""
+        if not self.dispatcher or self.store.launch(job_id):
+            return
         job_dir = self.store.path(job_id)
         request = self.store.request(job_id)
+        if request.get('kind') != 'gpu':
+            allocated = sum(r.get('kind') != 'gpu' and r['state'] in ('submitted', 'running', 'done')
+                            for r in self.store.active())
+            if allocated >= self.max_live_pipelines or not self.admission.admit(job_id):
+                return
         options, script = sbatch_script(self.slurm, request.get('kind', 'gpu'), runner_command(job_dir, self.python))
         (job_dir / 'job.sh').write_text(script)
         command = ['sbatch', '--parsable', f'--job-name=msms-{request["task"]}', f'--output={job_dir}/slurm-%j.log',
@@ -266,10 +365,12 @@ class SlurmBackend:
             raise RuntimeError(f'sbatch failed: {done.stderr.strip()[-2000:]}')
         job = parse_job_id(done.stdout)
         self.store.set_launch(job_id, backend=self.name, slurm_job_id=job, sbatch=command)
-        self.store.set_status(job_id, 'submitted', slurm_job_id=job, submitted=now())
+        self.store.set_status(job_id, 'submitted', slurm_job_id=job, submitted=now(), admission_hold=None)
 
     def poll(self, job_id: str) -> dict:
         status = self.store.status(job_id)
+        if not self.dispatcher:
+            return {**status, 'state': 'running'} if status['state'] == 'done' and not status.get('scheduler_confirmed') else status
         job = self.store.launch(job_id).get('slurm_job_id')
         if status['state'] == 'done' and status.get('scheduler_confirmed'):
             return status
@@ -287,8 +388,10 @@ class SlurmBackend:
                                      capture_output=True, text=True)
                 codes = [line.strip() for line in run.stdout.splitlines() if line.strip()] if not run.returncode else []
                 if codes and codes[-1] == '0:0' and self.store.result(job_id) is not None:
-                    return self.store.set_status(job_id, 'done', scheduler_state=state,
-                                                 scheduler_confirmed=True, scheduler_exit_code='0:0')
+                    status = self.store.set_status(job_id, 'done', scheduler_state=state,
+                                                  scheduler_confirmed=True, scheduler_exit_code='0:0')
+                    self.admission.record(job_id, 'done')
+                    return status
                 if codes and ':' in codes[-1] and codes[-1] != '0:0':
                     return self.store.set_status(job_id, 'failed', scheduler_state=state,
                         error=f'Slurm exit code {codes[-1]} after runner result', finished=now())
@@ -333,6 +436,7 @@ class SlurmBackend:
 
     def describe(self) -> dict:
         return {'backend': self.name, 'host': socket.gethostname(),
+                'admission': self.admission.summary(),
                 'slurm': {k: v for k, v in self.slurm.items() if v not in (None, '', [], {})},
                 'inventory': self.inventory()}
 

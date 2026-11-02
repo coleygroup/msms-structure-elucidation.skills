@@ -65,6 +65,8 @@ For an analysis without a supplied formula, follow [formula search](../../../doc
 
    Before a large run, use a bounded allocation to verify that the selected CPU and GPU nodes can read the checkout/checkpoints and read, write and rename files in the configured job root. A responsive login-node path does not establish compute-node accessibility. Prefer a verified shared path and node-local scratch for native intermediate writes. Confirm scheduler completion and exit code zero, rather than treating an allocated node or runner result as sufficient.
 
+   Follow the production-route canary and admission checks in [MCP execution](../../../docs/mcp-execution.md). Validate the actual PubChem route, CPU trust store, fresh inference when required, collection and cache reuse before bulk admission. Keep TLS verification enabled. Check concurrent handoffs on shared storage. Use one supported dispatcher and current configuration per job root, and keep operational history separate from current agent instructions. Stop old dispatchers before upgrading; preserve scientific requests, caches, checkpoints and partial results.
+
    ```bash
    msms-structure-elucidation setup --remote <login-destination> --remote-repo <remote-repo> \
      --remote-python .cache/mcp-venv/bin/python --scheduler slurm

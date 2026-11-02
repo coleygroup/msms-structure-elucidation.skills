@@ -5,6 +5,8 @@ import argparse
 import sys
 import threading
 import time
+import logging
+import subprocess
 
 PUMP_SECONDS = 1
 
@@ -13,7 +15,11 @@ def _pump_forever(backend) -> None:
     """Start queued local jobs as GPUs free up, even while no client is polling."""
     while True:
         time.sleep(PUMP_SECONDS)
-        backend.pump()
+        try:
+            backend.pump()
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            logging.exception('MCP scheduler tick failed; admissions have not been confirmed')
+            time.sleep(4)
 
 
 def main(argv: list[str] | None = None) -> int:

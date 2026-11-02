@@ -118,6 +118,7 @@ def handle(operation: str, data: dict):
     store = JobStore(Path(endpoint['job_root']))
     config = {'mcp': {**endpoint.get('mcp', {}), 'backend': endpoint.get('backend', 'local')},
               '_mcp_python': endpoint.get('python') or sys.executable}
+    config['mcp'].setdefault('scheduler_process', True)
     backend = make_backend(config['mcp']['backend'], store, config, config['_mcp_python'])
     if operation == 'probe':
         from msms_structure_elucidation import hostprobe

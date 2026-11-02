@@ -19,6 +19,8 @@ Each monitoring pass should:
 
 Repair recoverable failures within the authorized scope and resume only the affected work, preserving completed results, confirmed weights and scientific settings. Explain issues that need the user's input; do not silently skip failed features or overwrite their evidence.
 
+Check `scheduler-service.json` and admission holds alongside job phases. Long CPU-ready queues with idle GPUs indicate a scheduling/preparation bottleneck. Repair an environment hold, then use `resume_admission` with its scope and validation reason before retrying affected requests. Keep one current coordinator and configuration; use supported backend recovery controls instead of adding another dispatcher or ledger. Continue reviewing completed features while an endpoint is unavailable.
+
 ## Start evidence review before the batch finishes
 
 Apply the workflow's agent review as soon as a stable per-feature result is available. Do not wait for every feature, the final batch summary or the consolidated report. Alternate monitoring with review so neither activity prevents progress on the other.

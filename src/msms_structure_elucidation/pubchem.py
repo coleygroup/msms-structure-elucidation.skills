@@ -8,6 +8,9 @@ import json
 import math
 import re
 import time
+import os
+import ssl
+from pathlib import Path
 from datetime import datetime, timezone
 import urllib.error
 import urllib.parse
@@ -25,19 +28,38 @@ def _get(path: str, data: dict | None = None, retries: int = 3) -> dict:
     body = urllib.parse.urlencode(data).encode() if data else None
     for attempt in range(retries):
         try:
+            _rate_limit()
             with urllib.request.urlopen(urllib.request.Request(f'{PUBCHEM}/{path}', data=body), timeout=120) as r:
-                time.sleep(0.25)  # PubChem asks for at most 5 requests per second
                 return json.load(r)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return {}
             if attempt == retries - 1:
                 raise
-        except urllib.error.URLError:
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, ssl.SSLCertVerificationError) or 'CERTIFICATE_VERIFY_FAILED' in str(exc):
+                raise  # trust-store failures cannot be repaired by retrying the same request
             if attempt == retries - 1:
                 raise
         time.sleep(2 * (attempt + 1))
     return {}
+
+
+def _rate_limit() -> None:
+    """Share the PubChem request budget across this coordinator's CPU processes."""
+    from msms_structure_elucidation.prediction_cache import file_lock
+    from msms_structure_elucidation.mcp.jobs import read_json, write_json
+    configured = os.environ.get('MSMS_PUBCHEM_RATE_FILE')
+    if not configured:
+        time.sleep(.25)
+        return
+    path = Path(configured)
+    with file_lock(path.with_suffix('.lock')):
+        previous = read_json(path, {}).get('next_request', 0.)
+        delay = max(0., min(.25, previous - time.time()))
+        if delay:
+            time.sleep(delay)
+        write_json(path, {'next_request': time.time() + .25})
 
 
 def _elements(formula: str) -> set[str]:

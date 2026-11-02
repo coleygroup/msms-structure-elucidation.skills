@@ -53,6 +53,11 @@ mcp:  # prediction server; setup writes host-specific values to configs/local.ya
   gpu_devices: null        # optional list of physical GPU indices; null allows all detected GPUs
   max_concurrent_jobs: auto  # GPU job limit; auto: one per GPU, or one on CPU-only hosts
   max_cpu_jobs: 2          # independent local CPU preparation/scoring slots
+  scheduler_process: true # one detached local scheduler; workers only publish state
+  max_live_pipelines: auto # cap running/waiting CPU processes; auto: CPU slots + prepared limit
+  route_canary: true      # one successful PubChem route request before expanding a new environment
+  environment_failure_limit: 3 # hold new pipeline admissions for repeated environment errors
+  worker_environment: {}  # e.g. verified SSL_CERT_FILE; GPU visibility belongs to the scheduler
   min_free_memory_gb: 2    # RAM admission floor for new local CPU jobs, when measurable
   max_prepared_jobs: auto  # pause new CPU preparations at two waiting parents per GPU (at least two)
   prediction_group_size: auto  # measured rate × target duration; fallback 4096 candidates; GPU batch is separate

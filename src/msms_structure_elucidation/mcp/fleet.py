@@ -97,7 +97,7 @@ class Endpoint:
 
     def _scheduler(self, operation: str, payload: dict, result: dict) -> dict:
         """Keep Kubernetes credentials on the coordinator; gateway pods need no API permissions."""
-        from msms_structure_elucidation.mcp.kubernetes import kubectl
+        from msms_structure_elucidation.mcp.kubernetes import kubectl, inventory_summary
         settings = self.settings['mcp']['kubernetes']
         def run(*args, **kwargs):
             response = kubectl(settings, *args, **kwargs)
@@ -137,7 +137,8 @@ class Endpoint:
             result['inventory'] = {}
             for name, resource in [('quota', 'resourcequota'), ('nodes', 'nodes'), ('pods', 'pods')]:
                 response = kubectl(settings, 'get', resource, '-o', 'json')
-                result['inventory'][name] = json.loads(response.stdout) if not response.returncode else {
+                result['inventory'][name] = inventory_summary(resource, json.loads(response.stdout), settings.get(
+                    'gpu_resource', 'nvidia.com/gpu')) if not response.returncode else {
                     'error': response.stderr[-1000:]}
         return result
 
@@ -206,7 +207,7 @@ class FleetBackend:
         if coordinator not in ('local', 'slurm'):
             raise ValueError('Pool coordinator_backend must be local or slurm')
         self.cpu = make_backend(coordinator, store, config, python)
-        if isinstance(self.cpu, LocalBackend):
+        if hasattr(self.cpu, 'exclude_tasks'):
             self.cpu.exclude_tasks = {'model_inference'}
         self.cpu.child_cancel = self.cancel
         self.endpoints = {name: Endpoint(name, endpoint) for name, endpoint in (settings.get('servers') or {}).items()
@@ -262,7 +263,9 @@ class FleetBackend:
         if hasattr(self.cpu, 'pump'):
             self.cpu.pump()
         with file_lock(self.store.root / 'fleet.lock'):
-            jobs = [row for row in self.store.list(100000) if row['task'] == 'model_inference']
+            jobs = [row for row in self.store.active() if row['task'] == 'model_inference']
+            for marker in (self.store.root / 'cleanup-pending').glob('*'):
+                jobs.append({'job_id': marker.name, 'task': 'model_inference', **self.store.status(marker.name)})
             for row in jobs:
                 if row['state'] == 'done' and self.store.status(row['job_id']).get('remote_cleanup_pending'):
                     job_id = row['job_id']
@@ -273,6 +276,7 @@ class FleetBackend:
                                 'remote_job_id': receipt['remote_job_id'],
                                 'acknowledged_inventory': receipt['inventory']})
                             self.store.set_status(job_id, 'done', remote_cleanup_pending=False, remote_cleanup_error=None)
+                            (self.store.root / 'cleanup-pending' / job_id).unlink(missing_ok=True)
                         except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                             self.store.set_status(job_id, 'done', remote_cleanup_error=str(exc)[-2000:])
             # Reconcile assignments first. A transport failure leaves ownership intact;
@@ -290,7 +294,7 @@ class FleetBackend:
                     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                         self.store.set_status(row['job_id'], self.store.status(row['job_id'])['state'],
                                               transport_error=str(exc)[-2000:])
-            active = [row for row in self.store.list(100000) if row['task'] == 'model_inference' and row['state'] in ACTIVE]
+            active = [row for row in jobs if self.store.status(row['job_id'])['state'] in ACTIVE]
             for row in reversed(jobs):
                 job_id = row['job_id']
                 if self.store.status(job_id)['state'] != 'queued' or self.store.launch(job_id).get('server'):
@@ -373,6 +377,10 @@ class FleetBackend:
             # Save acknowledgement locally before cleanup; a cleanup failure never loses results.
             write_json(self.store.path(job_id) / 'collection-receipt.json',
                        {'server': endpoint.name, 'remote_job_id': launch['remote_job_id'], 'inventory': receipt['inventory']})
+            if endpoint.settings.get('cleanup', True):
+                pending = self.store.root / 'cleanup-pending'
+                pending.mkdir(exist_ok=True)
+                (pending / job_id).touch()
             self.store.set_status(job_id, 'done', server=endpoint.name, finished=now(),
                                   remote_cleanup_pending=endpoint.settings.get('cleanup', True), transport_error=None)
             cleanup_error = None
@@ -382,6 +390,8 @@ class FleetBackend:
                                              'acknowledged_inventory': receipt['inventory']})
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                     cleanup_error = str(exc)[-2000:]
+            if not cleanup_error:
+                (self.store.root / 'cleanup-pending' / job_id).unlink(missing_ok=True)
             return self.store.set_status(job_id, 'done', server=endpoint.name, finished=now(),
                                          remote_cleanup_error=cleanup_error,
                                          remote_cleanup_pending=bool(cleanup_error), transport_error=None)

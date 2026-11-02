@@ -18,6 +18,16 @@ def produce(molecules, energies):
 
 
 class SharedPredictionTests(unittest.TestCase):
+    def test_complete_cache_hit_needs_no_writer_lease_or_prediction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first, _ = cache.predictions(root, {'weights': 'same'}, ['CCO', 'COC'], [20, 40], produce)
+            with patch.object(cache, 'candidate_guard', side_effect=AssertionError('warm hit took writer lease')):
+                second, receipt = cache.predictions(root, {'weights': 'same'}, ['CCO', 'COC'], [20, 40],
+                    lambda *a: self.fail('warm hit predicted again'))
+            self.assertEqual(first, second)
+            self.assertEqual(receipt['reused_spectra'], 4)
+            self.assertEqual(receipt['predicted_spectra'], 0)
     def test_large_candidate_batch_uses_bounded_file_descriptors(self):
         handles = Path('/proc/self/fd')
         if not handles.is_dir():

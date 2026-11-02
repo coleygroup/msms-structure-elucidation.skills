@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import time
 import uuid
+import math
 from pathlib import Path
 
 from msms_structure_elucidation.prediction_cache import file_lock
@@ -25,6 +26,18 @@ _JOB_ID = re.compile(r'^[a-z_]+-[0-9a-f]{16}$')
 
 def now() -> str:
     return datetime.datetime.now().isoformat(timespec='seconds')
+
+
+def timestamp(value) -> float:
+    """Compare legacy epoch and ISO timestamps without mixing types."""
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else 0.
+    if not value:
+        return 0.
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return 0.
 
 
 def write_json(path: Path, data) -> None:
@@ -78,7 +91,56 @@ class JobStore:
             # Publish the request last: schedulers discover jobs through request.json.
             write_json(path / 'request.json', {'task': task, 'kind': kind, 'params': params,
                                              'created': now(), 'attempt': uuid.uuid4().hex})
+            self._index(job_id, initial_state)
+            self._index_parent(job_id, params.get('_parent_job'))
         return job_id, False
+
+    def _index(self, job_id: str, state: str, pending: bool = False) -> None:
+        """Maintain a compact live-job directory; closed history is not a scheduling queue."""
+        folder = self.root / 'active'
+        folder.mkdir(exist_ok=True)
+        marker = folder / job_id
+        if state in ACTIVE or pending:
+            if not marker.exists():
+                marker.touch(exist_ok=True)
+        else:
+            marker.unlink(missing_ok=True)
+
+    def active(self) -> list[dict]:
+        """Read live jobs only, importing an older store once on first use."""
+        ready = self.root / 'active-index-ready.json'
+        if not ready.exists():
+            with file_lock(self.root / 'active-index.lock'):
+                if not ready.exists():
+                    for row in self.list(10**9):
+                        if row['state'] in ACTIVE or self.scheduler_pending(row['job_id']):
+                            self._index(row['job_id'], row['state'], pending=True)
+                        request = self.request(row['job_id'])
+                        self._index_parent(row['job_id'], request['params'].get('_parent_job'))
+                        if row['state'] == 'done' and self.status(row['job_id']).get('remote_cleanup_pending'):
+                            folder = self.root / 'cleanup-pending'
+                            folder.mkdir(exist_ok=True)
+                            (folder / row['job_id']).touch()
+                    write_json(ready, {'version': 1})
+        rows = []
+        for marker in (self.root / 'active').glob('*'):
+            folder = self.root / marker.name
+            request = self.request(marker.name) if (folder / 'request.json').is_file() else None
+            status = read_json(folder / 'status.json')
+            if request and status and (status['state'] in ACTIVE or self.scheduler_pending(marker.name, status)):
+                rows.append({'job_id': marker.name, 'task': request['task'], 'kind': request.get('kind', 'gpu'),
+                             'created': request.get('created'), **status})
+            elif request and status:
+                marker.unlink(missing_ok=True)
+            elif not folder.exists():
+                marker.unlink(missing_ok=True)
+        return rows
+
+    def scheduler_pending(self, job_id: str, status: dict | None = None) -> bool:
+        """Keep runner results visible until Slurm/Kubernetes confirms successful termination."""
+        status = self.status(job_id) if status is None else status
+        return status['state'] == 'done' and not status.get('scheduler_confirmed') and self.launch(job_id).get(
+            'backend') in ('slurm', 'kubernetes')
 
     def request(self, job_id: str) -> dict:
         return read_json(self.path(job_id) / 'request.json')
@@ -96,6 +158,7 @@ class JobStore:
                 return previous
             status = {**previous, **extra, 'state': state, 'updated': now()}
             write_json(path, status)
+            self._index(job_id, state, self.scheduler_pending(job_id, status))
             return status
 
     def set_phase(self, job_id: str, phase: str, **extra) -> dict:
@@ -105,19 +168,34 @@ class JobStore:
             status = read_json(path, {})
             if status.get('state') in FINISHED:
                 return status
+            if status.get('phase') == phase and all(status.get(k) == v for k, v in extra.items()):
+                return status
             clock = time.time()
             elapsed = dict(status.get('phase_seconds', {}))
             if status.get('phase'):
                 key = status['phase']
                 elapsed[key] = elapsed.get(key, 0.) + max(0., clock - status.get('phase_started', clock))
             status.update(extra, phase=phase, phase_started=clock, phase_seconds=elapsed, updated=now())
+            if phase == 'waiting_cpu':
+                status['cpu_ready_at'] = clock
             write_json(path, status)
             return status
 
     def children(self, job_id: str) -> list[str]:
         """Internal prediction jobs belonging to an orchestrator."""
-        return [row['job_id'] for row in self.list(100_000)
-                if self.request(row['job_id'])['params'].get('_parent_job') == job_id]
+        if not (self.root / 'active-index-ready.json').exists():
+            self.active()  # imports a legacy store once, including its parent index
+        return [marker.name for marker in (self.root / 'children' / job_id).glob('*')
+                if (self.root / marker.name / 'request.json').is_file()]
+
+    def _index_parent(self, job_id: str, parent: str | None) -> None:
+        """Index child ownership without rescanning all closed model outputs."""
+        if parent:
+            if not _JOB_ID.match(parent):
+                raise ValueError('Invalid parent job identifier')
+            folder = self.root / 'children' / parent
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / job_id).touch(exist_ok=True)
 
     def result(self, job_id: str):
         return read_json(self.path(job_id) / 'result.json')
@@ -146,4 +224,4 @@ class JobStore:
                 jobs.append({'job_id': job_id, 'task': read_json(request)['task'],
                              **{k: v for k, v in self.status(job_id).items()
                                 if k in ('state', 'updated', 'error', 'phase', 'phase_seconds')}})
-        return sorted(jobs, key=lambda job: job.get('updated', ''), reverse=True)[:limit]
+        return sorted(jobs, key=lambda job: timestamp(job.get('updated')), reverse=True)[:limit]

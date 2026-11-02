@@ -52,6 +52,43 @@ def job_manifest(settings: dict, name: str, command: list[str], kind: str = 'gpu
                  'template': {'metadata': {'labels': {'app.kubernetes.io/managed-by': 'msms-mcp'}}, 'spec': pod}}}
 
 
+def inventory_summary(resource: str, data: dict, gpu_resource: str = 'nvidia.com/gpu') -> dict:
+    """Keep resource observations small and exclude pod environments and node annotations."""
+    if data.get('error'):
+        return data
+    items = data.get('items', [])
+    if resource == 'resourcequota':
+        return {'items': [{'name': item.get('metadata', {}).get('name'),
+                           'hard': item.get('status', {}).get('hard', {}),
+                           'used': item.get('status', {}).get('used', {})} for item in items]}
+    if resource == 'nodes':
+        products = {}
+        ready = schedulable = 0
+        for item in items:
+            ok = any(c.get('type') == 'Ready' and c.get('status') == 'True'
+                     for c in item.get('status', {}).get('conditions', []))
+            ready += ok
+            schedulable += ok and not item.get('spec', {}).get('unschedulable', False)
+            labels = item.get('metadata', {}).get('labels', {})
+            product = labels.get('nvidia.com/gpu.product', 'unspecified')
+            amount = int(item.get('status', {}).get('allocatable', {}).get(gpu_resource, 0))
+            if amount:
+                products[product] = products.get(product, 0) + amount
+        return {'nodes': len(items), 'ready_nodes': ready, 'ready_uncordoned_nodes': schedulable,
+                'gpu_resource': gpu_resource, 'allocatable_by_product': products,
+                'availability': 'Allocatable includes GPUs in use; taints, reservations and quotas still apply'}
+    phases = {}
+    requested = 0
+    for item in items:
+        phase = item.get('status', {}).get('phase', 'Unknown')
+        phases[phase] = phases.get(phase, 0) + 1
+        if phase in ('Pending', 'Running'):
+            containers = item.get('spec', {}).get('containers', [])
+            requested += sum(int(c.get('resources', {}).get('requests', {}).get(gpu_resource, 0)) for c in containers)
+    return {'pods': len(items), 'phases': phases, 'gpu_requests': requested,
+            'scope': 'Configured namespace only; other namespaces are not included'}
+
+
 class KubernetesBackend:
     """The JobStore must be on storage mounted at the same path in runner pods."""
     name = 'kubernetes'
@@ -60,6 +97,10 @@ class KubernetesBackend:
         self.store, self.python = store, python
         self.config = config
         self.settings = config.get('mcp', {}).get('kubernetes') or {}
+        from msms_structure_elucidation.mcp.admission import Admission
+        self.admission = Admission(store, config)
+        from msms_structure_elucidation.mcp.backends import pipeline_limit
+        self.max_live_pipelines = pipeline_limit(config.get('mcp', {}))
         if not self.settings.get('shared_workspace'):
             raise ValueError('Kubernetes needs shared_workspace: true and a mounted persistent job root')
 
@@ -73,7 +114,7 @@ class KubernetesBackend:
         if not self.dispatcher or self.settings.get('external_scheduler'):
             return
         with file_lock(self.store.root / 'kubernetes-scheduler.lock'):
-            for row in self.store.list(100000):
+            for row in self.store.active():
                 status = self.store.status(row['job_id'])
                 if status['state'] in ACTIVE:
                     parent = self.store.request(row['job_id'])['params'].get('_parent_job')
@@ -89,6 +130,11 @@ class KubernetesBackend:
     def submit(self, job_id: str) -> None:
         if not self.dispatcher:
             return
+        request = self.store.request(job_id)
+        if request.get('kind') != 'gpu':
+            live = sum(r.get('kind') != 'gpu' and r['state'] in ('submitted', 'running', 'done') for r in self.store.active())
+            if live >= self.max_live_pipelines or not self.admission.admit(job_id):
+                return
         from msms_structure_elucidation.mcp.backends import runner_command
         folder = self.store.path(job_id)
         name = 'msms-' + job_id.replace('_', '-')
@@ -103,7 +149,7 @@ class KubernetesBackend:
         result = kubectl(self.settings, 'create', '-f', '-', input=json.dumps(manifest))
         if result.returncode and 'AlreadyExists' not in result.stderr:
             raise RuntimeError(f'Kubernetes submission failed: {result.stderr[-2000:]}')
-        self.store.set_status(job_id, 'submitted', kubernetes_job=name, submitted=now())
+        self.store.set_status(job_id, 'submitted', kubernetes_job=name, submitted=now(), admission_hold=None)
 
     def archive(self, job_id: str, require_logs: bool = True) -> dict:
         """Archive scheduler records and logs before any object deletion."""
@@ -151,7 +197,9 @@ class KubernetesBackend:
             if 'Failed' in conditions or not success or status['state'] != 'done':
                 return self.store.set_status(job_id, 'failed', finished=now(),
                     error='Kubernetes Job/Pod/exit code/result did not all confirm success')
-            return self.store.set_status(job_id, 'done', scheduler_confirmed=True)
+            status = self.store.set_status(job_id, 'done', scheduler_confirmed=True)
+            self.admission.record(job_id, 'done')
+            return status
         # A runner result alone cannot establish Kubernetes completion.
         return {**status, 'state': 'running' if status['state'] == 'done' else status['state'],
                 'scheduler_state': 'Running' if job.get('status', {}).get('active') else 'Pending'}
@@ -184,8 +232,10 @@ class KubernetesBackend:
                             'nodes': ('get', 'nodes', '-o', 'json'),
                             'pods': ('get', 'pods', '-o', 'json')}.items():
             result = kubectl(self.settings, *args)
-            inventory[label] = json.loads(result.stdout) if not result.returncode else {'error': result.stderr[-1000:]}
+            inventory[label] = inventory_summary(args[1], json.loads(result.stdout), self.settings.get(
+                'gpu_resource', 'nvidia.com/gpu')) if not result.returncode else {'error': result.stderr[-1000:]}
         # Requested resources and node capacity are observations, never promises of idle capacity.
         return {'backend': self.name, 'inventory': inventory,
+                'admission': self.admission.summary(),
                 'availability': 'scheduler-controlled', 'context': self.settings.get('context'),
                 'namespace': self.settings.get('namespace')}

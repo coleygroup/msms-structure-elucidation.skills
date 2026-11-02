@@ -9,7 +9,7 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from pathlib import Path
 from typing import Callable
 
@@ -26,7 +26,8 @@ def digest(value: object) -> str:
 
 
 @contextmanager
-def file_lock(path: Path, on_wait: Callable | None = None, on_acquired: Callable | None = None):
+def file_lock(path: Path, on_wait: Callable | None = None, on_acquired: Callable | None = None,
+              *, blocking: bool = True):
     """Release an interprocess lock automatically even when its owner exits."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+b') as handle:
@@ -44,6 +45,9 @@ def file_lock(path: Path, on_wait: Callable | None = None, on_acquired: Callable
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
+                    if not blocking:
+                        yield False
+                        return
                     if on_wait is not None and not waited:
                         on_wait()
                         waited = True
@@ -51,13 +55,19 @@ def file_lock(path: Path, on_wait: Callable | None = None, on_acquired: Callable
             try:
                 if waited and on_acquired is not None:
                     on_acquired()
-                yield
+                yield True
             finally:
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            if on_wait is None:
+            if not blocking:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    yield False
+                    return
+            elif on_wait is None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             else:
                 while True:
@@ -72,7 +82,7 @@ def file_lock(path: Path, on_wait: Callable | None = None, on_acquired: Callable
             try:
                 if waited and on_acquired is not None:
                     on_acquired()
-                yield
+                yield True
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -203,9 +213,26 @@ def predictions(root: Path, identity: dict, smiles: list[str], energies: list[in
     unique = list(dict.fromkeys(smiles))
     rows = {}
     hits = 0
+    database = folder / 'spectra.sqlite3'
+    if database.is_file() and not refresh:
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=120)) as db:
+            db.execute('BEGIN')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='spectra'").fetchone():
+                for smi in unique:
+                    for energy in requested:
+                        saved = db.execute('SELECT payload FROM spectra WHERE smiles=? AND energy=?', (smi, energy)).fetchone()
+                        if saved:
+                            row = json.loads(saved[0])
+                            _validate(row, smi, energy)
+                            rows[smi, energy] = row
+                            hits += 1
+    if hits == len(unique) * len(requested):
+        return _records(rows, unique, requested), {'namespace': namespace, 'reused_spectra': hits,
+            'predicted_spectra': 0, 'identity': identity}
+    missing_molecules = [smi for smi in unique if any((smi, e) not in rows for e in requested)]
     from msms_structure_elucidation.mcp.pipeline import cache_wait_callbacks
     on_wait, on_acquired = cache_wait_callbacks()
-    with candidate_guard(folder, unique, on_wait, on_acquired):
+    with candidate_guard(folder, missing_molecules, on_wait, on_acquired):
         with sqlite3.connect(folder / 'spectra.sqlite3', timeout=120) as db:
             db.execute('CREATE TABLE IF NOT EXISTS spectra (smiles TEXT, energy TEXT, payload TEXT, '
                        'PRIMARY KEY(smiles, energy))')
@@ -213,6 +240,8 @@ def predictions(root: Path, identity: dict, smiles: list[str], energies: list[in
             for smi in unique:
                 needed = []
                 for energy in requested:
+                    if (smi, energy) in rows:
+                        continue
                     saved = None if refresh else db.execute(
                         'SELECT payload FROM spectra WHERE smiles=? AND energy=?', (smi, energy)).fetchone()
                     if saved:
@@ -242,8 +271,12 @@ def predictions(root: Path, identity: dict, smiles: list[str], energies: list[in
                 # Commit only after the complete requested group passed validation.
                 db.executemany('INSERT OR REPLACE INTO spectra VALUES (?, ?, ?)', pending)
                 db.commit()
-    records = [{'smiles': smi, 'predicted_spectra': {e: rows[smi, e]['peaks'] for e in requested},
+    return _records(rows, unique, requested), {'namespace': namespace, 'reused_spectra': hits,
+                     'predicted_spectra': len(unique) * len(requested) - hits, 'identity': identity}
+
+
+def _records(rows: dict, unique: list[str], requested: list[str]) -> list[dict]:
+    """Return independent request records from validated immutable cache rows."""
+    return [{'smiles': smi, 'predicted_spectra': {e: rows[smi, e]['peaks'] for e in requested},
                 'predicted_fragment_ids': {e: rows[smi, e]['fragment_ids'] for e in requested
                                            if rows[smi, e]['fragment_ids'] is not None}} for smi in unique]
-    return records, {'namespace': namespace, 'reused_spectra': hits,
-                     'predicted_spectra': len(unique) * len(requested) - hits, 'identity': identity}

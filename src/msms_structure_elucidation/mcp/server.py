@@ -127,6 +127,8 @@ def _response(job_id: str, detail: str = 'summary') -> dict:
                 'remote_cleanup_pending', 'dispatch_errors', 'kubernetes_job', 'scheduler_reason', 'cancel_requested'):
         if status.get(key):
             out[key] = status[key]
+    if status.get('admission_hold'):
+        out['admission_hold'] = status['admission_hold']
     if status['state'] in ACTIVE and status.get('scheduler_state'):
         out['scheduler_state'] = status['scheduler_state']
     if status['state'] == 'done':
@@ -195,8 +197,18 @@ async def server_info() -> dict:
         missing = tasks.missing_assets(task, config, model='glacier')
         models[f'{task}(glacier)'] = {'ready': not missing, 'missing': missing}
     return {**await asyncio.to_thread(runtime['backend'].describe), 'job_root': str(runtime['store'].root),
+            'readiness_scope': 'Configured assets only; validate the actual production route before bulk execution',
             'config': config.get('_local_config_path') or config['_config_path'], 'models': models,
             'collision_energy_rule': 'Inspect raw/mzML acquisition metadata first; reuse verified settings for matching inputs. Ask only if values, NCE/eV units or stepped mode remain unresolved or conflicting.'}
+
+
+@tool
+async def resume_admission(scope: str, reason: str) -> dict:
+    """Reopen an environment-held queue after repair; run one real route canary before expanding."""
+    from msms_structure_elucidation.mcp.admission import Admission
+    runtime = _runtime()
+    admission = Admission(runtime['store'], runtime['config'])
+    return await asyncio.to_thread(admission.resume, scope, reason)
 
 
 @tool
