@@ -52,6 +52,10 @@ The launcher passes `num_writers`, `num_h5_chunks`, `feat_cache_size` and `spars
 
 Stay with the job after launch, including detached runs and waits for idle GPUs. Check live job/process states, logs, progress and failures, and keep the user informed. As soon as stable per-feature results are available, use [msms-evidence-review](../msms-evidence-review/SKILL.md) and write a per-feature `evidence_review.json` while other predictions continue. Mark incomplete coverage as provisional and revisit changed results. Resume monitoring between reviews; wait for verified outputs and feature accounting before reporting completion. Follow [job monitoring and early review](../../../docs/job-monitoring.md).
 
+If progress is slow or GPUs are idle, inspect `get_job` phases and CPU load to distinguish preparation, shared-cache waits, fragment merging/scoring and native inference. Follow [performance diagnosis](../../../docs/mcp-execution.md) before changing batch sizes or worker counts. Benchmark CPU scoring changes on saved predictions with exact scientific-output parity; preserve compatible raw predictions and leave the supplied model checkout unchanged.
+
+Inspect `server_info.cpu_workload` when tuning independent feature-job concurrency. Use `plan_cpu_concurrency` with measured CPU/RAM budgets, compare completed-feature throughput and save the host profile through setup. Track prediction waiters and submitted jobs separately from active CPU work; GLACIER data-loader workers are a separate setting. Follow [CPU sizing](../../../docs/mcp-execution.md#size-independent-cpu-feature-jobs) and retain existing jobs during controlled coordinator reloads.
+
 ## Score candidate structures
 
 Accept the experimental `.ms` spectrum, a target neutral formula, a JSON array of candidate SMILES, and the reference candidates to compare. Reuse confirmed collision units, adduct, instrument, model and exact weights. Validate SMILES/formulas and deduplicate connectivity, retaining proposal origins and rejected-input reasons. Keep separate formula hypotheses in separate scoring groups.

@@ -29,6 +29,26 @@ Set machine-specific values in ignored `configs/local.yaml`:
 
 The RAM floor is an admission check, not a hard memory limit. Tune CPU slots, preparation workers, group size and model batch size together for the host. A larger prediction group amortizes Python startup, checkpoint loading and writer startup while retaining resumable groups. Native model processes still load their weights for each uncached group; the adapter does not keep a resident model across requests.
 
+### Size independent CPU feature jobs
+
+`max_cpu_jobs` controls independent feature preparation/scoring jobs; the default of two is a conservative starting point. GLACIER's `num_cpu_workers` controls featurization inside each native prediction process. Measure and tune these separately.
+
+Use `server_info.cpu_workload` to distinguish working CPU jobs from `waiting_gpu`, `waiting_cache`, `waiting_cpu`, submitted jobs and the coordinator queue. The report includes the effective resident-pipeline limit, the active CPU and prepared-waiter limits when enforced locally, and the resources configured for new Slurm CPU jobs. Check `max_prepared_jobs` and prediction-group look-ahead when a pool's GPUs lack upcoming work. Submitted Slurm jobs have not necessarily started. A running CPU allocation can be waiting for predictions; use host CPU samples and job phases together.
+
+Budget CPU cores and RAM for all resident parents after reserving capacity for the operating system, other users and local GPU inference workers. Measure each CPU job's complete process tree or cgroup, including scientific subprocesses, and add memory headroom. Check native thread pools against the per-job CPU allocation. On Slurm, use the intended compute-node/account capacity and scheduler policy; the login host's CPU count is not that budget. On Kubernetes, use the applicable requests, limits and remaining quota.
+
+Call MCP `plan_cpu_concurrency` with `cpu_budget`, `memory_budget_gb`, `cpus_per_job`, `memory_per_job_gb` and an optional `max_jobs`. Without MCP:
+
+```bash
+msms-structure-elucidation plan-cpu \
+  --cpu-budget 24 --memory-budget-gb 64 \
+  --cpus-per-job 2 --memory-per-job-gb 4
+```
+
+The read-only planner returns a capacity ceiling and an `mcp_settings` fragment; insufficient budgets return no fragment. The example allows at most 12 parents. The fragment bounds both `max_cpu_jobs` and `max_live_pipelines`, including resident waiters. With Slurm, `max_live_pipelines` is the submission cap for CPU parents; `max_cpu_jobs` alone contributes to the automatic cap and does not impose a separate active-job limit. CPU parents keep their CPU/RAM allocations during prediction waits, so increasing their count can increase reservations without increasing useful CPU work.
+
+Compare representative completed-feature throughput, preparation/scoring times, peak memory and prediction-wait fractions at increasing concurrency, keeping inputs, weights, energies and cache conditions fixed. Increasing concurrency only helps while the relevant resources and downstream capacity have headroom. Save measured limits and CPU task resources in ignored `configs/local.yaml`; a capacity ceiling is not a measured optimum. Configure `mcp.slurm.cpu` or Kubernetes CPU resources to match the measured job footprint. Apply changes through a controlled coordinator/dispatcher reload while retaining existing native jobs, request identities and partial results.
+
 Tune the models differently. For ICEBERG, start with two parallel GPU workers per GPU and compare two to four, adjusting the batch size to fit their combined memory use. `models.simulator.num_gpu_workers` is the total across configured `cuda_devices`; the scheduler scales it to the GPUs allocated to each job. For GLACIER, keep one prediction process per GPU and increase `models.simulator.glacier.batch_size` until throughput plateaus or memory limits are reached. Keep CPU workers and writers fixed initially, then adjust them if native timing shows feature or writer waits. Save measured settings in `configs/local.yaml`.
 
 Local scheduling uses one detached process per job root. Startup is arbitrated on local temporary storage; the driver holds one shared ownership lease. Waiting workers never schedule the queue. CPU-ready requests resume in FIFO order before new preparations, and compact live-job and parent/child indexes keep closed history out of scheduling scans. A complete raw-cache hit uses a read snapshot without writer leases. Cancellation and failed-child propagation preserve the affected requests and evidence.
@@ -50,6 +70,8 @@ For a batch, submit independent MCP jobs with `wait_seconds=0`, then poll their 
 GPU children save `gpu-samples.csv` and `gpu-metrics.json`; `get_job` returns their `gpu_metrics`. `mcp.gpu_monitor_interval_seconds` sets the sampling interval (default 1 second, zero disables it). Samples use scheduler GPU IDs when available and include zeros, allocated-task timing, peak sampled memory and observed foreign compute processes. These whole-task measurements include startup, native preparation, writer drain and publication; derive sustained inference separately from native log boundaries and validate spectrum counts before calculating throughput.
 
 `get_job` exposes `phase`, accumulated `phase_seconds` and the current `prediction_job`. Phases distinguish CPU preparation, waiting for a shared prediction, waiting for a GPU, GPU prediction, waiting for a CPU slot and CPU scoring. Poll the parent until terminal; an internal prediction completing does not mean experimental scoring has finished. See [job monitoring](job-monitoring.md).
+
+For low GPU utilization or a long completion estimate, locate the slow phase before increasing GPU workers or batch size. Check CPU saturation, preparation queues, shared-cache waits, fragment merging and scoring as well as native inference timing. Stepped scoring decodes fragment masks once per temporary component and uses the native merge and normalization; raw cached spectra remain reusable when only this scoring calculation changes. Validate scoring optimizations against fixed saved predictions, comparing masses, intensities, fragment IDs, similarities, explained intensity and matched peaks exactly. Report a CPU replay speedup separately from measured inference or whole-workload gains. Keep fixes in the shared implementation and leave supplied model checkouts unchanged.
 
 To measure an installation, freeze inputs, native source, weights and scientific settings, use separate cold prediction caches, and compare revisions on the same idle GPU. [The local benchmark script](../scripts/benchmark_mcp_pipeline.py) runs a fixed JSON request list through the local backend and runner, records phase transitions and samples `nvidia-smi` utilization every 0.5 seconds. It excludes client transport and fixture preparation; it does not benchmark remote or pooled backends. Compare terminal feature accounting and hashes of peaks, fragments and scores as well as elapsed time. Sampled utilization is an observation, not a guarantee of saturation.
 

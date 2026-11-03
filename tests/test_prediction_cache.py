@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import shutil
 import tempfile
 import threading
 import time
@@ -15,6 +16,42 @@ from msms_structure_elucidation import cli, glacier, prediction_cache as cache, 
 def produce(molecules, energies):
     return [{'smiles': smi, 'predicted_spectra': {str(e): [[float(e), .8]] for e in energies},
              'predicted_fragment_ids': {str(e): ['1'] for e in energies}} for smi in molecules]
+
+
+class AdapterIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for name in ('worker.py', 'glacier.py', 'iceberg.py'):
+            shutil.copyfile(Path(cache.__file__).with_name(name), self.root / name)
+        self.worker = self.root / 'worker.py'
+
+    def test_scoring_only_change_reuses_existing_raw_predictions(self):
+        legacy = '9410f95c968745fc30145fef606e2ffaaab66b094977d18931a4a18f0545382e'
+        self.assertEqual(cache.adapter_fingerprint(self.worker), legacy)
+        first, _ = cache.predictions(self.root, {'adapter_sha256': legacy}, ['CCO'], [20, 40], produce)
+        self.worker.write_text(self.worker.read_text().replace('return super().int_frags', 'return None'))
+        identity = {'adapter_sha256': cache.adapter_fingerprint(self.worker)}
+        self.assertEqual(identity['adapter_sha256'], legacy)
+        second, receipt = cache.predictions(self.root, identity, ['CCO'], [20, 40],
+            lambda *args: self.fail('scoring-only change invalidated raw predictions'))
+        self.assertEqual(first, second)
+        self.assertEqual(receipt['reused_spectra'], 2)
+        self.assertEqual(receipt['predicted_spectra'], 0)
+
+    def test_raw_generation_or_model_adapter_changes_invalidate(self):
+        before = cache.adapter_fingerprint(self.worker)
+        raw = self.worker.read_text()
+        self.worker.write_text(raw.replace("runtime.get('sparse_k', 100)", "runtime.get('sparse_k', 200)"))
+        self.assertNotEqual(cache.adapter_fingerprint(self.worker), before)
+        self.worker.write_text(raw)
+        for name in ('glacier.py', 'iceberg.py'):
+            path = self.root / name
+            original = path.read_bytes()
+            path.write_bytes(original + b'\nRAW_GENERATION_VERSION = 2\n')
+            self.assertNotEqual(cache.adapter_fingerprint(self.worker), before)
+            path.write_bytes(original)
 
 
 class SharedPredictionTests(unittest.TestCase):

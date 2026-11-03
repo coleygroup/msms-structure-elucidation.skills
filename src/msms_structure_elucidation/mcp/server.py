@@ -191,15 +191,32 @@ async def server_info() -> dict:
     """Where this server runs, its job backend and GPUs, and which models are configured."""
     runtime = _runtime()
     config = runtime['config']
+    from msms_structure_elucidation.mcp.cpu import workload
+    backend = runtime['backend']
+    cpu_rows = await asyncio.to_thread(runtime['store'].active)
+    cpu_workload = workload(cpu_rows, config, getattr(backend, 'cpu', backend))
     models = {task: {'ready': not missing, 'missing': missing}
               for task in tasks.KINDS for missing in [tasks.missing_assets(task, config)]}
     for task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass', 'search_pubchem_formulas'):
         missing = tasks.missing_assets(task, config, model='glacier')
         models[f'{task}(glacier)'] = {'ready': not missing, 'missing': missing}
-    return {**await asyncio.to_thread(runtime['backend'].describe), 'job_root': str(runtime['store'].root),
+    return {**await asyncio.to_thread(backend.describe), 'job_root': str(runtime['store'].root),
+            'cpu_workload': cpu_workload,
             'readiness_scope': 'Configured assets only; validate the actual production route before bulk execution',
             'config': config.get('_local_config_path') or config['_config_path'], 'models': models,
             'collision_energy_rule': 'Inspect raw/mzML acquisition metadata first; reuse verified settings for matching inputs. Ask only if values, NCE/eV units or stepped mode remain unresolved or conflicting.'}
+
+
+@tool
+async def plan_cpu_concurrency(
+        cpu_budget: Annotated[float, Field(description='CPU cores budgeted for feature parents, after headroom', gt=0)],
+        memory_budget_gb: Annotated[float, Field(description='RAM GiB budgeted for resident feature parents', gt=0)],
+        cpus_per_job: Annotated[float, Field(description='CPU cores per feature job, including its subprocesses', gt=0)],
+        memory_per_job_gb: Annotated[float, Field(description='Per-parent peak RAM GiB plus headroom', gt=0)],
+        max_jobs: Annotated[int | None, Field(description='Optional explicit resident-job cap', gt=0)] = None) -> dict:
+    """Plan independent CPU feature concurrency from explicit resource budgets; changes no configuration or jobs."""
+    from msms_structure_elucidation.mcp.cpu import plan_concurrency
+    return plan_concurrency(cpu_budget, memory_budget_gb, cpus_per_job, memory_per_job_gb, max_jobs)
 
 
 @tool

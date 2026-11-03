@@ -8,11 +8,25 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from msms_structure_elucidation import workflow_guard as guard
 
 
 class WorkflowGuardTests(unittest.TestCase):
+    def test_install_cli_preserves_subcommand_and_uses_default_or_custom_hook(self):
+        for command in ('msms-workflow-guard hook', 'configured-python -m msms_structure_elucidation.workflow_guard hook'):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as tmp:
+                args = ['install', '--project-dir', tmp]
+                if command != 'msms-workflow-guard hook':
+                    args += ['--command', command]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(guard.main(args), 0)
+                for name in ('.codex/hooks.json', '.claude/settings.json'):
+                    events = guard.read_json(Path(tmp) / name)['hooks']
+                    for event in ('SessionStart', 'UserPromptSubmit', 'Stop'):
+                        self.assertEqual(events[event][0]['hooks'][0]['command'], command)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='msms guard ')
         self.addCleanup(temporary.cleanup)
@@ -109,6 +123,71 @@ class WorkflowGuardTests(unittest.TestCase):
         self.assertIn('exit_code', self.stop()['reason'])
         guard.write_json(receipt, {'state': 'done', 'finished': guard.now(), 'exit_code': 0})
         self.assertTrue(guard.inspect_state(self.path)['complete'])
+
+    def test_stop_returns_proven_running_job_without_scanning_remaining_work(self):
+        receipt = self.root / 'running.json'
+        guard.write_json(receipt, {'state': 'running'})
+        self.data['jobs'] = [{'job_id': 'active', 'status_path': str(receipt)},
+                             {'job_id': 'later', 'status_path': 'later.json'}]
+        self.save()
+        native = guard.readable
+
+        def bounded(root, value, **kwargs):
+            if value == 'later.json':
+                self.fail('Stop scanned later work after proving an active job')
+            return native(root, value, **kwargs)
+
+        with patch.object(guard, 'readable', side_effect=bounded), \
+                patch.object(guard, 'review_result', side_effect=AssertionError('unneeded review scan')):
+            result = self.stop()
+        self.assertEqual(result['decision'], 'block')
+        self.assertIn('active: running', result['reason'])
+        self.assertNotIn('Unreadable workflow state', result['reason'])
+        # Explicit checks and finish still inspect every remaining requirement.
+        checked = guard.inspect_state(self.path, force=True, stop_on_issue=True)
+        self.assertTrue(checked['inspection_complete'])
+        self.assertEqual({issue.get('job_id') for issue in checked['issues']}, {'active', 'later'})
+
+    def test_early_stop_leaves_review_cache_intact_and_full_check_lists_all_issues(self):
+        guard.inspect_state(self.path)
+        cache_path = self.path.with_name('validation_cache.json')
+        cache_before = cache_path.read_bytes()
+        for feature in self.data['features'].values():
+            Path(feature['review']).unlink()
+        result = guard.inspect_state(self.path, stop_on_issue=True)
+        self.assertFalse(result['inspection_complete'])
+        self.assertFalse(result['complete'])
+        self.assertFalse(result['allow_stop'])
+        self.assertEqual(cache_before, cache_path.read_bytes())
+        full = guard.inspect_state(self.path)
+        self.assertTrue(full['inspection_complete'])
+        self.assertEqual({issue.get('feature_id') for issue in full['issues']}, {'001', '002'})
+
+    def test_thousands_of_exclusions_share_evidence_only_within_one_check(self):
+        features = [str(index) for index in range(5000)]
+        path = guard.start(self.root, 'large-session', 'large-run', features, self.output)
+        data = guard.read_json(path)
+        data['features'] = {key: self.evidence(outcome='excluded') for key in features}
+        data['prerequisites'] = self.data['prerequisites']
+        data['report'] = self.data['report']
+        data['final_assessment'] = self.data['final_assessment']
+        guard.write_json(path, data)
+        for _ in range(2):
+            with patch.object(guard, 'readable', wraps=guard.readable) as readable:
+                result = guard.inspect_state(path, force=True)
+            self.assertTrue(result['complete'])
+            self.assertEqual(result['outcomes'], {'excluded': 5000})
+            proof_reads = [call for call in readable.call_args_list if call.args[1] == str(self.proof)]
+            self.assertEqual(len(proof_reads), 1)
+        # A shared file never excuses a malformed record or disappears behind a persistent cache.
+        data['features'][features[-1]]['reason'] = ''
+        guard.write_json(path, data)
+        result = guard.inspect_state(path, force=True)
+        self.assertEqual([issue['feature_id'] for issue in result['issues']], [features[-1]])
+        self.proof.unlink()
+        result = guard.inspect_state(path, force=True)
+        self.assertFalse(result['complete'])
+        self.assertEqual(len([issue for issue in result['issues'] if issue['kind'] == 'feature']), 5000)
 
     def test_weak_evidence_requires_user_route_and_both_routes_need_scoring(self):
         self.make_result('001', weak=True)

@@ -162,7 +162,10 @@ function renderOverview() {
 }
 function renderHist(sims) {
   const bins = Array.from({ length: 20 }, (_, i) => ({ lo: i / 20, n: 0 }));
-  sims.forEach(s => { bins[Math.min(19, Math.floor(s * 20))].n++; });
+  sims.forEach(s => {
+    if (typeof s !== 'number' || !Number.isFinite(s)) return;
+    bins[Math.max(0, Math.min(19, Math.floor(s * 20)))].n++;
+  });
   const W = 640, H = 210, m = { l: 34, r: 8, t: 22, b: 26 }, iw = W - m.l - m.r, ih = H - m.t - m.b, bw = iw / 20;
   const ymax = Math.max(1, ...bins.map(b => b.n)), y = v => m.t + ih - (v / ymax) * ih, step = ymax > 24 ? 10 : 5;
   let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Histogram of rank-1 similarity">`;
@@ -671,6 +674,7 @@ function renderInspectorSelection() {
 function renderPeakInfo(sp, pl) {
   const note = $('frag-note'), box = $('peak-info');
   note.disabled = true; note.value = '';
+  $('expand-fragment-note').disabled = true;
   if (!sp || !S.peak) { box.innerHTML = '<span class="sub">Hover a peak to preview its fragment on the structure; click to pin it here.</span>'; return; }
   if (S.peak.kind === 'e') {
     const [mz, it] = sp.exp[S.peak.i];
@@ -686,6 +690,7 @@ function renderPeakInfo(sp, pl) {
   if (sp.ids[i] != null) {
     const key = peakNoteKey(sp, i), draft = S.drafts.get(`${S.r}|${cand().review_key}|${key}`);
     note.disabled = READONLY();
+    $('expand-fragment-note').disabled = false;
     note.value = draft ?? noteFor(cand()).fragments?.[key]?.comment ?? '';
   }
 }
@@ -735,6 +740,26 @@ function renderEvidence() {
 }
 
 /* ---------- verdict and autosave ---------- */
+let expandedNoteSource = null;
+function setSaveState(message) {
+  $('save-state').textContent = message;
+  $('note-editor-status').textContent = message;
+}
+function openNoteEditor(sourceId) {
+  if (!S.result?.candidates.length || (sourceId === 'frag-note' && $('expand-fragment-note').disabled)) return;
+  expandedNoteSource = $(sourceId);
+  const fragment = sourceId === 'frag-note', editor = $('note-editor-text');
+  $('note-editor-title').textContent = fragment ? 'Fragment note' : 'Candidate comment';
+  $('note-editor-context').textContent = `${S.index[S.r].label} · Candidate #${S.cand + 1}${fragment ? ` · ${$('peak-info').innerText.split('\n')[0]}` : ''}`;
+  editor.value = expandedNoteSource.value;
+  editor.maxLength = expandedNoteSource.maxLength;
+  editor.readOnly = expandedNoteSource.disabled || READONLY();
+  $('note-editor-status').textContent = $('save-state').textContent;
+  $('note-editor').showModal();
+  editor.focus();
+  editor.setSelectionRange(0, 0);
+  editor.scrollTop = 0; editor.scrollLeft = 0;
+}
 function currentReview() {
   const c = cand(), draft = S.drafts.get(`${S.r}|${c.review_key}`) || {}, note = noteFor(c);
   return { decision: draft.decision || note.decision || 'unreviewed', comment: draft.comment ?? note.comment ?? '' };
@@ -747,9 +772,9 @@ function renderVerdict() {
   $('cand-comment').disabled = READONLY();
   $('workspace').classList.toggle('readonly', READONLY());
   $('demo-chip').hidden = !DEMO();
-  $('save-state').textContent = READONLY() ? 'Read-only snapshot'
+  setSaveState(READONLY() ? 'Read-only snapshot'
     : DEMO() ? 'Demo · saved in this browser only'
-    : (note.updated_at ? `Saved ${new Date(note.updated_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}` : 'Autosaves as you review');
+    : (note.updated_at ? `Saved ${new Date(note.updated_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })}` : 'Autosaves as you review'));
 }
 function setDraft(patch) { S.drafts.set(`${S.r}|${cand().review_key}`, { ...currentReview(), ...patch }); }
 function rememberFragmentDraft() {
@@ -764,23 +789,23 @@ function scheduleSave(kind, delay) {
   const fragKey = ref && ref.id != null ? `${ref.key}:${ref.index}` : null;
   const timerKey = `${r}|${c.review_key}|${fragKey || kind}`;
   clearTimeout(S.saveTimers[timerKey]);
-  $('save-state').textContent = 'Editing…';
+  setSaveState('Editing…');
   S.saveTimers[timerKey] = setTimeout(async () => {
     const rv = S.drafts.get(`${r}|${c.review_key}`) || {};
     const note = S.r === r ? noteFor(c) : {};
     const body = { result: r, candidate_key: c.review_key, decision: rv.decision || note.decision || 'unreviewed', comment: rv.comment ?? note.comment ?? '' };
     if (fragKey) body.fragment = { ce: ref.key, peak_index: ref.index, comment: S.drafts.get(`${r}|${c.review_key}|${fragKey}`) ?? '' };
-    if (S.r === r) $('save-state').textContent = 'Saving…';
+    if (S.r === r) setSaveState('Saving…');
     try {
       const data = await api.save(body);
       S.index[r].review = data.review; S.index[r].reviewed = data.reviewed;
       if (S.r === r) {
         S.notes = data.notes;
-        $('save-state').textContent = `${DEMO() ? 'Demo · saved in this browser' : 'Saved'} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+        setSaveState(`${DEMO() ? 'Demo · saved in this browser' : 'Saved'} ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
         renderRail();
         if (S.cand === k && fragKey) renderFragList(spectraFor(cand()), currentPayload);
       }
-    } catch (error) { if (S.r === r) $('save-state').textContent = `Not saved: ${error.message}`; }
+    } catch (error) { if (S.r === r) setSaveState(`Not saved: ${error.message}`); }
   }, delay);
 }
 function decide(d) {
@@ -792,6 +817,7 @@ function decide(d) {
 
 /* ---------- navigation, palette, keyboard ---------- */
 function route() {
+  if ($('note-editor').open) $('note-editor').close();
   // Links use plain tokens (#r12, #overview) so they survive hosts that only pass simple anchors.
   const h = location.hash, legacy = h.match(/result=(\d+)/), m = h.match(/^#(?:\/r\/|r)(\d+)$/);
   const i = m ? Number(m[1]) : legacy ? Number(legacy[1]) : null;
@@ -920,6 +946,27 @@ function wire() {
   $('decision').addEventListener('click', e => { const b = e.target.closest('[data-d]'); if (b) decide(b.dataset.d); });
   $('cand-comment').addEventListener('input', () => { setDraft({ comment: $('cand-comment').value }); scheduleSave('candidate', 700); });
   $('frag-note').addEventListener('input', () => { rememberFragmentDraft(); scheduleSave('fragment', 700); });
+  $('expand-candidate-comment').addEventListener('click', () => openNoteEditor('cand-comment'));
+  $('expand-fragment-note').addEventListener('click', () => openNoteEditor('frag-note'));
+  $('note-editor-text').addEventListener('input', () => {
+    if (!expandedNoteSource || $('note-editor-text').readOnly) return;
+    expandedNoteSource.value = $('note-editor-text').value;
+    expandedNoteSource.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  $('note-editor-close').addEventListener('click', () => $('note-editor').close());
+  $('note-editor-maximize').addEventListener('click', () => {
+    const dialog = $('note-editor'), full = dialog.classList.toggle('maximized');
+    dialog.style.width = ''; dialog.style.height = '';
+    $('note-editor-maximize').setAttribute('aria-pressed', String(full));
+    $('note-editor-maximize').textContent = full ? 'Restore' : 'Full screen';
+  });
+  $('note-editor').addEventListener('close', () => {
+    expandedNoteSource = null;
+    $('note-editor').classList.remove('maximized');
+    $('note-editor').style.width = ''; $('note-editor').style.height = '';
+    $('note-editor-maximize').setAttribute('aria-pressed', 'false');
+    $('note-editor-maximize').textContent = 'Full screen';
+  });
   $('prev').addEventListener('click', () => stepUnknown(-1));
   $('next').addEventListener('click', () => stepUnknown(1));
   $('open-search').addEventListener('click', openPalette);

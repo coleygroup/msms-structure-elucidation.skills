@@ -28,6 +28,13 @@ const source = fs.readFileSync(path.join(root, 'src/msms_structure_elucidation/v
 const withoutInit = source.replace(/\ninit\(\);\s*$/, '\n');
 assert.notEqual(withoutInit, source, 'the test must disable only the browser bootstrap');
 vm.runInContext(withoutInit, context);
+elements.hist = { innerHTML: '' };
+context.histogramScores = [-2e-9, 0.5, 1.00000001, null, NaN, Infinity, '0.7'];
+vm.runInContext('renderHist(histogramScores)', context);
+assert.match(elements.hist.innerHTML, /Similarity 0\.00–0\.05<br><b>1<\/b> unknowns/);
+assert.match(elements.hist.innerHTML, /Similarity 0\.95–1\.00<br><b>1<\/b> unknowns/);
+assert.doesNotMatch(elements.hist.innerHTML, /NaN|Infinity/);
+assert.equal(context.histogramScores[0], -2e-9, 'Histogram bins must not alter scientific scores');
 const result = {
   parentmass: 250,
   spectra: { '10.0': [[100, 1]], '20.0': [[100.001, 2]] },

@@ -36,7 +36,9 @@ These example files are supplied with [ms-pred](https://github.com/coleygroup/ms
 
 For your own data, ask:
 
-> Use msms-structure-elucidation-skills to elucidate the spectra in sample.mgf and show me one interactive report.
+> Use msms-structure-elucidation-skills to elucidate molecular structures from [file path or GNPS/MassIVE link] and show all results in one interactive report.
+
+Replace the brackets with your file path or URL. For a dataset containing multiple files, specify which files or features to analyze.
 
 ## Explore your results
 

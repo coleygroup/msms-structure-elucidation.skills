@@ -135,7 +135,16 @@ def _scoring_prediction(predicted, source: dict):
     if missing:
         raise ValueError(f'Missing stepped prediction energies: {sorted(missing)}')
     from ms_pred import common
+    from functools import cached_property
     import numpy as np
+
+    class _MergeComponent(common.MassSpec):
+        # These copies are immutable during this merge. Decode masks once per
+        # component instead of rebuilding every mask for every native peak lookup.
+        @cached_property
+        def int_frags(self) -> list[int] | None:
+            return super().int_frags
+
     components, retained = [], set()
     for key in dict.fromkeys(indexed[ev] for ev in requested):
         spec = predicted[key]
@@ -146,7 +155,7 @@ def _scoring_prediction(predicted, source: dict):
         if not keep.any():
             continue
         # Native merging iterates num_peaks (positive count); remove interleaved zeros first.
-        components.append(common.MassSpec(collision_energy=float(key),
+        components.append(_MergeComponent(collision_energy=float(key),
             root_canonical_smiles=spec.root_canonical_smiles, adduct=spec.adduct,
             masses=masses[keep].copy(), intens=intens[keep].copy(),
             frags=spec.frags[keep].copy() if spec.frags is not None else None))
@@ -567,10 +576,7 @@ def _model_predictions(smiles, energies, nce, adduct, model, checkpoint, gen_che
     instrument = common.normalize_instrument(instrument)
     identity = cache.model_identity(model, checkpoints, Path(ms_pred.__file__).parent, root,
                                     adduct, instrument, runtime.get('sparse_k', 100))
-    import hashlib
-    identity['adapter_sha256'] = hashlib.sha256(Path(__file__).read_bytes() +
-        Path(__file__).with_name('glacier.py').read_bytes() +
-        Path(__file__).with_name('iceberg.py').read_bytes()).hexdigest()
+    identity['adapter_sha256'] = cache.adapter_fingerprint(Path(__file__))
     groups = defaultdict(list)
     for smi in dict.fromkeys(common.rm_stereo(s) for s in smiles):
         precursor = common.mass_from_smi(smi) + common.ion2mass[adduct]

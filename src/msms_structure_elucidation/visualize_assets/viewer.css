@@ -227,6 +227,8 @@ button.chip:hover { border-color: var(--accent); }
 .peak-info b { color: var(--text); }
 .peak-info .formula { font-size: 16px; color: var(--text); font-weight: 650; }
 .field { display: grid; gap: 4px; font-size: 12px; color: var(--text-2); }
+.note-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.note-heading button { font-size: 12px; padding: 2px 8px; }
 .frag-list { display: grid; gap: 4px; }
 .frag-row { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; text-align: left; font-size: 12px; padding: 4px 8px; }
 .frag-row { border-radius: 8px; background: var(--surface); border-color: var(--border); }
@@ -245,7 +247,8 @@ button.chip:hover { border-color: var(--accent); }
 .seg button:last-child { border-right: 0; }
 .seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); box-shadow: none; }
 .seg button[data-d="unreviewed"][aria-pressed="true"] { background: transparent; color: var(--text-3); }
-#cand-comment { flex: 1; min-width: 120px; }
+.comment-field { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 160px; }
+#cand-comment { flex: 1; min-width: 0; height: 32px; resize: none; }
 .save-state { font-size: 12px; color: var(--text-3); white-space: nowrap; min-width: 110px; text-align: right; }
 .ws-empty { margin: 12px 16px; }
 .ws-empty h2 { margin-bottom: 6px; }
@@ -264,6 +267,17 @@ button.chip:hover { border-color: var(--accent); }
 dialog { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); padding: 0; width: min(620px, 92vw);
   box-shadow: 0 20px 60px #00000040; }
 dialog::backdrop { background: rgba(15, 23, 42, 0.35); }
+#note-editor { width: min(900px, calc(100vw - 32px)); height: min(640px, calc(100dvh - 32px));
+  min-width: min(360px, calc(100vw - 24px)); min-height: min(300px, calc(100dvh - 24px));
+  max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); resize: both; overflow: auto; padding: 16px; gap: 12px; }
+#note-editor[open] { display: flex; flex-direction: column; }
+#note-editor.maximized { width: calc(100vw - 24px); height: calc(100dvh - 24px); }
+.note-editor-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: none; }
+.note-editor-head > div { flex: 1; min-width: 180px; }
+.note-editor-head h2 { margin: 0 0 4px; }
+.note-editor-head p { margin: 0; overflow-wrap: anywhere; }
+#note-editor-text { flex: 1; min-height: 0; resize: none; padding: 12px; line-height: 1.6; }
+.note-editor-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; flex: none; font-size: 12px; }
 #palette input { width: 100%; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 14px 16px; font-size: 15px; outline: none; }
 #pal-list { list-style: none; margin: 0; padding: 6px; max-height: 60vh; overflow: auto; }
 #pal-list li { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; align-items: center; padding: 7px 10px; border-radius: 7px; cursor: pointer; font-size: 13px; }
@@ -288,5 +302,8 @@ dialog::backdrop { background: rgba(15, 23, 42, 0.35); }
   .ov-grid, .ws-grid { grid-template-columns: 1fr; }
   .top-actions #open-search, .top-actions #export { display: none; }
   .verdict { height: auto; flex-wrap: wrap; padding: 8px 16px; position: sticky; bottom: 0; }
+  .comment-field { flex-basis: 100%; }
+  .note-editor-head > div { flex-basis: 100%; }
+  #note-editor-maximize { margin-left: auto; }
   .hbar { grid-template-columns: 110px 1fr 36px; }
 }

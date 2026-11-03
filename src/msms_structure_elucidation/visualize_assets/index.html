@@ -108,8 +108,11 @@
         <div class="struct" id="struct"></div>
         <div id="cand-summary" class="cand-summary"></div>
         <div id="peak-info" class="peak-info"></div>
-        <label class="field">Fragment note
-          <textarea id="frag-note" rows="3" maxlength="2000" disabled placeholder="Select an annotated peak to comment on its fragment"></textarea></label>
+        <div class="field">
+          <div class="note-heading"><label for="frag-note">Fragment note</label>
+            <button id="expand-fragment-note" type="button" class="ghost" disabled aria-haspopup="dialog" aria-controls="note-editor">Expand</button></div>
+          <textarea id="frag-note" rows="3" maxlength="2000" disabled placeholder="Select an annotated peak to comment on its fragment"></textarea>
+        </div>
         <div class="card-head spaced"><h3>Strongest predicted fragments</h3></div>
         <div id="frag-list" class="frag-list"></div>
       </aside>
@@ -124,11 +127,23 @@
         <button type="button" data-d="reject"><span class="ico reject" aria-hidden="true">✕</span>Reject <kbd>3</kbd></button>
         <button type="button" data-d="unreviewed">Clear <kbd>0</kbd></button>
       </div>
-      <input id="cand-comment" type="text" maxlength="2000" placeholder="Comment on this candidate…" aria-label="Candidate comment">
+      <div class="comment-field">
+        <textarea id="cand-comment" rows="1" maxlength="2000" placeholder="Comment on this candidate…" aria-label="Candidate comment"></textarea>
+        <button id="expand-candidate-comment" type="button" class="ghost" aria-haspopup="dialog" aria-controls="note-editor">Expand</button>
+      </div>
       <span id="save-state" class="save-state" role="status"></span>
     </div>
   </main>
 
+  <dialog id="note-editor" aria-labelledby="note-editor-title">
+    <div class="note-editor-head">
+      <div><h2 id="note-editor-title">Candidate comment</h2><p id="note-editor-context" class="sub"></p></div>
+      <button id="note-editor-maximize" type="button" class="ghost" aria-pressed="false">Full screen</button>
+      <button id="note-editor-close" type="button">Close</button>
+    </div>
+    <textarea id="note-editor-text" maxlength="2000" aria-labelledby="note-editor-title" aria-describedby="note-editor-status"></textarea>
+    <div class="note-editor-foot"><span id="note-editor-status" role="status"></span><span class="sub"><kbd>Esc</kbd> closes</span></div>
+  </dialog>
   <dialog id="palette" aria-label="Search unknowns">
     <input id="pal-q" type="search" placeholder="Jump to an unknown: name, formula, m/z, SMILES" aria-label="Search unknowns">
     <ol id="pal-list"></ol>

@@ -1,6 +1,7 @@
 """Share raw candidate predictions across features; never cache experimental scores."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -23,6 +24,48 @@ def cache_root(configured: str | None = None) -> Path:
 
 def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def _raw_adapter_source(worker_path: Path) -> str:
+    """Fingerprint raw generation conservatively, excluding only stepped scoring and identity bookkeeping."""
+    tree = ast.parse(worker_path.read_text(encoding='utf-8'))
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name == '_scoring_prediction':
+            node.body = [ast.Pass()]
+        elif node.name == '_model_predictions':
+            node.body = [statement for statement in node.body if not (
+                isinstance(statement, ast.Import) and all(alias.name == 'hashlib' for alias in statement.names)
+                or isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Subscript)
+                and isinstance(statement.targets[0].value, ast.Name)
+                and statement.targets[0].value.id == 'identity'
+                and isinstance(statement.targets[0].slice, ast.Constant)
+                and statement.targets[0].slice.value == 'adapter_sha256')]
+
+    def canonical(node) -> object:
+        if isinstance(node, ast.AST):
+            # Python 3.12 adds empty type_params fields to ordinary function definitions.
+            return [type(node).__name__, [(key, canonical(value)) for key, value in ast.iter_fields(node)
+                                         if key != 'type_params' or value]]
+        if isinstance(node, list):
+            return [canonical(value) for value in node]
+        return node
+
+    return digest({'worker': canonical(tree), 'adapters': {
+        name: hashlib.sha256(worker_path.with_name(name).read_bytes()).hexdigest()
+        for name in ('glacier.py', 'iceberg.py')}})
+
+
+def adapter_fingerprint(worker_path: Path) -> str:
+    """Keep compatible raw spectra when only stepped scoring changes."""
+    source = _raw_adapter_source(worker_path)
+    # This exact raw source previously used the whole-file fingerprint. Preserve
+    # that namespace only for the verified source; other generation changes miss.
+    if source == '528de0a3baec3e786eaf35074a62a3373259c3dd63004cab2d13cb2a6de671f2':
+        return '9410f95c968745fc30145fef606e2ffaaab66b094977d18931a4a18f0545382e'
+    return digest({'raw_adapter_schema': 2, 'source_sha256': source})
 
 
 @contextmanager

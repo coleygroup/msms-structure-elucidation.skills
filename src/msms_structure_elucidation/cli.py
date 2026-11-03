@@ -1078,6 +1078,12 @@ def main(argv=None):
     generator.add_argument('--iceberg-inten-ckpt')
     generator.add_argument('--num-rounds', type=int, default=0)
     generator.add_argument('--top-k', type=int, default=10)
+    cpu_plan = sub.add_parser('plan-cpu', help='plan CPU feature concurrency from explicit core/RAM budgets; read-only')
+    cpu_plan.add_argument('--cpu-budget', type=float, required=True, help='cores available to CPU feature parents after headroom')
+    cpu_plan.add_argument('--memory-budget-gb', type=float, required=True, help='GiB available to all resident CPU parents')
+    cpu_plan.add_argument('--cpus-per-job', type=float, required=True, help='cores used or reserved by each feature job')
+    cpu_plan.add_argument('--memory-per-job-gb', type=float, required=True, help='measured peak GiB per parent plus headroom')
+    cpu_plan.add_argument('--max-jobs', type=int, help='optional explicit resident-job cap')
     installer = sub.add_parser('setup', help='probe this or a remote host, tune model inference, save configs/local.yaml')
     installer.add_argument('--ms-pred-python', help='interpreter with ms_pred for the benchmark')
     installer.add_argument('--ms-pred-dir', help='ms-pred checkout; saved to configs/local.yaml')
@@ -1147,6 +1153,11 @@ def main(argv=None):
         prediction_parser.add_argument('--sparse-k', type=int, help='GLACIER peaks retained per predicted spectrum')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'plan-cpu':
+            from msms_structure_elucidation.mcp.cpu import plan_concurrency
+            print(json.dumps(plan_concurrency(args.cpu_budget, args.memory_budget_gb, args.cpus_per_job,
+                                             args.memory_per_job_gb, args.max_jobs), indent=2))
+            return 0
         if args.command == 'setup-pool':
             from msms_structure_elucidation.hostsetup import setup_pool
             print(json.dumps(setup_pool(args.servers, not args.no_probe), indent=2))

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from stat import S_ISREG
 import sys
 import tempfile
 
@@ -139,7 +140,11 @@ def artifact(root: Path, value: str) -> Path:
 
 def readable(root: Path, value: str, *, json_file: bool = False):
     path = artifact(root, value)
-    if not path.is_file() or not path.stat().st_size:
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        raise ValueError(f'Missing or empty artifact: {path}') from None
+    if not S_ISREG(metadata.st_mode) or not metadata.st_size:
         raise ValueError(f'Missing or empty artifact: {path}')
     if json_file:
         return read_json(path)
@@ -148,14 +153,18 @@ def readable(root: Path, value: str, *, json_file: bool = False):
     return path
 
 
-def evidence(root: Path, record: dict) -> None:
+def evidence(root: Path, record: dict, *, checked: set[Path] | None = None) -> None:
     if not isinstance(record.get('reason'), str) or not record['reason'].strip():
         raise ValueError('Record a reason and its supporting evidence.')
     paths = record.get('evidence')
     if not isinstance(paths, list) or not paths:
         raise ValueError('At least one evidence artifact is required.')
     for path in paths:
-        readable(root, path)
+        target = artifact(root, path)
+        if checked is None or target not in checked:
+            readable(root, path)
+            if checked is not None:
+                checked.add(target)
 
 
 def review_result(root: Path, feature_id: str, feature: dict) -> dict:
@@ -201,14 +210,14 @@ def review_result(root: Path, feature_id: str, feature: dict) -> dict:
     return review
 
 
-def route_issues(root: Path, feature: dict, review: dict) -> list[str]:
+def route_issues(root: Path, feature: dict, review: dict, *, checked: set[Path] | None = None) -> list[str]:
     route = feature.get('denovo', {})
     needed = review['weak_evidence'] or review['important_unexplained_peaks']
     if not needed and not route:
         return []
     if route.get('choice') not in ROUTES or route.get('source') != 'user':
         return ['Record the user-selected de novo route: agent, frigid, both or skip.']
-    evidence(root, route)
+    evidence(root, route, checked=checked)
     selected = ('agent', 'frigid') if route['choice'] == 'both' else (route['choice'],)
     issues = []
     for name in selected:
@@ -249,11 +258,21 @@ def feature_signature(root: Path, feature: dict) -> str:
     return hashlib.sha256(json.dumps([feature, stamps], sort_keys=True).encode()).hexdigest()
 
 
-def inspect_state(path: Path, *, force: bool = False) -> dict:
-    """Return actionable issues without model/network calls; cache unchanged reviews."""
+def inspect_state(path: Path, *, force: bool = False, stop_on_issue: bool = False) -> dict:
+    """Validate fully for check/finish; Stop may return the first proven blocking issue."""
     data = read_json(path)
     root = Path(data['project_root'])
     issues = []
+    checked: set[Path] = set()
+    status = data.get('status')
+    # Scoped holds require the complete issue set to establish what may stop.
+    short = stop_on_issue and not force and status in {'active', 'completed', 'completed_with_failures'}
+
+    def summary(allow_stop: bool = False, *, inspection_complete: bool = False) -> dict:
+        return {'run_id': data['run_id'], 'status': status, 'allow_stop': allow_stop,
+                'complete': not issues, 'inspection_complete': inspection_complete, 'issues': issues,
+                'outcomes': dict(Counter(item.get('outcome', 'pending') for item in data['features'].values()))}
+
     cache_path = path.with_name('validation_cache.json')
     validator_hash = sha256(Path(__file__))
     try:
@@ -282,50 +301,60 @@ def inspect_state(path: Path, *, force: bool = False) -> dict:
         add('request', 'Feature accounting or analysis identity differs from the registered request.')
     if request.get('feature_manifest') and sha256(artifact(root, request['feature_manifest'])) != request['feature_manifest_sha256']:
         add('request', 'Feature manifest changed after the requested feature set was frozen.')
+    if short and issues:
+        return summary()
     for name in PREREQUISITES:
         record = data.get('prerequisites', {}).get(name, {})
         try:
             if record.get('status') not in {'done', 'not_applicable'}:
                 raise ValueError('Resolve this prerequisite and record its evidence.')
-            evidence(root, record)
+            evidence(root, record, checked=checked)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             add('prerequisite', f'{name}: {exc}')
+        if short and issues:
+            return summary()
 
     active_jobs = False
     if not isinstance(data.get('jobs'), list):
         raise ValueError('jobs must be a list of registered job receipts.')
     for job in data['jobs']:
         try:
-            status = readable(root, job.get('status_path', ''), json_file=True)
-            state = status.get('state')
+            job_status = readable(root, job.get('status_path', ''), json_file=True)
+            state = job_status.get('state')
             if state in ACTIVE_JOBS:
                 active_jobs = True
                 raise ValueError(f'{state}; keep polling and review available features.')
-            if state not in TERMINAL_JOBS or not status.get('finished'):
+            if state not in TERMINAL_JOBS or not job_status.get('finished'):
                 raise ValueError('Missing terminal job state and finish time.')
-            if type(status.get('exit_code')) is not int:
+            if type(job_status.get('exit_code')) is not int:
                 raise ValueError('Missing verified exit_code in terminal job receipt.')
-            if state == 'done' and status['exit_code'] != 0:
+            if state == 'done' and job_status['exit_code'] != 0:
                 raise ValueError('Successful job receipt has a nonzero exit code.')
             if state in {'failed', 'cancelled'}:
-                evidence(root, job)
+                evidence(root, job, checked=checked)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             add('job', f'{job.get("job_id", "unnamed job")}: {exc}', job_id=job.get('job_id'))
+        if short and issues:
+            return summary()
 
     ready_reviews = False
     for feature_id, feature in data['features'].items():
         outcome = feature.get('outcome')
         if outcome not in OUTCOMES:
             add('feature', f'Feature outcome is {outcome!r}; finish or account for it.', feature_id)
+            if short:
+                return summary()
             # A published result must be reviewed even if the state still says pending.
             if feature.get('result') and artifact(root, feature['result']).is_file():
                 ready_reviews = True
             continue
         if outcome in {'excluded', 'failed'}:
             try:
-                evidence(root, feature)
+                evidence(root, feature, checked=checked)
             except (OSError, ValueError, TypeError, AttributeError) as exc:
                 add('feature', str(exc), feature_id)
+            if short and issues:
+                return summary()
             continue
         try:
             signature = feature_signature(root, feature)
@@ -336,20 +365,24 @@ def inspect_state(path: Path, *, force: bool = False) -> dict:
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             ready_reviews = True
             add('review', str(exc), feature_id)
+            if short:
+                return summary()
             continue
         try:
-            route_problems = route_issues(root, feature, review)
+            route_problems = route_issues(root, feature, review, checked=checked)
             for detail in route_problems:
                 add('route', detail, feature_id)
             if not route_problems:
                 next_cache[feature_id] = signature
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             add('route', str(exc), feature_id)
+        if short and issues:
+            return summary()
 
     report = data.get('report', {})
     try:
         if report.get('required') is False:
-            evidence(root, report)
+            evidence(root, report, checked=checked)
         elif report.get('required') is True:
             page = readable(root, report.get('path', ''))
             with page.open(encoding='utf-8') as file:
@@ -364,16 +397,15 @@ def inspect_state(path: Path, *, force: bool = False) -> dict:
     except (OSError, ValueError, TypeError) as exc:
         add('assessment', str(exc))
 
-    status = data.get('status')
     allow_stop = not issues
     hold = data.get('hold', {})
     if status == 'paused':
-        evidence(root, hold)
+        evidence(root, hold, checked=checked)
         if hold.get('source') != 'user':
             raise ValueError('A pause requires an explicit user instruction.')
         allow_stop = True
     elif status in {'awaiting_user', 'blocked'}:
-        evidence(root, hold)
+        evidence(root, hold, checked=checked)
         held_features = set(hold.get('feature_ids', []))
         held_prerequisites = set(hold.get('prerequisites', []))
         held_jobs = set(hold.get('job_ids', []))
@@ -390,9 +422,7 @@ def inspect_state(path: Path, *, force: bool = False) -> dict:
         raise ValueError(f'Unknown analysis status: {status!r}')
     if next_cache != cache:
         write_json(cache_path, {'validator_sha256': validator_hash, 'features': next_cache})
-    return {'run_id': data['run_id'], 'status': status, 'allow_stop': allow_stop,
-            'complete': not issues, 'issues': issues,
-            'outcomes': dict(Counter(item.get('outcome', 'pending') for item in data['features'].values()))}
+    return summary(allow_stop, inspection_complete=True)
 
 
 def hook(payload: dict, root: Path) -> dict:
@@ -432,7 +462,7 @@ def hook(payload: dict, root: Path) -> dict:
             data = read_json(path)
             if data.get('session_id') != session_id:
                 raise ValueError('Stored session ID does not match the owning directory.')
-            result = inspect_state(path)
+            result = inspect_state(path, stop_on_issue=True)
             if result['complete'] and result['status'] not in {'completed', 'completed_with_failures', 'paused'}:
                 result['allow_stop'] = False
                 result['issues'].append({'kind': 'finalize', 'detail':
@@ -490,7 +520,7 @@ def parser() -> argparse.ArgumentParser:
     handler.add_argument('--project-dir')
     installer = commands.add_parser('install', help='merge hooks into both clients in a project')
     installer.add_argument('--project-dir', default='.')
-    installer.add_argument('--command', default='msms-workflow-guard hook',
+    installer.add_argument('--command', dest='hook_command', default='msms-workflow-guard hook',
                            help='hook command; default requires this executable on the client PATH')
     starter = commands.add_parser('start', help='register an analysis before launching it')
     starter.add_argument('--project-dir', default='.')
@@ -525,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(hook(payload, root)))
             return 0
         if args.command == 'install':
-            print(json.dumps({'installed': install(Path(args.project_dir).resolve(), args.command)}, indent=2))
+            print(json.dumps({'installed': install(Path(args.project_dir).resolve(), args.hook_command)}, indent=2))
             return 0
         if args.command == 'start':
             root = project_root(args.project_dir)
