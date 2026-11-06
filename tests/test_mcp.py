@@ -165,6 +165,40 @@ class LocalBackendTest(unittest.TestCase):
 
 
 class SlurmTest(unittest.TestCase):
+    def test_scheduler_tick_batches_accounting_and_reads_active_queue_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(Path(tmp))
+            for n in range(40):
+                job, _ = store.create('prepare_feature_list', {'n': n}, kind='cpu')
+                store.set_launch(job, backend='slurm', slurm_job_id=str(1000+n))
+                store.set_status(job, 'running')
+            backend = backends.SlurmBackend(store, {'mcp': {}})
+            responses = [SimpleNamespace(returncode=0,stdout=''.join(f'{1000+n}|RUNNING|\n' for n in range(20)),stderr=''),
+                         SimpleNamespace(returncode=0,stdout=''.join(f'{1000+n}|PENDING\n' for n in range(20,40)),stderr='')]
+            with patch.object(backends.subprocess, 'run', side_effect=responses) as query, \
+                    patch.object(store, 'active', wraps=store.active) as active:
+                backend.pump()
+            self.assertEqual(query.call_count, 2)
+            self.assertEqual(active.call_count, 1)
+            self.assertIsNone(backend._poll_states)
+
+    def test_task_specific_cpu_route_preserves_default_gpu_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(Path(tmp))
+            job, _ = store.create('prepare_feature_list', {}, kind='cpu')
+            config = {'mcp': {'slurm': {'partition': 'gpu-partition', 'gpus': 1},
+                'task_slurm': {'prepare_feature_list': {'partition': 'cpu-partition', 'gpus': None,
+                    'cpus_per_task': 2, 'extra_args': ['--constraint=compatible-os']}}}}
+            backend = backends.SlurmBackend(store, config)
+            with patch.object(backends.subprocess, 'run', return_value=SimpleNamespace(
+                    returncode=0,stdout='1234\n',stderr='')) as submit:
+                backend.submit(job)
+            command = submit.call_args.args[0]
+            self.assertIn('--partition=cpu-partition', command)
+            self.assertIn('--constraint=compatible-os', command)
+            self.assertFalse(any(part.startswith('--gpus=') for part in command))
+            self.assertEqual(backend.slurm['partition'], 'gpu-partition')
+
     def test_sbatch_options_contain_only_configured_keys(self):
         options, script = backends.sbatch_script({'partition': None, 'gpus': None, 'setup': []}, 'gpu', ['py', '-m', 'x'])
         self.assertEqual(options, [])

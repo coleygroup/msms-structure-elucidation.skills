@@ -18,7 +18,7 @@ Load specialized instructions as their work becomes relevant:
 
 - Input preparation: [msms-feature-detect](../msms-feature-detect/SKILL.md), [msms-inspect](../msms-inspect/SKILL.md) or [msms-preprocess](../msms-preprocess/SKILL.md), under the workflow's conditions.
 - Candidate search and prediction: [msms-atlas-retrieval](../msms-atlas-retrieval/SKILL.md) and [msms-predict](../msms-predict/SKILL.md), using the confirmed model and the workflow's formula/search policy.
-- Every stable result: [msms-evidence-review](../msms-evidence-review/SKILL.md), including strong matches and no-candidate outcomes. Review incrementally while monitoring remaining jobs.
+- Every stable result: [msms-evidence-review](../msms-evidence-review/SKILL.md), including strong matches and no-candidate outcomes. Continuously refill available review slots from its ready-feature queue while monitoring remaining jobs; keep deeper follow-ups separate from initial review coverage.
 - Optional routes selected by the user: [msms-structure-proposal](../msms-structure-proposal/SKILL.md), or [msms-subformulae](../msms-subformulae/SKILL.md) followed by [msms-denovo](../msms-denovo/SKILL.md). Follow the workflow's selection requirements, score generated candidates and review the new evidence.
 - Presentation: [msms-visualize](../msms-visualize/SKILL.md), combining multiple unknowns in one report and preserving saved annotations.
 

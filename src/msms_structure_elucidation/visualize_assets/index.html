@@ -17,6 +17,7 @@
     </a>
     <div class="top-actions">
       <button id="open-search" class="ghost" type="button" title="Search unknowns">Search unknowns <kbd>/</kbd></button>
+      <button id="download-smiles" class="ghost" type="button" disabled aria-label="Download SMILES CSV" title="Download the top 10 ranked SMILES and similarities for every unknown, including filtered unknowns"><span class="download-label">Download SMILES </span>CSV</button>
       <button id="export" class="ghost" type="button" title="Write one self-contained read-only HTML report">Export report</button>
       <button id="theme" class="ghost icon" type="button" aria-label="Toggle light or dark theme" title="Theme">◐</button>
       <button id="help" class="ghost icon" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts">?</button>
@@ -26,6 +27,15 @@
 
   <main id="overview" hidden>
     <p class="notice" id="demo-note" hidden><b>Demo only:</b> the review controls (Keep, Uncertain, Reject, candidate comments and fragment notes) work here so you can try them, but reviews are saved only in this browser. They are not shared with anyone and are not added to the analysis.</p>
+    <section class="card" aria-label="Spectrum quality filter">
+      <div class="qc-controls">
+        <label class="inline"><input id="f-qc" type="checkbox" checked> Spectrum QC</label>
+        <label class="inline">At least <input id="f-qc-n" type="number" min="1" step="1" value="5" required aria-label="Minimum QC peaks"> peaks</label>
+        <label class="inline">with intensity ≥ <input id="f-qc-m" type="number" min="0" max="100" step="any" value="10" required aria-label="Minimum intensity percent"> % of base peak</label>
+        <span class="sub" id="qc-count" role="status"></span>
+      </div>
+      <p class="hint">Uses all experimental energies merged within 20 ppm. Precursor peaks (±20 ppm) are excluded before finding the base peak. Turn off Spectrum QC to show every unknown.</p>
+    </section>
     <section class="kpis" id="kpis" aria-label="Summary"></section>
     <section class="ov-grid">
       <div class="card">
@@ -60,12 +70,18 @@
         <table id="ov-table">
           <thead><tr>
             <th data-k="label">Unknown</th><th data-k="parentmass" class="num">m/z</th><th data-k="rt_min" class="num">RT (min)</th>
-            <th data-k="formula">Formula</th><th data-k="outcome">Outcome</th><th>Rank-1 structure</th>
+            <th data-k="formula">Formula</th><th data-k="qc_peaks" class="num">QC peaks</th><th data-k="outcome">Outcome</th><th>Rank-1 structure</th>
             <th data-k="top_similarity" class="num">Similarity</th><th data-k="top_explained" class="num">Explained</th><th data-k="verdict">Review</th>
           </tr></thead>
           <tbody></tbody>
         </table>
       </div>
+      <nav class="pagination" id="ov-pagination" aria-label="Unknown pages" hidden>
+        <span id="ov-page-info" class="sub" role="status"></span>
+        <button id="ov-prev" type="button" class="ghost">Previous</button>
+        <label class="inline">Page <select id="ov-page" aria-label="Unknown page"></select></label>
+        <button id="ov-next" type="button" class="ghost">Next</button>
+      </nav>
     </section>
   </main>
 
@@ -100,7 +116,7 @@
             </div>
           </div>
           <div id="plots"></div>
-          <p class="hint">Drag across the plot to zoom · double-click to reset · click a peak to inspect its fragment · <kbd>←</kbd><kbd>→</kbd> step through annotated peaks</p>
+          <p class="hint" id="plot-hint">Drag across the plot to zoom · double-click to reset · click a peak to inspect its fragment · <kbd>←</kbd><kbd>→</kbd> step through annotated peaks</p>
         </div>
         <div class="card" id="evidence"></div>
       </section>
@@ -109,15 +125,16 @@
         <div id="cand-summary" class="cand-summary"></div>
         <div id="peak-info" class="peak-info"></div>
         <div class="field">
-          <div class="note-heading"><label for="frag-note">Fragment note</label>
-            <button id="expand-fragment-note" type="button" class="ghost" disabled aria-haspopup="dialog" aria-controls="note-editor">Expand</button></div>
-          <textarea id="frag-note" rows="3" maxlength="2000" disabled placeholder="Select an annotated peak to comment on its fragment"></textarea>
+          <label for="frag-note">Fragment note</label>
+          <div class="note-input">
+            <textarea id="frag-note" rows="3" maxlength="2000" disabled placeholder="Select an annotated peak to comment on its fragment"></textarea>
+            <button id="expand-fragment-note" type="button" class="ghost expand-note" disabled aria-label="Expand fragment note" title="Expand fragment note" aria-haspopup="dialog" aria-controls="note-editor"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M4 14v6h6M20 4 4 20"/></svg></button>
+          </div>
         </div>
         <div class="card-head spaced"><h3>Strongest predicted fragments</h3></div>
         <div id="frag-list" class="frag-list"></div>
       </aside>
     </div>
-    <div class="ws-empty card" id="ws-empty" hidden></div>
     <div class="verdict" id="verdict">
       <span class="chip demo" id="demo-chip" hidden title="Reviews here are a demo: they stay in this browser and are not shared or added to the analysis.">Demo only</span>
       <span class="vlabel">Verdict for <b id="v-rank"></b></span>
@@ -127,9 +144,9 @@
         <button type="button" data-d="reject"><span class="ico reject" aria-hidden="true">✕</span>Reject <kbd>3</kbd></button>
         <button type="button" data-d="unreviewed">Clear <kbd>0</kbd></button>
       </div>
-      <div class="comment-field">
+      <div class="comment-field note-input">
         <textarea id="cand-comment" rows="1" maxlength="2000" placeholder="Comment on this candidate…" aria-label="Candidate comment"></textarea>
-        <button id="expand-candidate-comment" type="button" class="ghost" aria-haspopup="dialog" aria-controls="note-editor">Expand</button>
+        <button id="expand-candidate-comment" type="button" class="ghost expand-note" aria-label="Expand candidate comment" title="Expand candidate comment" aria-haspopup="dialog" aria-controls="note-editor"><svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M4 14v6h6M20 4 4 20"/></svg></button>
       </div>
       <span id="save-state" class="save-state" role="status"></span>
     </div>

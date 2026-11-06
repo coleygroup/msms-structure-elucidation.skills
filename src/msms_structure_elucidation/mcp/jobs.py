@@ -21,6 +21,8 @@ from msms_structure_elucidation.prediction_cache import file_lock
 
 ACTIVE = ('queued', 'submitted', 'running')
 FINISHED = ('done', 'failed', 'cancelled')
+WORKER_OWNED_TASKS = frozenset({'score_prepared_feature','publish_prediction_group','build_prediction_group'})
+VIRTUAL_BACKENDS = frozenset({'feature-pipeline','feature-worker','cpu-worker'})
 _JOB_ID = re.compile(r'^[a-z_]+-[0-9a-f]{16}$')
 
 
@@ -90,7 +92,8 @@ class JobStore:
             write_json(path / 'status.json', {'state': initial_state, 'updated': now()})
             # Publish the request last: schedulers discover jobs through request.json.
             write_json(path / 'request.json', {'task': task, 'kind': kind, 'params': params,
-                                             'created': now(), 'attempt': uuid.uuid4().hex})
+                                             'created': now(), 'attempt': uuid.uuid4().hex, 'index_version': 1,
+                                             'config_identity': (config or {}).get('_config_digest')})
             self._index(job_id, initial_state)
             self._index_parent(job_id, params.get('_parent_job'))
         return job_id, False
@@ -106,8 +109,10 @@ class JobStore:
         else:
             marker.unlink(missing_ok=True)
 
-    def active(self) -> list[dict]:
-        """Read live jobs only, importing an older store once on first use."""
+    def active(self, exclude_tasks: set[str] | None = None,
+               include_jobs: set[str] | None = None) -> list[dict]:
+        """Read selected live jobs, filtering task markers before opening their files."""
+        excluded, included = exclude_tasks or set(), include_jobs or set()
         ready = self.root / 'active-index-ready.json'
         if not ready.exists():
             with file_lock(self.root / 'active-index.lock'):
@@ -118,23 +123,49 @@ class JobStore:
                         request = self.request(row['job_id'])
                         self._index_parent(row['job_id'], request['params'].get('_parent_job'))
                         if row['state'] == 'done' and self.status(row['job_id']).get('remote_cleanup_pending'):
-                            folder = self.root / 'cleanup-pending'
-                            folder.mkdir(exist_ok=True)
-                            (folder / row['job_id']).touch()
+                            self._index_cleanup(row['job_id'],self.status(row['job_id']))
                     write_json(ready, {'version': 1})
         rows = []
         for marker in (self.root / 'active').glob('*'):
+            if marker.name.rsplit('-',1)[0] in excluded and marker.name not in included:
+                continue
             folder = self.root / marker.name
             request = self.request(marker.name) if (folder / 'request.json').is_file() else None
             status = read_json(folder / 'status.json')
             if request and status and (status['state'] in ACTIVE or self.scheduler_pending(marker.name, status)):
                 rows.append({'job_id': marker.name, 'task': request['task'], 'kind': request.get('kind', 'gpu'),
                              'created': request.get('created'), **status})
+                if request.get('kind') == 'pipeline' and not request.get('index_version'):
+                    # Old running parents publish new children without maintaining the
+                    # index. Their compact phase record is sufficient during a rollout.
+                    for child in status.get('prediction_jobs', []):
+                        folder = self.root / child
+                        if not (folder / 'request.json').is_file():
+                            continue
+                        child_status = self.status(child)
+                        self._index_parent(child, marker.name)
+                        self._index(child, child_status['state'], self.scheduler_pending(child, child_status))
             elif request and status:
                 marker.unlink(missing_ok=True)
             elif not folder.exists():
                 marker.unlink(missing_ok=True)
+        known = {row['job_id'] for row in rows}
+        for marker in (self.root / 'active').glob('*'):
+            if marker.name.rsplit('-',1)[0] in excluded and marker.name not in included:
+                continue
+            if marker.name not in known and (self.root / marker.name / 'request.json').is_file():
+                request, status = self.request(marker.name), self.status(marker.name)
+                if status['state'] in ACTIVE or self.scheduler_pending(marker.name, status):
+                    rows.append({'job_id': marker.name, 'task': request['task'], 'kind': request.get('kind', 'gpu'),
+                                 'created': request.get('created'), **status})
         return rows
+
+    def has_active(self) -> bool:
+        """Keep execution or acknowledged-cleanup work alive without decoding requests."""
+        if not (self.root/'active-index-ready.json').is_file():
+            self.active()
+        return any(folder.is_dir() and next(folder.iterdir(),None) is not None
+                   for folder in (self.root/name for name in ('active','worker-cleanup-pending','cleanup-pending')))
 
     def scheduler_pending(self, job_id: str, status: dict | None = None) -> bool:
         """Keep runner results visible until Slurm/Kubernetes confirms successful termination."""
@@ -146,7 +177,19 @@ class JobStore:
         return read_json(self.path(job_id) / 'request.json')
 
     def status(self, job_id: str) -> dict:
-        return read_json(self.path(job_id) / 'status.json', {'state': 'queued'})
+        status = read_json(self.path(job_id) / 'status.json', {'state': 'queued'})
+        self._index_cleanup(job_id,status)
+        return status
+
+    def _index_cleanup(self, job_id: str, status: dict) -> None:
+        """Recover cleanup indexes from durable flags, including migrated closed jobs."""
+        if status.get('state')=='done' and status.get('remote_cleanup_pending'):
+            name = 'worker-cleanup-pending' if self.launch(job_id).get('backend')=='feature-worker' else 'cleanup-pending'
+            folder = self.root/name
+            folder.mkdir(exist_ok=True)
+            marker = folder/job_id
+            if not marker.exists():
+                marker.touch(exist_ok=True)
 
     def set_status(self, job_id: str, state: str, **extra) -> dict:
         path = self.path(job_id) / 'status.json'
@@ -159,6 +202,7 @@ class JobStore:
             status = {**previous, **extra, 'state': state, 'updated': now()}
             write_json(path, status)
             self._index(job_id, state, self.scheduler_pending(job_id, status))
+            self._index_cleanup(job_id,status)
             return status
 
     def set_phase(self, job_id: str, phase: str, **extra) -> dict:

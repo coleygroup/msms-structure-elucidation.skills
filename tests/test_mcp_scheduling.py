@@ -11,8 +11,90 @@ from pathlib import Path
 from unittest.mock import patch
 
 from msms_structure_elucidation.mcp import backends, pipeline
-from msms_structure_elucidation.mcp.admission import Admission
+from msms_structure_elucidation.mcp.admission import Admission, request_window
 from msms_structure_elucidation.mcp.jobs import JobStore, write_json
+
+
+class BackendIsolationTests(unittest.TestCase):
+    def test_automatic_cpu_budget_resolves_explicit_stages_on_each_backend(self):
+        from msms_structure_elucidation.mcp.cpu_pool import stage_defaults
+        gpu_info = [{'index': i} for i in range(8)]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(backends.hostprobe, 'gpus', return_value=gpu_info):
+            for name in ('local', 'slurm', 'kubernetes'):
+                with self.subTest(backend=name):
+                    config = {'mcp': {'backend': name, 'max_concurrent_jobs': 8, 'feature_pipeline': True,
+                        'feature_cpu_workers': 1, **stage_defaults(8), 'kubernetes': {'shared_workspace': True}}}
+                    backend = backends.make_backend(name, JobStore(Path(tmp)/name), config)
+                    self.assertGreaterEqual(backend.core.max_live_pipelines, 28)
+                    if name == 'local':
+                        self.assertEqual(backend.core.max_cpu_jobs, 28)
+                        fields = backend.describe()['feature_pipeline']
+                        self.assertEqual((fields['preparation_workers'], fields['scoring_workers'],
+                                          fields['cpu_workers']), (16,4,20))
+                    backend.close()
+
+    def test_single_backend_does_not_import_fleet_or_kubernetes(self):
+        unavailable = {f'msms_structure_elucidation.mcp.{name}': None
+                       for name in ('fleet', 'kubernetes')}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, unavailable), \
+                patch.object(backends.hostprobe, 'gpus', return_value=[]):
+            for name in ('local', 'slurm'):
+                config = {'mcp': {'backend': name, 'feature_pipeline': False}}
+                store = JobStore(Path(tmp) / name)
+                backend = backends.make_backend(name, store, config)
+                self.assertEqual(backend.name, name)
+                self.assertFalse(hasattr(backend, 'network'))
+
+    def test_local_feature_pipeline_needs_no_pool_adapter(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules, {
+                'msms_structure_elucidation.mcp.fleet': None,
+                'msms_structure_elucidation.mcp.kubernetes': None}), \
+                patch.object(backends.hostprobe, 'gpus', return_value=[]):
+            config = {'mcp': {'backend': 'local', 'feature_pipeline': True}}
+            backend = backends.make_backend('local', JobStore(Path(tmp)), config)
+            self.assertEqual(backend.core.name, 'local')
+            backend.close()
+
+
+class RequestWindowTests(unittest.TestCase):
+    def test_completed_delivery_does_not_occupy_execution_capacity(self):
+        rows = [{'state':'done', 'remote_cleanup_pending':True} for _ in range(600)]
+        rows += [{'state':'running', 'phase':'cpu_scoring'} for _ in range(300)]
+        window = request_window(rows, 1024, 2048)
+        self.assertEqual(window['execution_pending'], 0)
+        self.assertEqual(window['postprediction_pending'], 300)
+        self.assertEqual(window['delivery_pending'], 600)
+        self.assertEqual(window['admission_slots'], 1024)
+        self.assertIsNone(window['hold'])
+
+    def test_delivery_has_its_own_bounded_backlog(self):
+        window = request_window([{'state':'done'}] * 4, 8, 4)
+        self.assertEqual(window['admission_slots'], 0)
+        self.assertEqual(window['hold'], 'delivery_backlog_limit')
+
+    def test_scoring_waiters_and_output_work_have_their_own_budget(self):
+        rows = [{'state':'running','phase':'waiting_cpu','worker_status':{'scoring_job':'score-1'}}] * 600
+        rows += [{'state':'running','phase':'waiting_output'}] * 40
+        rows += [{'state':'running','phase':'waiting_cpu'}] * 100
+        window = request_window(rows,1024,2048)
+        self.assertEqual(window['execution_pending'],100)
+        self.assertEqual(window['postprediction_pending'],640)
+        self.assertEqual(window['admission_slots'],924)
+        held = request_window(rows,1024,2048,postprediction_limit=640)
+        self.assertEqual(held['admission_slots'],0)
+        self.assertEqual(held['hold'],'postprediction_backlog_limit')
+
+    def test_confirmation_and_verification_remain_execution_requirements(self):
+        rows = [{'state':'done', 'awaiting_scheduler_confirmation':True},
+                {'state':'running', 'phase':'result_collection', 'worker_status':{'state':'done'}},
+                {'state':'running', 'phase':'result_collection', 'worker_status':None},
+                {'state':'failed'}, {'state':'done', 'published':True}]
+        window = request_window(rows, 3, 8)
+        self.assertEqual(window['execution_pending'], 2)
+        self.assertEqual(window['delivery_pending'], 2)
+        self.assertEqual(window['admission_slots'], 1)
+        with self.assertRaises(ValueError):
+            request_window([], 0, 8)
 
 
 class SchedulingTests(unittest.TestCase):
@@ -33,6 +115,12 @@ class SchedulingTests(unittest.TestCase):
 
     def parent(self, n):
         return self.store.create('score_candidates', {'feature': n}, kind='pipeline')[0]
+
+    def test_raw_local_scheduler_never_launches_cpu_service_children(self):
+        for task in ('publish_prediction_group','score_prepared_feature'):
+            self.store.create(task,{},kind='cpu')
+        self.backend.pump()
+        self.assertEqual(self.launched,[])
 
     def waiting(self, n, since):
         jid = self.parent(n)
@@ -91,6 +179,25 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(active.call_count, 1)
         self.assertEqual(len(self.launched), 1)
 
+    def test_resource_scheduler_skips_virtual_files_but_keeps_owned_legacy_jobs(self):
+        self.backend.exclude_tasks.add('elucidate_feature')
+        virtual=[]
+        for index in range(40):
+            job,_=self.store.create('elucidate_feature',{'index':index},kind='pipeline')
+            self.store.set_launch(job,backend='feature-pipeline');virtual.append(job)
+        legacy,_=self.store.create('elucidate_feature',{'index':'legacy'},kind='pipeline')
+        self.backend._launch(legacy,'')
+        self.backend.pump()
+        self.store.set_phase(legacy,'waiting_cpu')
+        original=self.store.request
+        def request(job):
+            self.assertNotIn(job,virtual,'Virtual requests must be filtered before their files are read')
+            return original(job)
+        with patch.object(self.store,'request',side_effect=request):
+            self.backend.pump()
+        self.assertEqual(self.store.status(legacy)['phase'],'cpu_scoring')
+        self.assertEqual([row['job_id'] for row in self.backend.queue_snapshot],[legacy])
+
     def test_mixed_legacy_timestamps_can_be_listed(self):
         a, b = self.parent(1), self.parent(2)
         write_json(self.store.path(a) / 'status.json', {'state': 'queued', 'updated': 1793632000.0})
@@ -107,6 +214,19 @@ class AdmissionTests(unittest.TestCase):
 
     def create(self, n):
         return self.store.create('search_pubchem_formulas', {'n': n, 'model': 'glacier'}, kind='pipeline')[0]
+
+    def test_old_generation_completion_does_not_verify_the_new_configuration(self):
+        old, _ = self.store.create('search_pubchem_formulas', {'n': 1}, kind='pipeline',
+                                   config={'_config_digest': 'old-environment'})
+        new, _ = self.store.create('search_pubchem_formulas', {'n': 2}, kind='pipeline',
+                                   config={'_config_digest': 'new-environment'})
+        self.store.set_status(old, 'done')
+        admission = Admission(self.store, {'_config_digest': 'new-environment'})
+        admission.record(old, 'done')
+        self.assertTrue(admission.admit(new))
+        scope = admission.scope(self.store.request(new), new)
+        self.assertNotIn('verified', admission.status()[scope])
+        self.assertEqual(admission.status()[scope]['canary'], new)
 
     def test_one_real_canary_precedes_bulk_admission(self):
         a, b = self.create(1), self.create(2)
@@ -151,6 +271,22 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(admission.admit(c))
         admission.record(c, 'failed', 'No module named pubchempy')
         self.assertFalse(admission.admit(self.create(4)))
+
+    def test_storage_exhaustion_holds_a_route_until_repair_is_recorded(self):
+        for index,message in enumerate(('Disk quota exceeded', '[Errno 28] No space left on device')):
+            with self.subTest(message=message):
+                admission = Admission(self.store, {'_config_digest': str(index)})
+                failed,_ = self.store.create('search_pubchem_formulas', {'storage_case': index}, kind='pipeline',
+                                            config={'_config_digest': str(index)})
+                waiting,_ = self.store.create('search_pubchem_formulas', {'storage_case': index+10}, kind='pipeline',
+                                             config={'_config_digest': str(index)})
+                self.assertTrue(admission.admit(failed))
+                admission.record(failed, 'failed', message)
+                self.assertFalse(admission.admit(waiting))
+                scope = admission.scope(self.store.request(failed), failed)
+                self.assertEqual(admission.status()[scope]['hold']['signature'], 'storage_capacity')
+                admission.resume(scope, 'Verified writable storage after cleanup')
+                self.assertTrue(admission.admit(waiting))
 
     def test_bulk_slurm_submission_stops_at_failed_production_canary(self):
         config = {'mcp': {'backend': 'slurm'}}

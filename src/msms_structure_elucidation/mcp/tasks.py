@@ -25,7 +25,9 @@ INLINE_SPECTRUM = 'spectrum.ms'
 # Pipeline tasks prepare and score on CPU; their internal inference jobs acquire GPUs separately.
 KINDS = {'predict_spectra': 'pipeline', 'score_candidates': 'pipeline', 'generate_structures_frigid': 'gpu',
          'predict_fingerprint_mist': 'gpu', 'retrieve_atlas': 'pipeline', 'search_pubchem_mass': 'pipeline',
-         'search_pubchem_formulas': 'pipeline', 'infer_formulas': 'cpu', 'model_inference': 'gpu'}
+         'search_pubchem_formulas': 'pipeline', 'infer_formulas': 'cpu', 'model_inference': 'gpu',
+         'elucidate_feature': 'pipeline', 'prepare_feature_list': 'cpu', 'score_prepared_feature': 'cpu',
+         'publish_prediction_list': 'cpu', 'publish_prediction_group': 'cpu', 'build_prediction_group':'cpu'}
 
 
 def _section(config: dict, name: str) -> dict:
@@ -50,6 +52,18 @@ def _interpreter(path: str | None, config: dict) -> str | None:
 
 def missing_assets(task: str, config: dict, model: str = 'iceberg', num_rounds: int = 0) -> list[str]:
     """Config keys this server still needs for a task; empty when the task can run."""
+    mcp = config.get('mcp',{})
+    if mcp.get('backend')=='pool' and mcp.get('feature_pipeline') and mcp.get('feature_placement','workers')=='workers':
+        from msms_structure_elucidation.mcp.workers import REMOTE_TASKS, request_contract
+        if task in REMOTE_TASKS:
+            selected = _section(config,'simulator').get('model','iceberg') if task=='infer_formulas' else model
+            eligible = [node for node in mcp.get('servers',{}).values() if node.get('enabled',True) and
+                        node.get('features') and selected in node.get('models',[])]
+            missing = [] if eligible else [f'mcp.servers: features-enabled {selected} worker']
+            identity = request_contract({'model':selected},config)
+            if not identity.get('weights') or not identity.get('source'):
+                missing.append(f'mcp.approved_model_identities.{selected} (or local approved model files)')
+            return missing
     sim, denovo = _section(config, 'simulator'), _section(config, 'denovo')
     missing = []
     if task in ('predict_spectra', 'score_candidates', 'search_pubchem_mass', 'search_pubchem_formulas'):
@@ -71,6 +85,25 @@ def missing_assets(task: str, config: dict, model: str = 'iceberg', num_rounds: 
 
 def _ms_pred_python(config: dict) -> str:
     return cli.model_python(_section(config, 'simulator').get('python') or None)
+
+
+def _scientific_call(command: list[str], config: dict, log, preparation: bool = False) -> dict:
+    """Run CPU science in its configured interpreter with the current package source."""
+    env = {**os.environ,'CUDA_VISIBLE_DEVICES':''}
+    if preparation:
+        env['MSMS_FEATURE_PREPARATION'] = '1'
+    native = asset(_section(config,'simulator').get('ms_pred_src'),config)
+    env['PYTHONPATH'] = str(Path(__file__).parents[2])+os.pathsep+env.get('PYTHONPATH','')
+    if native:
+        env['PYTHONPATH'] = str(Path(native)/'src')+os.pathsep+env['PYTHONPATH']
+    done = subprocess.run(command,env=env,stdout=subprocess.PIPE,stderr=log,text=True)
+    log.write(done.stdout);log.flush()
+    if done.returncode:
+        raise RuntimeError(f'Scientific CPU task exited {done.returncode}; inspect log.txt')
+    for line in reversed(done.stdout.splitlines()):
+        if line.startswith('RESULT_JSON='):
+            return json.loads(line.removeprefix('RESULT_JSON='))
+    raise RuntimeError('Scientific CPU task produced no result')
 
 
 def _simulator_options(config: dict, model: str, devices: str | None) -> dict:
@@ -117,6 +150,10 @@ def predict_spectra(params: dict, job_dir: Path, config: dict, devices: str | No
 
 
 def score_candidates(params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
+    native_score = config.get('_mcp_native_score',False)
+    if config.get('mcp',{}).get('feature_worker') and not native_score:
+        return _scientific_call([_ms_pred_python(config),'-m','msms_structure_elucidation.mcp.scoring',
+                                '--job',str(job_dir)],config,log)
     path = _spectrum(params, job_dir)
     data = inspect_ms(path, params['collision_unit'])
     python = _ms_pred_python(config)
@@ -129,18 +166,33 @@ def score_candidates(params: dict, job_dir: Path, config: dict, devices: str | N
     if formula:
         listing = job_dir / 'proposed.json'
         listing.write_text(json.dumps(smiles))
-        checked = cli.worker(python, 'validate', smiles_json=listing, formula=formula)
+        if native_score:
+            from msms_structure_elucidation.worker import validate_smiles
+            checked = validate_smiles(smiles,formula)
+        else:
+            checked = cli.worker(python, 'validate', smiles_json=listing, formula=formula)
         smiles = [row['smiles'] for row in checked if row['formula_match']]
         rejected = [row for row in checked if not row['formula_match']]
     if not smiles:
         return {**observed, 'status': 'no_candidates', 'formula': formula, 'candidates': [], 'rejected': rejected}
     listing = job_dir / 'smiles.json'
     listing.write_text(json.dumps(smiles))
-    candidates = cli.worker(python, 'simulate', spectrum=path, smiles_json=listing, formula=formula or '',
-        experimental_unit=params['collision_unit'], output_dir=job_dir, instrument=_instrument(params, data['metadata'], config),
-        top_k=params['top_k'], limit_images=True, **_simulator_options(config, params['model'], devices))
-    return {**observed, 'status': 'ranked' if candidates else 'no_candidates',
-            'formula': formula, 'candidates': candidates, 'rejected': rejected}
+    if native_score:
+        from msms_structure_elucidation.worker import simulate
+        options = _simulator_options(config,params['model'],devices)
+        options.pop('ms_pred_dir',None)
+        candidates = simulate(str(path),smiles,formula or '',experimental_unit=params['collision_unit'],
+            output_dir=str(job_dir),instrument=_instrument(params,data['metadata'],config),top_k=params['top_k'],**options)
+    else:
+        candidates = cli.worker(python, 'simulate', spectrum=path, smiles_json=listing, formula=formula or '',
+            experimental_unit=params['collision_unit'], output_dir=job_dir, instrument=_instrument(params, data['metadata'], config),
+            top_k=params['top_k'], limit_images=True, **_simulator_options(config, params['model'], devices))
+    result = {**observed, 'status': 'ranked' if candidates else 'no_candidates',
+              'formula': formula, 'candidates': candidates, 'rejected': rejected}
+    if native_score:
+        from msms_structure_elucidation.visualize import write_structure_cache
+        write_structure_cache(result,job_dir/'viewer_structures.json')
+    return result
 
 
 def retrieve_atlas(params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
@@ -275,6 +327,15 @@ RUNNERS = {'predict_spectra': predict_spectra, 'score_candidates': score_candida
 
 
 def run(task: str, params: dict, job_dir: Path, config: dict, devices: str | None, log) -> dict:
+    if task in ('prepare_feature_list', 'publish_prediction_list', 'publish_prediction_group', 'score_prepared_feature'):
+        if task=='publish_prediction_group':
+            command = [_ms_pred_python(config), '-m', 'msms_structure_elucidation.mcp.raw_outputs',
+                       '--publish-job',str(job_dir)]
+        else:
+            action = 'score' if task == 'score_prepared_feature' else 'prepare'
+            command = [_ms_pred_python(config), '-m', 'msms_structure_elucidation.mcp.features', action]
+            command += ['--job', str(job_dir)] if action == 'prepare' else ['--prepared', params['prepared']]
+        return _scientific_call(command,config,log,preparation=True)
     if task == 'model_inference':
         from msms_structure_elucidation.mcp.pipeline import inference
         return inference(params, job_dir, config, devices, log)
@@ -310,7 +371,7 @@ def summarize(task: str, result: dict, params: dict) -> dict:
     if task == 'score_candidates':
         return {'formula': result['formula'], 'candidates': [_candidate(row) for row in result['candidates']],
                 'rejected': result['rejected']}
-    if task in ('retrieve_atlas', 'search_pubchem_mass', 'search_pubchem_formulas'):
+    if task in ('retrieve_atlas', 'search_pubchem_mass', 'search_pubchem_formulas', 'elucidate_feature', 'score_prepared_feature'):
         evidence = dict(result.get('review_evidence') or {})
         evidence.pop('matched_peaks', None)
         evidence['strongest_unexplained_peaks'] = evidence.get('strongest_unexplained_peaks', [])[:10]
@@ -323,4 +384,7 @@ def summarize(task: str, result: dict, params: dict) -> dict:
         ranked = sorted(range(len(result['probabilities'])), key=lambda bit: result['probabilities'][bit], reverse=True)
         return {key: result[key] for key in ('formula', 'adduct', 'threshold', 'fingerprint_bits', 'on_bits', 'hdf5')} | {
             'top_bits': [[bit, result['probabilities'][bit]] for bit in ranked[:50]]}
+    if task == 'prepare_feature_list':
+        return {key:len(result.get(key,[])) for key in
+                ('prepared_features','processed_features','scored_jobs','held_features','held_scores')}
     return result

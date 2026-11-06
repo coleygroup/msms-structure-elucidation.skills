@@ -10,6 +10,48 @@ from msms_structure_elucidation.mcp.jobs import ACTIVE, read_json, write_json
 from msms_structure_elucidation.prediction_cache import file_lock
 
 
+def request_stage(row: dict) -> str | None:
+    """Distinguish model demand from CPU output/scoring and verified result delivery."""
+    if row.get('published'):
+        return None
+    if row.get('awaiting_scheduler_confirmation'):
+        return 'execution'
+    worker = row.get('worker_status') or {}
+    phase = row.get('phase') or worker.get('phase')
+    if row.get('state') in ('done','failed','cancelled') or (phase=='result_collection' and worker.get('state')=='done'):
+        return 'delivery'
+    if phase in ('cpu_scoring','cpu_output','waiting_output') or (
+            phase=='waiting_cpu' and (row.get('scoring_job') or worker.get('scoring_job'))):
+        return 'postprediction'
+    return 'execution'
+
+
+def request_backlog(rows: list[dict]) -> dict:
+    """Count independently bounded prediction, CPU output/scoring and delivery stages."""
+    counts = {stage+'_pending':0 for stage in ('execution','postprediction','delivery')}
+    for row in rows:
+        stage = request_stage(row)
+        if stage:
+            counts[stage+'_pending'] += 1
+    return counts
+
+
+def request_window(rows: list[dict], execution_limit: int, delivery_limit: int,
+                   postprediction_limit: int | None = None) -> dict:
+    """Feed model work independently of bounded CPU output/scoring and delivery backlogs."""
+    postprediction_limit = delivery_limit if postprediction_limit is None else postprediction_limit
+    if min(execution_limit, delivery_limit, postprediction_limit) < 1:
+        raise ValueError('Execution, postprediction and delivery limits must be positive')
+    counts = request_backlog(rows)
+    execution, delivery = counts['execution_pending'], counts['delivery_pending']
+    hold = ('delivery_backlog_limit' if delivery>=delivery_limit else
+            'postprediction_backlog_limit' if counts['postprediction_pending']>=postprediction_limit else
+            'execution_limit' if execution>=execution_limit else None)
+    return {**counts,
+            'execution_limit':execution_limit,'postprediction_limit':postprediction_limit,'delivery_limit':delivery_limit,
+            'admission_slots':max(0,execution_limit-execution) if hold is None else 0,'hold':hold}
+
+
 def failure_signature(message: str) -> str | None:
     """Classify environment faults; malformed individual spectra never stop unrelated work."""
     text = message.lower()
@@ -19,6 +61,7 @@ def failure_signature(message: str) -> str | None:
         'model_configuration': ('checkpoint required', 'checkpoint does not match', 'native source differs',
                                 'package source differs', 'checkpoints are required'),
         'pubchem_rate_limit': ('http error 429', 'too many requests'),
+        'storage_capacity': ('disk quota exceeded', 'no space left on device', '[errno 122]', '[errno 28]'),
     }.items():
         if any(term in text for term in terms):
             return signature
@@ -35,12 +78,15 @@ class Admission:
         if self.threshold < 1:
             raise ValueError('environment_failure_limit must be positive')
 
-    def scope(self, request: dict) -> str:
-        family = 'pubchem' if request['task'].startswith('search_pubchem_') else request['task']
+    def scope(self, request: dict, job_id: str | None = None) -> str:
+        family = 'pubchem' if request['task'].startswith('search_pubchem_') or request['task'] == 'elucidate_feature' else request['task']
         params = request.get('params', {})
         identity = params.get('_model_identity', {})
+        saved = request.get('config_identity')
+        if not saved and job_id:
+            saved = read_json(self.store.path(job_id) / 'config.json', {}).get('_config_digest')
         version = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest() if identity else (
-            self.config.get('_config_digest') or 'configured')
+            saved or self.config.get('_config_digest') or 'configured')
         return ':'.join((family, params.get('model', 'iceberg'), str(version)))
 
     def status(self) -> dict:
@@ -60,7 +106,7 @@ class Admission:
         request = self.store.request(job_id)
         if request.get('kind') != 'pipeline':
             return True
-        scope = self.scope(request)
+        scope = self.scope(request, job_id)
         with file_lock(self.path.with_suffix('.lock')):
             data = self.status()
             row = data.setdefault(scope, {})
@@ -91,7 +137,7 @@ class Admission:
         if state == 'done' and self.store.scheduler_pending(job_id):
             return
         signature = failure_signature(message)
-        scope = self.scope(request)
+        scope = self.scope(request, job_id)
         with file_lock(self.path.with_suffix('.lock')):
             data = self.status()
             row = data.setdefault(scope, {})

@@ -123,8 +123,8 @@ def _response(job_id: str, detail: str = 'summary') -> dict:
     if metrics:
         out['gpu_metrics'] = metrics
     for key in ('devices', 'slurm_job_id', 'host', 'started', 'finished', 'phase', 'phase_seconds',
-                'prediction_job', 'prediction_jobs', 'server', 'transport_error', 'remote_cleanup_error',
-                'remote_cleanup_pending', 'dispatch_errors', 'kubernetes_job', 'scheduler_reason', 'cancel_requested'):
+                'prediction_job', 'prediction_jobs', 'preparation_job', 'scoring_job', 'output_jobs', 'worker_job', 'server', 'transport_error', 'remote_cleanup_error',
+                'remote_cleanup_pending', 'dispatch_errors', 'kubernetes_job', 'scheduler_reason', 'cancel_requested','worker_status'):
         if status.get(key):
             out[key] = status[key]
     if status.get('admission_hold'):
@@ -158,17 +158,8 @@ async def _wait(job_id: str, wait_seconds: int, ctx: Context | None) -> None:
 
 def _model_identity(params: dict, config: dict) -> dict:
     """Fingerprint scientific inputs outside the MCP event loop."""
-    from msms_structure_elucidation.prediction_cache import cache_root, file_fingerprint, source_fingerprint
-    options = tasks.cli._model_options(argparse.Namespace(model=params.get('model', 'iceberg')), config)
-    required = ('checkpoint',) if options['model'] == 'glacier' else ('gen_checkpoint', 'inten_checkpoint')
-    root = cache_root(options.get('prediction_cache'))
-    identity = {'config': config.get('_config_digest'),
-                'adapter': source_fingerprint(Path(tasks.cli.__file__).parent),
-                'weights': {key: file_fingerprint(Path(options[key]), root) for key in required
-                            if options.get(key) and Path(options[key]).is_file()}}
-    if options.get('ms_pred_dir') and Path(options['ms_pred_dir']).is_dir():
-        identity['source'] = source_fingerprint(Path(options['ms_pred_dir'])/'src/ms_pred')
-    return identity
+    from msms_structure_elucidation.mcp.workers import request_contract
+    return request_contract(params,config)
 
 
 async def _submit(task: str, params: dict, inputs: dict, wait_seconds: int | None, ctx: Context | None) -> dict:
@@ -194,6 +185,9 @@ async def server_info() -> dict:
     from msms_structure_elucidation.mcp.cpu import workload
     backend = runtime['backend']
     cpu_rows = await asyncio.to_thread(runtime['store'].active)
+    cpu_rows = [{**row, 'execution_backend': runtime['store'].launch(row['job_id']).get('backend'),
+                 'awaiting_scheduler_confirmation': runtime['store'].scheduler_pending(row['job_id'], row)}
+                for row in cpu_rows]
     cpu_workload = workload(cpu_rows, config, getattr(backend, 'cpu', backend))
     models = {task: {'ready': not missing, 'missing': missing}
               for task in tasks.KINDS for missing in [tasks.missing_assets(task, config)]}
@@ -217,6 +211,53 @@ async def plan_cpu_concurrency(
     """Plan independent CPU feature concurrency from explicit resource budgets; changes no configuration or jobs."""
     from msms_structure_elucidation.mcp.cpu import plan_concurrency
     return plan_concurrency(cpu_budget, memory_budget_gb, cpus_per_job, memory_per_job_gb, max_jobs)
+
+
+@tool
+async def elucidate_spectra(
+        features: Annotated[list[dict], Field(description='Features with unique feature_id, spectrum_ms or spectrum_path, '
+            'collision_unit (NCE/eV), optional formula/formulas, instrument and top_k', min_length=1)],
+        model: Model = 'glacier',
+        search: Annotated[Literal['buddy_top3', 'mass'], Field(description='Saved user-selected candidate search route')] = 'buddy_top3') -> dict:
+    """Accept a batch immediately; the backend balances CPU lists, groups predictions and scores each feature."""
+    runtime = _runtime()
+    if not runtime['config'].get('mcp', {}).get('feature_pipeline', False):
+        raise ValueError('Enable mcp.feature_pipeline for backend-owned feature preparation')
+    _require('search_pubchem_formulas', model=model)
+    identity = await asyncio.to_thread(_model_identity, {'model': model}, runtime['config'])
+
+    def accept() -> list[dict]:
+        pending = []
+        seen = set()
+        # Validate every input before publishing any job.
+        for feature in features:
+            key = str(feature.get('feature_id', ''))
+            if not key or key in seen:
+                raise ValueError('Supply distinct, nonempty feature_id values')
+            seen.add(key)
+            unit = feature.get('collision_unit')
+            if unit not in ('NCE', 'eV'):
+                raise ValueError(f'{key}: explicit collision_unit NCE/eV required')
+            params = {k:feature[k] for k in ('formula','formulas','instrument','top_k','ppm','elements') if k in feature}
+            params.update(feature_id=key, model=model, collision_unit=unit, _model_identity=identity)
+            params.setdefault('top_k', 10)
+            if params['top_k'] < 1:
+                raise ValueError('top_k must be positive')
+            if search == 'mass' and (params.get('formula') or params.get('formulas')):
+                raise ValueError('Mass-only search must not supply formulas')
+            inputs = _spectrum_inputs(params, feature.get('spectrum_ms'), feature.get('spectrum_path'), unit)
+            pending.append(('search_pubchem_mass' if search == 'mass' else 'elucidate_feature', params, inputs))
+        jobs = []
+        for task, params, inputs in pending:
+            job, reused = runtime['store'].create(task, params, inputs, 'pipeline', runtime['config'])
+            # Publish the whole batch before waking the backend so it can balance k lists.
+            if not runtime['store'].launch(job):
+                runtime['store'].set_launch(job, backend=getattr(runtime['backend'],'feature_launch_name','feature-pipeline'))
+            jobs.append({'feature_id': params['feature_id'], 'job_id': job, 'reused_earlier_job': reused})
+        runtime['backend'].pump()
+        return jobs
+
+    return {'accepted': await asyncio.to_thread(accept), 'next': 'Poll feature job IDs with get_job; preparation and dispatch run in the backend.'}
 
 
 @tool

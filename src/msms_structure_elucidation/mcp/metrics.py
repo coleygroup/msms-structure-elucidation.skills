@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import datetime
 import math
 import os
 import shutil
@@ -106,4 +107,5 @@ class GpuMonitor:
             self.thread.join(timeout=12)
         summary = summarize(self.folder / 'gpu-samples.csv', self.start, time.time())
         summary.update(query_selector=self.selector, requested_interval_seconds=self.interval, errors=self.errors)
+        summary['host_utc_offset_seconds'] = datetime.datetime.now().astimezone().utcoffset().total_seconds()
         write_json(self.folder / 'gpu-metrics.json', summary)

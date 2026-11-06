@@ -31,7 +31,16 @@
     if (current) { peaks.push([current.mz, current.intensity]); members.push(current.members); }
     return { peaks, members };
   }
-  const api = { mergePeaks };
+  function spectrumQC(result) {
+    const precursor = Number(result.parentmass);
+    if (!Number.isFinite(precursor) || precursor <= 0) return { relative_intensities: [], precursor_known: false };
+    const spectra = Object.entries(result.spectra || {}).map(([key, peaks]) => ({ key,
+      peaks: peaks.filter(p => Math.abs(p[0] - precursor) / precursor * 1e6 > 20) }));
+    const intensities = mergePeaks(spectra).peaks.map(p => p[1]);
+    const base = intensities.reduce((max, value) => Math.max(max, value), 0);
+    return { relative_intensities: intensities.map(v => 100 * (v / base)).sort((a, b) => b - a), precursor_known: true };
+  }
+  const api = { mergePeaks, spectrumQC };
   root.MSMSMerge = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);

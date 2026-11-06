@@ -16,6 +16,20 @@ from msms_structure_elucidation.spectrum import inspect_ms
 
 
 class EnergyInputTests(unittest.TestCase):
+    def test_explicit_mean_policy_and_json_metadata_preserve_repeated_components(self):
+        with patch('msms_structure_elucidation.config.settings', return_value={
+                'pipeline': {'stepped_aggregation': 'arithmetic_mean'}}):
+            info = stepped_components('[20,20,40]', 250, 'NCE')
+        self.assertEqual(info['merge_method'], 'arithmetic_mean')
+        self.assertEqual(info['model_energies_ev'], [10, 10, 20])
+        self.assertEqual(info['weights'], [1 / 3] * 3)
+        for value in ['[true,40]', '["20",40]']:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                energy_values(value)
+        with patch('msms_structure_elucidation.config.settings', return_value={
+                'pipeline': {'stepped_aggregation': 'unknown'}}), self.assertRaises(ValueError):
+            stepped_components([20,40], 250, 'NCE')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

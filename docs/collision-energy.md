@@ -32,6 +32,8 @@ The current stepped mode implements equal component weights. If acquisition meta
 
 ## Prepare and run stepped inputs
 
+An explicitly configured `pipeline.stepped_aggregation: arithmetic_mean` retains the unnormalized equal-weight mean and records that policy in the energy alignment. Keep a campaign's confirmed aggregation policy when resuming it. The default is `sum_then_base_peak_normalize`.
+
 For feature MGF with verified stepped settings, convert the single measured composite using:
 
 ```bash

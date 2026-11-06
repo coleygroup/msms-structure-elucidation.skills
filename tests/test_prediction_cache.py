@@ -1,9 +1,13 @@
 import json
+import os
 import importlib.util
 import shutil
 import tempfile
 import threading
 import time
+import sqlite3
+import subprocess
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -18,6 +22,42 @@ def produce(molecules, energies):
              'predicted_fragment_ids': {str(e): ['1'] for e in energies}} for smi in molecules]
 
 
+class InterruptedCacheTests(unittest.TestCase):
+    def hot_cache(self, root):
+        identity={'test':'interrupted-writer'}
+        expected,_=cache.predictions(root,identity,['CCO'],[20],produce)
+        database=root/cache.digest(identity)/'spectra.sqlite3'
+        subprocess.run([sys.executable,'-c', '''import sqlite3,os,sys
+db=sqlite3.connect(sys.argv[1]);db.execute('PRAGMA cache_size=1');db.execute('BEGIN IMMEDIATE')
+db.execute('CREATE TABLE uncommitted (payload BLOB)')
+db.executemany('INSERT INTO uncommitted VALUES (?)',[(b'x'*4096,)]*128)
+os._exit(0)
+''',str(database)],check=True)
+        self.assertTrue(database.with_name(database.name+'-journal').is_file())
+        reader=sqlite3.connect(database.as_uri()+'?mode=ro',uri=True)
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as error:
+                reader.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone()
+            self.assertEqual(getattr(error.exception,'sqlite_errorcode',8) & 255,8)
+        finally:
+            reader.close()
+        return identity,expected
+
+    def test_prediction_reader_recovers_hot_journal_without_repredicting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);identity,expected=self.hot_cache(root)
+            actual,receipt=cache.predictions(root,identity,['CCO'],[20],
+                lambda *args:self.fail('A recovered cache must not repeat inference'))
+            self.assertEqual(actual,expected)
+            self.assertEqual(receipt['reused_spectra'],1)
+
+    def test_dispatch_planner_recovers_hot_journal_without_losing_cached_rows(self):
+        from msms_structure_elucidation.mcp.raw_outputs import missing_groups
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);identity,_=self.hot_cache(root)
+            self.assertEqual(missing_groups(root,identity,['CCO'],[20,40]),{(40,):['CCO']})
+
+
 class AdapterIdentityTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -28,12 +68,14 @@ class AdapterIdentityTests(unittest.TestCase):
         self.worker = self.root / 'worker.py'
 
     def test_scoring_only_change_reuses_existing_raw_predictions(self):
-        legacy = '9410f95c968745fc30145fef606e2ffaaab66b094977d18931a4a18f0545382e'
-        self.assertEqual(cache.adapter_fingerprint(self.worker), legacy)
-        first, _ = cache.predictions(self.root, {'adapter_sha256': legacy}, ['CCO'], [20, 40], produce)
-        self.worker.write_text(self.worker.read_text().replace('return super().int_frags', 'return None'))
+        original = cache.adapter_fingerprint(self.worker)
+        first, _ = cache.predictions(self.root, {'adapter_sha256': original}, ['CCO'], [20, 40], produce)
+        source = self.worker.read_text()
+        modified = source.replace('return super().int_frags', 'return None')
+        self.assertNotEqual(source, modified)
+        self.worker.write_text(modified)
         identity = {'adapter_sha256': cache.adapter_fingerprint(self.worker)}
-        self.assertEqual(identity['adapter_sha256'], legacy)
+        self.assertEqual(identity['adapter_sha256'], original)
         second, receipt = cache.predictions(self.root, identity, ['CCO'], [20, 40],
             lambda *args: self.fail('scoring-only change invalidated raw predictions'))
         self.assertEqual(first, second)
@@ -53,8 +95,78 @@ class AdapterIdentityTests(unittest.TestCase):
             self.assertNotEqual(cache.adapter_fingerprint(self.worker), before)
             path.write_bytes(original)
 
+    def test_verified_legacy_namespace_can_be_retained_during_a_rollout(self):
+        legacy = 'e06de0363d3b474f1683b692d8faafe435244861a76ebf2e38aa4a9af491a42f'
+        verified = '4116460df09642d1ca64381b287450ad5ea3e370e6b9e1bf10190749a720b87d'
+        with patch.dict(os.environ, {'MSMS_PREDICTION_CACHE_ADAPTER': legacy}), \
+                patch.object(cache, '_raw_adapter_source', side_effect=[verified, 'unverified-source']):
+            self.assertEqual(cache.adapter_fingerprint(self.worker), legacy)
+            with self.assertRaisesRegex(ValueError, 'incompatible'):
+                cache.adapter_fingerprint(self.worker)
+
 
 class SharedPredictionTests(unittest.TestCase):
+    def test_missing_cache_recheck_releases_reader_before_prediction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);identity={'weights':'same'};molecules=[f'candidate_{i}' for i in range(300)]
+            database=root/cache.digest(identity)/'spectra.sqlite3'
+            def generate(smiles,energies):
+                # Another producer must be able to publish while inference runs.
+                with sqlite3.connect(database,timeout=.1) as writer:
+                    writer.execute('CREATE TABLE independent_writer (value INTEGER)')
+                    writer.execute('INSERT INTO independent_writer VALUES (1)')
+                return produce(smiles,energies)
+            actual,receipt=cache.predictions(root,identity,molecules,[20,40],generate)
+            self.assertEqual(actual,produce(molecules,[20,40]))
+            self.assertEqual(receipt['predicted_spectra'],600)
+            reused,receipt=cache.predictions(root,identity,molecules,[20,40],
+                lambda *args:self.fail('Completed predictions must be reused'))
+            self.assertEqual(actual,reused);self.assertEqual(receipt['reused_spectra'],600)
+
+    def test_a_large_warm_reader_releases_its_snapshot_for_another_writer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            identity = {'weights': 'same'}
+            molecules = [f'candidate_{i}' for i in range(300)]
+            cache.predictions(root, identity, molecules, [20], produce)
+            database = root / cache.digest(identity) / 'spectra.sqlite3'
+            original = cache.sqlite3.connect
+            errors = []
+            writes = []
+            class Reader:
+                def __init__(self, connection):
+                    self.connection, self.reads = connection, 0
+                def execute(self, sql, parameters=()):
+                    if sql.startswith('SELECT payload'):
+                        self.reads += 1
+                        if self.reads == 257:
+                            def write():
+                                try:
+                                    with original(database, timeout=.5) as db:
+                                        db.execute('INSERT INTO spectra VALUES (?, ?, ?)', ('other', '20', '{}'))
+                                    writes.append(True)
+                                except Exception as error:
+                                    errors.append(str(error))
+                            thread = threading.Thread(target=write)
+                            thread.start()
+                            thread.join(2)
+                            if thread.is_alive():
+                                errors.append('writer did not finish between read windows')
+                    return self.connection.execute(sql, parameters)
+                def commit(self):
+                    return self.connection.commit()
+                def close(self):
+                    return self.connection.close()
+            def connect(*args, **kwargs):
+                connection = original(*args, **kwargs)
+                return Reader(connection) if kwargs.get('uri') else connection
+            with patch.object(cache.sqlite3, 'connect', side_effect=connect):
+                records, receipt = cache.predictions(root, identity, molecules, [20], produce)
+            self.assertEqual(errors, [])
+            self.assertEqual(writes, [True])
+            self.assertEqual(len(records), 300)
+            self.assertEqual(receipt['predicted_spectra'], 0)
+
     def test_complete_cache_hit_needs_no_writer_lease_or_prediction(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

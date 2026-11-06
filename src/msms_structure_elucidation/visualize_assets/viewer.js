@@ -16,12 +16,13 @@ const outcomeLabel = r => (r.outcome === 'model' ? `${r.top_model || 'Model'} pr
 const modelLabel = c => (String(c.source).startsWith('public') ? null : `${c.model_name || c.source}${c.model_version ? ' ' + c.model_version : ''}`);
 const DECISION = { keep: 'Kept', uncertain: 'Uncertain', reject: 'Rejected' };
 const ICON = { keep: '✓', uncertain: '?', reject: '✕' };
+const PAGE_SIZE = 100;
 
 const S = {
-  index: [], order: [], token: null, sort: { key: 'label', dir: 1 },
+  index: [], order: [], page: 0, token: null, sort: { key: 'label', dir: 1 },
   r: null, result: null, notes: null, cand: 0, pairIdx: -1, compare: null, peak: null, zoom: null,
   payloads: new Map(), thumbs: new Map(), drafts: new Map(), saveTimers: {}, loading: 0, formulaCache: {},
-  mergedCache: new WeakMap(),
+  mergedCache: new WeakMap(), qc: { enabled: true, minPeaks: 5, minIntensity: 10 },
 };
 
 /* ---------- data access: live server or embedded static export ---------- */
@@ -119,9 +120,15 @@ const ppm = (a, b) => ((a - b) / b) * 1e6;
 
 /* ---------- overview ---------- */
 function reviewState(r) { return r.review?.verdict || (r.review?.reviewed ? 'touched' : 'todo'); }
+function qcPeakCount(r) {
+  if (!r.spectrum_qc?.precursor_known) return null;
+  return r.spectrum_qc.relative_intensities.filter(v => v >= S.qc.minIntensity).length;
+}
+function passesQC(r) { return !S.qc.enabled || qcPeakCount(r) >= S.qc.minPeaks; }
+function qcRows() { return S.index.filter(passesQC); }
 function filtered() {
   const q = $('f-q').value.trim().toLowerCase(), outcome = $('f-outcome').value, review = $('f-review').value, min = Number($('f-sim').value);
-  const rows = S.index.filter(r => {
+  const rows = qcRows().filter(r => {
     if (outcome === 'none' ? r.candidates > 0 : outcome && r.outcome !== outcome) return false;
     if (review === 'todo' ? r.review?.reviewed : review && r.review?.verdict !== review) return false;
     if (min > 0 && !(r.top_similarity >= min)) return false;
@@ -129,7 +136,7 @@ function filtered() {
     return true;
   });
   const { key, dir } = S.sort;
-  const val = r => key === 'verdict' ? ['keep', 'uncertain', 'reject', 'touched', 'todo'].indexOf(reviewState(r)) : r[key];
+  const val = r => key === 'qc_peaks' ? qcPeakCount(r) : key === 'verdict' ? ['keep', 'uncertain', 'reject', 'touched', 'todo'].indexOf(reviewState(r)) : r[key];
   const cmp = (a, b) => {
     const x = val(a), y = val(b);
     if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
@@ -137,28 +144,32 @@ function filtered() {
   };
   return rows.sort(cmp);
 }
-function renderOverview() {
-  const n = S.index.length, withC = S.index.filter(r => r.candidates), sims = withC.map(r => r.top_similarity);
-  const reviewed = S.index.filter(r => r.review?.reviewed).length;
-  const kpis = [[n, 'unknowns'], [withC.length, 'with ranked candidates'], [S.index.filter(r => r.outcome === 'model').length, `via ${[...new Set(S.index.filter(r => r.outcome === 'model').map(r => r.top_model || 'model'))].join(' / ') || 'model'} prediction`],
+function renderOverview(resetPage = false) {
+  const rows = qcRows(), n = rows.length, withC = rows.filter(r => r.candidates), sims = withC.map(r => r.top_similarity);
+  const reviewed = rows.filter(r => r.review?.reviewed).length;
+  const unavailable = S.index.filter(r => !r.spectrum_qc?.precursor_known).length;
+  $('qc-count').textContent = S.qc.enabled
+    ? `${n} of ${S.index.length} pass · ${S.index.length - n} hidden${unavailable ? ` · ${unavailable} missing precursor m/z` : ''}`
+    : `QC off · all ${S.index.length} unknowns shown`;
+  const kpis = [[n, 'unknowns'], [withC.length, 'with ranked candidates'], [rows.filter(r => r.outcome === 'model').length, `via ${[...new Set(rows.filter(r => r.outcome === 'model').map(r => r.top_model || 'model'))].join(' / ') || 'model'} prediction`],
     [sims.filter(s => s >= 0.7).length, 'rank-1 similarity ≥ 0.7'], [sims.filter(s => s < 0.5).length, 'rank-1 below 0.5 (review)'],
     [`${reviewed}/${n}`, 'reviewed']];
   $('kpis').innerHTML = kpis.map(([v, l]) => `<div class="kpi"><b>${v}</b><span>${l}</span></div>`).join('');
   renderHist(sims);
   const counts = new Map();
-  Object.keys(OUTCOME).forEach(k => S.index.filter(r => r.outcome === k).forEach(r => counts.set(outcomeLabel(r), (counts.get(outcomeLabel(r)) || 0) + 1)));
+  Object.keys(OUTCOME).forEach(k => rows.filter(r => r.outcome === k).forEach(r => counts.set(outcomeLabel(r), (counts.get(outcomeLabel(r)) || 0) + 1)));
   const max = Math.max(1, ...counts.values());
   $('outcomes').innerHTML = [...counts].map(([label, n]) =>
     `<div class="hbar"><span>${esc(label)}</span><span class="track"><span class="fill" style="width:${(100 * n / max).toFixed(1)}%"></span></span><span class="n">${n}</span></div>`).join('');
-  const models = [...new Set(S.index.filter(r => r.outcome === 'model').map(r => r.top_model || 'Model'))];
+  const models = [...new Set(rows.filter(r => r.outcome === 'model').map(r => r.top_model || 'Model'))];
   $('f-outcome').querySelector('option[value="model"]').textContent = models.length ? `${models.join(' / ')} prediction` : 'Model prediction';
-  const rv = { keep: 0, uncertain: 0, reject: 0, touched: 0, todo: 0 }; S.index.forEach(r => rv[reviewState(r)]++);
+  const rv = { keep: 0, uncertain: 0, reject: 0, touched: 0, todo: 0 }; rows.forEach(r => rv[reviewState(r)]++);
   const segs = [['keep', 'var(--good)'], ['uncertain', 'var(--warn)'], ['reject', 'var(--bad)'], ['touched', 'var(--text-3)']];
   $('review-sub').textContent = `${reviewed} of ${n} unknowns have notes`;
   $('review-bar').innerHTML = `<div class="stack" role="img" aria-label="Review progress">${segs.filter(([k]) => rv[k]).map(([k, c]) => `<span style="width:${100 * rv[k] / n}%;background:${c}" title="${k}: ${rv[k]}"></span>`).join('')}</div>
     <div class="stack-legend">${[['keep', 'Kept'], ['uncertain', 'Uncertain'], ['reject', 'Rejected'], ['touched', 'Notes only'], ['todo', 'Not reviewed']]
       .map(([k, l]) => `<span>${ICON[k] ? `<span class="ico ${k}">${ICON[k]}</span>` : ''} ${l} <b>${rv[k]}</b></span>`).join('')}</div>`;
-  renderTable();
+  renderTable(resetPage);
 }
 function renderHist(sims) {
   const bins = Array.from({ length: 20 }, (_, i) => ({ lo: i / 20, n: 0 }));
@@ -166,10 +177,14 @@ function renderHist(sims) {
     if (typeof s !== 'number' || !Number.isFinite(s)) return;
     bins[Math.max(0, Math.min(19, Math.floor(s * 20)))].n++;
   });
-  const W = 640, H = 210, m = { l: 34, r: 8, t: 22, b: 26 }, iw = W - m.l - m.r, ih = H - m.t - m.b, bw = iw / 20;
-  const ymax = Math.max(1, ...bins.map(b => b.n)), y = v => m.t + ih - (v / ymax) * ih, step = ymax > 24 ? 10 : 5;
+  const largest = Math.max(1, ...bins.map(b => b.n)), rough = largest / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(rough));
+  const step = Math.max(1, [1, 2, 5, 10].find(n => n * magnitude >= rough) * magnitude);
+  const ymax = Math.ceil(largest / step) * step;
+  const W = 640, H = 210, m = { l: Math.max(34, ymax.toLocaleString().length * 7 + 12), r: 8, t: 22, b: 26 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b, bw = iw / 20, y = v => m.t + ih - (v / ymax) * ih;
   let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Histogram of rank-1 similarity">`;
-  for (let v = 0; v <= ymax; v += step) s += `<g class="axis"><line x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/><text x="${m.l - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text></g>`;
+  for (let v = 0; v <= ymax; v += step) s += `<g class="axis y-axis"><line x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/><text x="${m.l - 6}" y="${y(v) + 4}" text-anchor="end">${v.toLocaleString()}</text></g>`;
   bins.forEach((b, i) => {
     const x = m.l + i * bw + 1, h = m.t + ih - y(b.n), w = bw - 2;
     if (b.n) s += `<path d="M${x},${m.t + ih}v${-Math.max(0, h - 3)}q0,-3 3,-3h${w - 6}q3,0 3,3v${Math.max(0, h - 3)}z" fill="var(--accent)"/>`;
@@ -188,16 +203,26 @@ function pumpThumbs() {
     api.thumb(i).then(svg => { S.thumbs.set(i, svg); el.innerHTML = svg; }).catch(() => {}).finally(() => { thumbActive--; pumpThumbs(); });
   }
 }
-function renderTable() {
+function renderTable(resetPage = false) {
   S.order = filtered().map(r => r.index);
-  const rows = S.order.map(i => S.index[i]);
-  $('ov-count').textContent = `${rows.length} of ${S.index.length}`;
+  const pages = Math.max(1, Math.ceil(S.order.length / PAGE_SIZE));
+  S.page = resetPage ? 0 : Math.max(0, Math.min(S.page, pages - 1));
+  const start = S.page * PAGE_SIZE, rows = S.order.slice(start, start + PAGE_SIZE).map(i => S.index[i]);
+  $('ov-count').textContent = `${S.order.length} of ${S.index.length}`;
+  $('ov-pagination').hidden = S.index.length <= PAGE_SIZE;
+  $('ov-page-info').textContent = `Page ${S.page + 1} of ${pages} · ${rows.length ? start + 1 : 0}–${start + rows.length} of ${S.order.length} unknowns`;
+  $('ov-page').innerHTML = Array.from({ length: pages }, (_, i) => `<option value="${i}">${i + 1}</option>`).join('');
+  $('ov-page').value = String(S.page);
+  $('ov-page').disabled = pages === 1;
+  $('ov-prev').disabled = S.page === 0;
+  $('ov-next').disabled = S.page === pages - 1;
   document.querySelectorAll('#ov-table th[data-k]').forEach(th => th.setAttribute('aria-sort', th.dataset.k === S.sort.key ? (S.sort.dir > 0 ? 'ascending' : 'descending') : 'none'));
   $('ov-table').tBodies[0].innerHTML = rows.map(r => {
     const kind = r.candidates ? r.outcome : 'none', st = reviewState(r);
     return `<tr data-i="${r.index}" tabindex="0">
       <td><b>${esc(r.label)}</b></td><td class="num">${fmt(r.parentmass, 4)}</td><td class="num">${fmt(r.rt_min, 2)}</td>
       <td>${r.formula ? fhtml(r.formula) : '<span class="sub">—</span>'}</td>
+      <td class="num" title="Non-precursor peaks ≥ ${S.qc.minIntensity}% of base peak">${qcPeakCount(r) ?? '—'}</td>
       <td><span class="chip"><span class="outcome-ico ${kind}"></span><span>${esc(outcomeLabel(r))}</span></span></td>
       <td>${r.top_smiles ? `<span class="thumb" data-thumb="${r.index}">${S.thumbs.get(r.index) || ''}</span>` : ''}</td>
       <td class="num">${r.candidates ? `<span class="simcell">${fmt(r.top_similarity, 3)}<span class="minibar"><i style="width:${100 * r.top_similarity}%"></i></span></span>` : '—'}</td>
@@ -205,12 +230,18 @@ function renderTable() {
       <td>${DECISION[st] ? `<span class="chip"><span class="ico ${st}">${ICON[st]}</span>${DECISION[st]}${r.review.rank ? ` #${r.review.rank}` : ''}</span>` : st === 'touched' ? '<span class="chip">Notes</span>' : '<span class="sub">—</span>'}</td></tr>`;
   }).join('');
   thumbObserver?.disconnect();
+  thumbQueue.length = 0;
   thumbObserver = new IntersectionObserver(entries => entries.forEach(e => {
     if (!e.isIntersecting) return;
     const el = e.target, i = Number(el.dataset.thumb); thumbObserver.unobserve(el);
     if (!S.thumbs.has(i)) { thumbQueue.push([i, el]); pumpThumbs(); }
   }), { rootMargin: '200px' });
   document.querySelectorAll('[data-thumb]').forEach(el => { if (!S.thumbs.has(Number(el.dataset.thumb))) thumbObserver.observe(el); });
+}
+function changePage(page) {
+  S.page = page;
+  renderTable();
+  $('ov-table').closest('.card').scrollIntoView({ block: 'start' });
 }
 
 /* ---------- workspace ---------- */
@@ -291,13 +322,46 @@ function mergedSpectrum(c) {
   S.mergedCache.set(c, sp);
   return sp;
 }
+function experimentalPairs() {
+  const res = S.result, mapping = res.energy_mapping || [];
+  return Object.keys(res.spectra).map(key => {
+    if (key === 'stepped' || res.acquisition_mode === 'stepped') {
+      return { experimental_key: key, acquisition_mode: 'stepped',
+        input_values: res.stepped_collision?.values || mapping.map(m => m.input_value),
+        input_unit: res.stepped_collision?.unit || mapping[0]?.input_unit || res.collision_unit || '' };
+    }
+    const meta = mapping.find(m => m.experimental_key === key ||
+      (m.collision_energy_ev != null && Number(m.collision_energy_ev) === Number(key)));
+    return { experimental_key: key, input_value: meta?.input_value ?? (Number.isFinite(Number(key)) ? Number(key) : null),
+      input_unit: meta?.input_unit || 'eV' };
+  });
+}
+const experimentalEnergyLabel = p => p.input_values?.length || p.input_value != null
+  ? `${energyLabel(p)} ${esc(p.input_unit)}` : `Spectrum ${esc(p.experimental_key)}`;
+function experimentalSpectrum() {
+  const pairs = experimentalPairs();
+  if (!pairs.length) return null;
+  const merged = S.pairIdx === -1 && pairs.length > 1;
+  if (merged && S.mergedCache.has(S.result)) return S.mergedCache.get(S.result);
+  const pair = merged ? { merged: true, input_values: pairs.flatMap(p => p.input_values ?? [p.input_value]), input_unit: pairs[0].input_unit }
+    : pairs[Math.max(0, Math.min(S.pairIdx, pairs.length - 1))];
+  const exp = merged ? window.MSMSMerge.mergePeaks(pairs.map(p => ({ key: p.experimental_key, peaks: S.result.spectra[p.experimental_key] }))).peaks
+    : S.result.spectra[pair.experimental_key];
+  const precursor = Number(S.result.parentmass) || Infinity;
+  const sp = { pair, key: merged ? 'merged' : pair.experimental_key, exp, pred: [], ids: [],
+    expMax: Math.max(1e-9, ...exp.filter(p => p[0] <= precursor + 2).map(p => p[1])),
+    predMax: 1, e2p: new Map(), p2e: new Map(), precursor, merged, experimentalOnly: true };
+  if (merged) S.mergedCache.set(S.result, sp);
+  return sp;
+}
 function spectraFor(c) {
+  if (!c) return experimentalSpectrum();
   return S.pairIdx === -1 && (c.energy_alignment || []).length > 1
     ? mergedSpectrum(c) : pairedSpectrum(c, pairOf(c));
 }
 function defaultRange(sp) {
   const mzs = [...sp.pred.map(p => p[0]), ...sp.exp.filter(p => p[0] <= sp.precursor + 2).map(p => p[0])];
-  const lo = Math.max(0, Math.min(...mzs) - 12), hi = Math.max(sp.precursor === Infinity ? 0 : sp.precursor, ...mzs) + 12;
+  const lo = Math.max(0, (mzs.length ? Math.min(...mzs) : 0) - 12), hi = Math.max(sp.precursor === Infinity ? 0 : sp.precursor, ...mzs) + 12;
   return [Math.floor(lo / 10) * 10, Math.ceil(hi / 10) * 10];
 }
 function payload(k) {
@@ -334,6 +398,7 @@ function renderWorkspace() {
     if (!$('demo-source').hidden) $('demo-source').href = url;
   }
   const pos = S.order.indexOf(S.r);
+  if (pos >= 0) S.page = Math.floor(pos / PAGE_SIZE);
   $('ws-name').textContent = r.label;
   $('ws-pos').textContent = pos >= 0 ? `${pos + 1} / ${S.order.length}` : `— / ${S.order.length}`;
   const energies = (res.energy_mapping || []).map(m => `${fmt(m.input_value, 0)} ${esc(m.input_unit)}`).join(', ');
@@ -341,9 +406,13 @@ function renderWorkspace() {
     `${esc(res.adduct || '')}`, res.formula ? `<b>${fhtml(res.formula)}</b> <span class="sub">${esc(res.formula_source || '')}</span>` : 'no formula',
     energies ? `collision <b>${res.acquisition_mode === 'stepped' ? 'stepped ' : ''}${energies}</b>` : '', `<span class="chip"><span class="outcome-ico ${has ? r.outcome : 'none'}"></span>${esc(outcomeLabel(r))}</span>`]
     .filter(Boolean).map(x => `<span>${x}</span>`).join('');
-  $('ws-grid').hidden = !has; $('verdict').hidden = !has; $('ws-empty').hidden = has;
-  if (!has) { renderEmpty(); return; }
-  renderRail(); renderEnergy(); renderPlots(); renderEvidence(); renderInspector(); renderVerdict();
+  $('workspace').classList.toggle('experimental-only', !has);
+  $('ws-grid').hidden = false; $('verdict').hidden = !has;
+  $('plot-hint').innerHTML = has
+    ? 'Drag across the plot to zoom · double-click to reset · click a peak to inspect its fragment · <kbd>←</kbd><kbd>→</kbd> step through annotated peaks'
+    : 'Drag across the plot to zoom · double-click to reset · hover or click a peak to inspect its m/z and relative intensity';
+  renderRail(); renderEnergy(); renderPlots(); renderEvidence(); renderInspector();
+  if (has) renderVerdict();
 }
 function renderEmpty() {
   const res = S.result, r = S.index[S.r];
@@ -363,7 +432,7 @@ function renderEmpty() {
       : 'The PubChem mass search or model prediction did not complete. Check the errors and model assets in retrieval.json, then resume the same mass-only search.';
   }
   const hyps = (res.formula_hypotheses || []).map(h => h.formula).filter(f => f && f !== res.formula);
-  $('ws-empty').innerHTML = `<h2>No ranked candidates</h2><p>${why}</p>${formulaResults(res)}
+  $('evidence').innerHTML = `<h2>No ranked candidates</h2><p>${why}</p>${formulaResults(res)}
     ${hyps.length ? res.search_mode === 'pubchem-mass' ? `<p>PubChem mass-matched formulas: ${hyps.map(fhtml).join(', ')}</p>` : `<p>Other formula hypotheses — rerun retrieval with one of them:</p>${hypList(hyps)}` : ''}
     ${(res.warnings || []).map(w => `<p class="warn">⚠ ${esc(String(w).split('\n')[0])}</p>`).join('')}`;
 }
@@ -404,9 +473,9 @@ function renderRail() {
 }
 function renderEnergy() {
   const c = cand(), sel = $('energy');
-  const align = c.energy_alignment || [];
-  const merged = align.length > 1 ? `<option value="-1">Merged all energies · ${align.map(a => energyLabel(a)).join('/')} ${esc(align[0].input_unit)} ↔ ${[...new Set(align.map(a => fmt(a.model_energies_ev ?? a.model_energy_ev ?? a.atlas_ev, 0)))].join('/')} eV</option>` : '';
-  sel.innerHTML = merged + align.map((a, i) => `<option value="${i}">${energyLabel(a)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energies_ev ?? a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}</option>`).join('');
+  const align = c ? c.energy_alignment || [] : experimentalPairs();
+  const merged = align.length > 1 ? `<option value="-1">Merged all energies · ${align.map(a => energyLabel(a)).join('/')} ${esc(align[0].input_unit)}${c ? ` ↔ ${[...new Set(align.map(a => fmt(a.model_energies_ev ?? a.model_energy_ev ?? a.atlas_ev, 0)))].join('/')} eV` : ''}</option>` : '';
+  sel.innerHTML = merged + align.map((a, i) => `<option value="${i}">${c ? `${energyLabel(a)} ${esc(a.input_unit)} ↔ ${fmt(a.model_energies_ev ?? a.model_energy_ev ?? a.atlas_ev, 0)} eV ${esc(modelLabel(c) || 'ICEBERG Atlas')}` : experimentalEnergyLabel(a)}</option>`).join('');
   sel.value = String(S.pairIdx === -1 && align.length > 1 ? -1 : Math.max(0, Math.min(S.pairIdx, align.length - 1)));
   sel.disabled = align.length < 2;
   $('compare').setAttribute('aria-pressed', String(S.compare != null));
@@ -415,6 +484,10 @@ function renderEnergy() {
   other.hidden = S.compare == null;
   other.innerHTML = S.result.candidates.map((x, k) => k === S.cand ? '' : `<option value="${k}">vs #${k + 1} · ${fmt(x.entropy_similarity, 3)}</option>`).join('');
   if (S.compare != null) other.value = String(S.compare);
+  if (!c) {
+    $('legend').innerHTML = '<span><span class="sw" style="background:var(--exp)"></span>Experimental spectrum</span>';
+    return;
+  }
   $('legend').innerHTML = `<span><span class="sw" style="background:var(--exp)"></span>Experimental, matched</span>
     <span><span class="sw" style="background:var(--exp-soft)"></span>Experimental, unexplained</span>
     <span><span class="sw" style="background:var(--pred)"></span>Predicted, with fragment</span>
@@ -426,7 +499,10 @@ function renderPlots() {
   const holder = $('plots'); holder.innerHTML = '';
   const ks = S.compare != null ? [S.cand, S.compare] : [S.cand];
   const base = spectraFor(cand());
-  if (!base) { holder.innerHTML = '<p class="sub">No experimental energy was paired with a prediction for this candidate.</p>'; return; }
+  if (!base || (base.experimentalOnly && !base.exp.length)) {
+    holder.innerHTML = `<p class="sub">${cand() ? 'No experimental energy was paired with a prediction for this candidate.' : 'No experimental peaks are available for this energy.'}</p>`;
+    return;
+  }
   if (!S.zoom) S.zoom = defaultRange(base);
   ks.forEach(k => {
     const el = document.createElement('div'); el.className = 'plot'; holder.append(el);
@@ -441,15 +517,16 @@ function drawMirror(el, k, compact) {
   const c = cand(k), sp = spectraFor(c);
   if (!sp) { el.innerHTML = `<p class="sub">#${k + 1}: no paired energy.</p>`; return; }
   const W = Math.max(480, el.clientWidth || 800), H = compact ? 250 : 360, m = { l: 44, r: 12, t: 20, b: 26 };
-  const iw = W - m.l - m.r, ih = H - m.t - m.b, mid = m.t + ih / 2, half = ih / 2 - 6;
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const mid = m.t + (sp.experimentalOnly ? ih : ih / 2), half = sp.experimentalOnly ? ih - 36 : ih / 2 - 6;
   const [lo, hi] = S.zoom, x = mz => m.l + ((mz - lo) / (hi - lo)) * iw;
   const inRange = mz => mz >= lo && mz <= hi;
   const sel = S.peak && S.peak.k === k ? S.peak : null;
   const selPred = sel ? (sel.kind === 'p' ? sel.i : sp.e2p.get(sel.i)) : null;
   const selExp = sel ? (sel.kind === 'e' ? sel.i : sp.p2e.get(sel.i)) : null;
-  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Mirror plot, experimental versus predicted rank ${k + 1}">`;
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${sp.experimentalOnly ? 'Experimental spectrum' : `Mirror plot, experimental versus predicted rank ${k + 1}`}">`;
   [1, 0.5].forEach(v => {
-    [mid - v * half, mid + v * half].forEach(yy => { s += `<g class="axis"><line x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}"/><text x="${m.l - 6}" y="${yy + 4}" text-anchor="end">${v * 100}%</text></g>`; });
+    (sp.experimentalOnly ? [mid - v * half] : [mid - v * half, mid + v * half]).forEach(yy => { s += `<g class="axis"><line x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}"/><text x="${m.l - 6}" y="${yy + 4}" text-anchor="end">${v * 100}%</text></g>`; });
   });
   const step = niceStep(hi - lo);
   for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) s += `<g class="axis"><text x="${x(v)}" y="${H - 8}" text-anchor="middle">${+v.toFixed(2)}</text></g>`;
@@ -467,9 +544,9 @@ function drawMirror(el, k, compact) {
     const [mz, it] = sp.pred[i], h = (it / sp.predMax) * half;
     s += `<line class="peak pred${sp.ids[i] != null ? ' a' : ''}${i === selPred ? ' sel' : ''}" data-s="p" data-i="${i}" x1="${x(mz)}" x2="${x(mz)}" y1="${mid}" y2="${mid + Math.max(1, h)}"/>`;
   }
-  // Direct labels on the strongest matched experimental peaks, spaced apart.
+  // Label the strongest experimental peaks, using matched peaks when a candidate is present.
   const placed = [];
-  [...sp.e2p.keys()].filter(i => inRange(sp.exp[i][0])).sort((a, b) => sp.exp[b][1] - sp.exp[a][1]).slice(0, 10).forEach(i => {
+  (sp.experimentalOnly ? sp.exp.map((_, i) => i) : [...sp.e2p.keys()]).filter(i => inRange(sp.exp[i][0])).sort((a, b) => sp.exp[b][1] - sp.exp[a][1]).slice(0, 10).forEach(i => {
     const px = x(sp.exp[i][0]);
     if (placed.some(q => Math.abs(q - px) < 46) || placed.length >= 5) return;
     placed.push(px);
@@ -491,11 +568,13 @@ function drawMirror(el, k, compact) {
   }
   s += `<line class="baseline" x1="${m.l}" x2="${W - m.r}" y1="${mid}" y2="${mid}"/>`;
   const expLabel = sp.merged ? `merged ${sp.pair.input_values.map(v => fmt(v, 0)).join('/')} ${esc(sp.pair.input_unit)}`
-    : `${energyLabel(sp.pair)} ${esc(sp.pair.input_unit)}`;
-  const predLabel = sp.merged ? `merged ${sp.pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV · overall similarity ${fmt(c.entropy_similarity, 3)}`
-    : `${fmt(sp.pair.model_energies_ev ?? sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}`;
+    : experimentalEnergyLabel(sp.pair);
   s += `<text class="side-label" x="${m.l + 6}" y="${m.t + 10}">Experimental · ${expLabel}</text>`;
-  s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${predLabel}</text>`;
+  if (!sp.experimentalOnly) {
+    const predLabel = sp.merged ? `merged ${sp.pair.model_energies_ev.map(v => fmt(v, 0)).join('/')} eV · overall similarity ${fmt(c.entropy_similarity, 3)}`
+      : `${fmt(sp.pair.model_energies_ev ?? sp.pair.model_energy_ev ?? sp.pair.atlas_ev, 0)} eV · similarity ${fmt(sp.pair.entropy_similarity ?? c.entropy_similarity, 3)}`;
+    s += `<text class="side-label" x="${m.l + 6}" y="${m.t + ih - 4}">Predicted #${k + 1} · ${predLabel}</text>`;
+  }
   s += '</svg>';
   el.innerHTML = s;
   wirePlot(el, k, sp, { m, iw, ih, mid, x, lo, hi });
@@ -557,7 +636,7 @@ function peakTip(k, sp, h) {
   if (h.kind === 'e') {
     const [mz, it] = sp.exp[h.i], pi = sp.e2p.get(h.i);
     const rel = `${(100 * it / sp.expMax).toFixed(1)}% of base peak`;
-    if (pi == null) return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br><span class="muted">Not explained by #${k + 1}</span>`;
+    if (pi == null) return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br><span class="muted">${sp.experimentalOnly ? 'No candidate prediction is available' : `Not explained by #${k + 1}`}</span>`;
     const f = peakFormula(k, sp, pi);
     return `<b>Experimental m/z ${mz.toFixed(4)}</b><br>${rel}<br>Matched predicted ${sp.pred[pi][0].toFixed(4)} (${ppm(mz, sp.pred[pi][0]).toFixed(1)} ppm)${f ? `<br>${fhtml(f)}` : ''}`;
   }
@@ -650,6 +729,14 @@ async function renderInspector() {
   const k = S.cand, c = cand(), sp = spectraFor(c), r = S.r;
   currentPayload = null;
   $('struct').classList.remove('dim');
+  if (!c) {
+    $('struct').innerHTML = '';
+    $('cand-summary').innerHTML = `<div class="stat"><b>${sp?.exp.length || 0}</b><span>${sp?.merged ? 'merged ' : ''}experimental peaks</span></div>
+      <div class="stat"><b>${Object.keys(S.result.spectra).length}</b><span>experimental spectra</span></div>`;
+    renderPeakInfo(sp, null);
+    $('frag-list').innerHTML = '';
+    return;
+  }
   $('struct').innerHTML = '<span class="sub">Drawing…</span>';
   $('cand-summary').innerHTML = `<div class="stat"><b>${fmt(sp?.pair.entropy_similarity ?? c.entropy_similarity, 3)}</b><span>${sp?.merged ? 'overall ' : ''}entropy similarity</span></div>
     <div class="stat"><b>${pct(c.explained_intensity)}</b><span>intensity explained</span></div>
@@ -675,10 +762,10 @@ function renderPeakInfo(sp, pl) {
   const note = $('frag-note'), box = $('peak-info');
   note.disabled = true; note.value = '';
   $('expand-fragment-note').disabled = true;
-  if (!sp || !S.peak) { box.innerHTML = '<span class="sub">Hover a peak to preview its fragment on the structure; click to pin it here.</span>'; return; }
+  if (!sp || !S.peak) { box.innerHTML = `<span class="sub">${sp?.experimentalOnly ? 'Hover a peak to see its m/z and relative intensity; click to pin it here.' : 'Hover a peak to preview its fragment on the structure; click to pin it here.'}</span>`; return; }
   if (S.peak.kind === 'e') {
     const [mz, it] = sp.exp[S.peak.i];
-    box.innerHTML = `<div>Experimental m/z <b>${mz.toFixed(4)}</b> · ${(100 * it / sp.expMax).toFixed(1)}%</div><div class="sub">Not explained by #${S.cand + 1}. Compare another candidate or try another formula.</div>`;
+    box.innerHTML = `<div>Experimental m/z <b>${mz.toFixed(4)}</b> · ${(100 * it / sp.expMax).toFixed(1)}%</div><div class="sub">${sp.experimentalOnly ? 'No candidate prediction is available for comparison.' : `Not explained by #${S.cand + 1}. Compare another candidate or try another formula.`}</div>`;
     return;
   }
   const i = S.peak.i, [mz, it] = sp.pred[i], ei = sp.p2e.get(i), f = fragmentFor(pl, sp, i);
@@ -711,6 +798,7 @@ function renderFragList(sp, pl) {
 }
 function renderEvidence() {
   const c = cand(), sp = spectraFor(c), res = S.result;
+  if (!c) { renderEmpty(); return; }
   if (!sp) { $('evidence').innerHTML = ''; return; }
   const model = !String(c.source).startsWith('public');
   const unexplained = sp.exp.map((p, i) => i).filter(i => !sp.e2p.has(i) && sp.exp[i][0] <= sp.precursor + 2 && sp.exp[i][1] / sp.expMax >= 0.03)
@@ -832,6 +920,7 @@ function route() {
 function go(i) { if (i != null && S.index[i]) location.hash = `#r${i}`; }
 function stepUnknown(dir) {
   if (!S.order.length) return;
+  $(dir < 0 ? 'prev' : 'next').focus({ preventScroll: true });
   const pos = S.order.indexOf(S.r);
   go(S.order[pos < 0 ? 0 : (pos + dir + S.order.length) % S.order.length]);
 }
@@ -857,7 +946,7 @@ function openPalette() {
 }
 function palRows() {
   const q = $('pal-q').value.trim().toLowerCase();
-  return S.index.filter(r => !q || [r.label, r.formula, fmt(r.parentmass, 4), r.top_smiles].join(' ').toLowerCase().includes(q)).slice(0, 40);
+  return qcRows().filter(r => !q || [r.label, r.formula, fmt(r.parentmass, 4), r.top_smiles].join(' ').toLowerCase().includes(q)).slice(0, 40);
 }
 function renderPalette() {
   const rows = palRows(); palSel = Math.min(palSel, Math.max(0, rows.length - 1));
@@ -875,6 +964,31 @@ function copyFormulaCommand(f) {
 let toastTimer = null;
 function toast(html, ms = 5000) { const t = $('toast'); t.innerHTML = html; t.hidden = false; clearTimeout(toastTimer); if (ms) toastTimer = setTimeout(() => { t.hidden = true; }, ms); }
 function showError(msg) { const e = $('error'); e.textContent = msg; e.hidden = !msg; }
+
+function rankedSmilesCSV() {
+  const header = ['unknown_id', ...Array.from({ length: 10 }, (_, i) =>
+    [`top${i + 1}_smiles`, `top${i + 1}_similarity`]).flat()];
+  const rows = S.index.map(row => {
+    const candidates = row.ranked_candidates ?? STATIC?.results[row.index]?.result.candidates ?? [];
+    return [row.label, ...Array.from({ length: 10 }, (_, i) =>
+      [candidates[i]?.smiles ?? '', candidates[i]?.entropy_similarity ?? '']).flat()];
+  });
+  return [header, ...rows].map(row => row.map(value => {
+    const cell = String(value ?? '');
+    return /[",\r\n]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell;
+  }).join(',')).join('\r\n') + '\r\n';
+}
+
+function downloadSmilesCSV() {
+  const url = URL.createObjectURL(new Blob([rankedSmilesCSV()], { type: 'text/csv;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'ranked_smiles.csv';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 async function exportReport() {
   if (STATIC) return;
@@ -909,17 +1023,27 @@ function onKey(e) {
     ArrowDown: () => has && selectCandidate(S.cand + 1), ArrowUp: () => has && selectCandidate(S.cand - 1),
     ArrowRight: () => has && stepPeak(1), ArrowLeft: () => has && stepPeak(-1),
     1: () => decide('keep'), 2: () => decide('uncertain'), 3: () => decide('reject'), 0: () => decide('unreviewed'),
-    c: () => toggleCompare(), z: () => { if (has) { S.zoom = null; renderPlots(); } },
+    c: () => toggleCompare(), z: () => { if (S.result) { S.zoom = null; renderPlots(); } },
   }[e.key];
   if (act) { e.preventDefault(); act(); }
 }
 function wire() {
-  ['f-q', 'f-outcome', 'f-review', 'f-sim'].forEach(id => $(id).addEventListener('input', () => { $('f-sim-v').textContent = Number($('f-sim').value).toFixed(2); renderTable(); }));
+  ['f-qc', 'f-qc-n', 'f-qc-m'].forEach(id => $(id).addEventListener('input', () => {
+    const valid = $('f-qc-n').checkValidity() && $('f-qc-m').checkValidity();
+    if (!valid && id !== 'f-qc') return;
+    if (valid) Object.assign(S.qc, { minPeaks: Number($('f-qc-n').value), minIntensity: Number($('f-qc-m').value) });
+    S.qc.enabled = $('f-qc').checked;
+    renderOverview(true);
+  }));
+  ['f-q', 'f-outcome', 'f-review', 'f-sim'].forEach(id => $(id).addEventListener('input', () => { $('f-sim-v').textContent = Number($('f-sim').value).toFixed(2); renderTable(true); }));
   document.querySelectorAll('#ov-table th[data-k]').forEach(th => th.addEventListener('click', () => {
     const k = th.dataset.k;
     S.sort = S.sort.key === k ? { key: k, dir: -S.sort.dir } : { key: k, dir: ['top_similarity', 'top_explained'].includes(k) ? -1 : 1 };
-    renderTable();
+    renderTable(true);
   }));
+  $('ov-prev').addEventListener('click', () => changePage(S.page - 1));
+  $('ov-next').addEventListener('click', () => changePage(S.page + 1));
+  $('ov-page').addEventListener('change', () => changePage(Number($('ov-page').value)));
   const openRow = e => { const tr = e.target.closest('tr[data-i]'); if (tr) go(Number(tr.dataset.i)); };
   $('ov-table').tBodies[0].addEventListener('click', openRow);
   $('ov-table').tBodies[0].addEventListener('keydown', e => { if (e.key === 'Enter') openRow(e); });
@@ -971,6 +1095,7 @@ function wire() {
   $('next').addEventListener('click', () => stepUnknown(1));
   $('open-search').addEventListener('click', openPalette);
   $('help').addEventListener('click', () => $('shortcuts').showModal());
+  $('download-smiles').addEventListener('click', downloadSmilesCSV);
   $('export').addEventListener('click', exportReport);
   $('theme').addEventListener('click', () => {
     const dark = getComputedStyle(document.documentElement).colorScheme.includes('dark');
@@ -989,7 +1114,7 @@ function wire() {
   document.addEventListener('keydown', onKey);
   window.addEventListener('hashchange', route);
   let rt = null;
-  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { if (!$('workspace').hidden && S.result?.candidates.length) renderPlots(); }, 120); });
+  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { if (!$('workspace').hidden && S.result) renderPlots(); }, 120); });
 }
 
 async function init() {
@@ -999,6 +1124,9 @@ async function init() {
     await loadStatic();
     const data = await api.index();
     S.index = data.results;
+    $('download-smiles').disabled = S.index.length === 0;
+    // Older static snapshots carry spectra without a precomputed QC summary.
+    if (STATIC) S.index.forEach((r, i) => { r.spectrum_qc ||= window.MSMSMerge.spectrumQC(STATIC.results[i].result); });
     if (data.review_token) S.token = data.review_token;
     const first = S.index[0]?.path || '';
     const folder = first.split('/').slice(-3, -2)[0] || '';
@@ -1022,7 +1150,7 @@ async function init() {
       }
     }
     S.order = filtered().map(r => r.index);
-    if (S.index.length === 1 && !location.hash) location.hash = '#r0';
+    if (S.index.length === 1 && passesQC(S.index[0]) && !location.hash) location.hash = '#r0';
     route();
   } catch (error) { showError(`Cannot load results: ${error.message}`); }
 }

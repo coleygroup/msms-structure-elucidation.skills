@@ -66,6 +66,17 @@ def worker(python: str, action: str, **kwargs):
         cwd = Path(cwd).expanduser().resolve()
         if not (cwd / 'src/ms_pred').is_dir():
             raise FileNotFoundError(f'Not an ms-pred checkout: {cwd}. Clone https://github.com/coleygroup/ms-pred and follow its README.')
+    if action == 'pubchem-formula' and os.environ.get('MSMS_FEATURE_PREPARATION') == '1' and Path(python).absolute() == Path(sys.executable).absolute():
+        from msms_structure_elucidation.pubchem_index import formula_candidates
+        return formula_candidates(kwargs['formula'], kwargs['formula_map'], kwargs['precursor_mz'],
+                                  kwargs['adduct'], kwargs['ms1_ppm'], kwargs.get('prediction_cache'))
+    if action == 'simulate' and os.environ.get('MSMS_PREDICTION_CACHE_ONLY') == '1' and os.environ.get('MSMS_FEATURE_PREPARATION') == '1' and Path(python).absolute() == Path(sys.executable).absolute():
+        from msms_structure_elucidation import worker as science
+        values = dict(kwargs)
+        values['smiles'] = json.loads(Path(values.pop('smiles_json')).read_text())
+        if not values.pop('limit_images', False):
+            values['top_k'] = None
+        return science.simulate(**values)
     if cwd is None and Path(python).absolute() == Path(sys.executable).absolute():
         from msms_structure_elucidation import worker as science
         if action == 'rank':
@@ -82,7 +93,8 @@ def worker(python: str, action: str, **kwargs):
         if action == 'atlas-info':
             return science.atlas_info(str(kwargs['mgf']), [int(x) for x in kwargs['energies'].split(',')],
                 str(kwargs['spectrum']), kwargs['formula'], kwargs['experimental_unit'])
-    cmd = [python, '-m', 'msms_structure_elucidation.worker', action]
+    cmd = ([python, '-m', 'msms_structure_elucidation.pubchem_index'] if action == 'pubchem-formula'
+           else [python, '-m', 'msms_structure_elucidation.worker', action])
     for key, value in kwargs.items():
         if value is True:
             cmd.append('--' + key.replace('_', '-'))
@@ -146,6 +158,22 @@ def _model_options(args, config: dict, default_model='iceberg') -> dict:
     return options
 
 
+def _pubchem_formula_map(args, config: dict, model_options: dict) -> str | None:
+    """Resolve an explicit index or the conventional file in the selected checkout."""
+    supplied = getattr(args, 'pubchem_formula_map', None)
+    configured = config.get('models', {}).get('retrieval', {}).get('pubchem_formula_map')
+    path = str(Path(supplied).expanduser().resolve()) if supplied else asset(configured, config)
+    if path:
+        if not Path(path).is_file():
+            raise FileNotFoundError(f'Configured PubChem formula index is missing: {path}')
+        return path
+    if model_options.get('ms_pred_dir'):
+        discovered = Path(model_options['ms_pred_dir']) / 'data/retrieval/pubchem/pubchem_formulae_inchikey.hdf5'
+        if discovered.is_file():
+            return str(discovered)
+    return None
+
+
 def _devices(value) -> str | None:
     """CUDA_VISIBLE_DEVICES string; a YAML list such as [1] or [0, 1] becomes '1' or '0,1'."""
     if isinstance(value, (list, tuple)):
@@ -179,7 +207,8 @@ def _save(result: dict, out: Path, no_report=False) -> None:
 
 def _simulate_shards(python: str, path: Path, mgf: Path | None, formula: str, unit: str,
                      out: Path, options: dict, instrument: str | None, shard_size: int,
-                     top_k: int, smiles: list[str] | None = None) -> tuple[list[dict], int]:
+                     top_k: int, smiles: list[str] | None = None,
+                     prepare_only: bool = False) -> tuple[list[dict], int]:
     from msms_structure_elucidation.worker import sort_candidates
     if not options['ms_pred_dir']:
         raise FileNotFoundError('Set --ms-pred-dir or models.simulator.ms_pred_src to an ms-pred checkout for local model inference')
@@ -193,6 +222,12 @@ def _simulate_shards(python: str, path: Path, mgf: Path | None, formula: str, un
             raise ValueError('Direct prediction requires a candidate SMILES list')
         smiles = worker(python, 'atlas-smiles', mgf=mgf)
     if not smiles:
+        return [], 0
+    if prepare_only:
+        if options.get('prediction_cache') is None:
+            raise ValueError('Separated preparation requires a shared prediction cache')
+        from msms_structure_elucidation.preparation import record_request
+        record_request(out, path, formula, unit, instrument, options, smiles, python)
         return [], 0
     shards = out / 'model_shards' / formula
     shards.mkdir(parents=True, exist_ok=True)
@@ -254,15 +289,17 @@ def _check_search_options(args: argparse.Namespace) -> None:
 
 def _mass_formula_candidates(python: str, path: Path, group: dict, record: dict, unit: str,
                              out: Path, options: dict, instrument: str | None, shard_size: int,
-                             top_k: int) -> list[dict]:
+                             top_k: int, prepare_only: bool = False) -> list[dict]:
     """Validate a PubChem formula group, preserve aliases, and predict every unique structure."""
     formula = group['formula']
     folder = out / 'pubchem_candidates'
     folder.mkdir(exist_ok=True)
     listing = folder / f'{formula}.input.json'
     listing.write_text(json.dumps([row['smiles'] for row in group['candidates']]))
-    checked = worker(python, 'validate', smiles_json=listing, formula=formula,
-                     keep_duplicates=True, strip_stereo=True)
+    checked = group.get('validated_structures')
+    if checked is None:
+        checked = worker(python, 'validate', smiles_json=listing, formula=formula,
+                         keep_duplicates=True, strip_stereo=True)
     by_input = {row['input_smiles']: row for row in checked}
     requested = {row['smiles'] for row in group['candidates']}
     if set(by_input) != requested or any(not row['formula_match'] for row in checked):
@@ -282,7 +319,7 @@ def _mass_formula_candidates(python: str, path: Path, group: dict, record: dict,
     manifest.write_text(json.dumps(list(provenance.values()), indent=2, allow_nan=False))
     record.update(candidate_manifest=str(manifest), candidate_structures=len(provenance), scored_structures=0)
     candidates, count = _simulate_shards(python, path, None, formula, unit, out, options,
-                                        instrument, shard_size, top_k, sorted(provenance))
+                                        instrument, shard_size, top_k, sorted(provenance), prepare_only)
     for candidate in candidates:
         candidate.update({key: value for key, value in provenance[candidate['smiles']].items() if key != 'smiles'})
     record.update(scored_structures=count, status='ranked' if candidates else 'no_candidates')
@@ -394,14 +431,28 @@ def run(args):
             if mass_only or direct_formulas:
                 if direct_formulas:
                     from msms_structure_elucidation import pubchem
-                    mass_groups[formula] = pubchem.candidates_for_formula(formula, data['parentmass'], data['adduct'],
-                                                                         tolerance['ms1_ppm'])
+                    formula_map = _pubchem_formula_map(args, config, model_options)
+                    group = None
+                    if formula_map:
+                        python = python or model_python(python_option)
+                        group = worker(python, 'pubchem-formula', formula=formula, formula_map=formula_map,
+                            precursor_mz=data['parentmass'], adduct=data['adduct'], ms1_ppm=tolerance['ms1_ppm'],
+                            prediction_cache=model_options.get('prediction_cache'),
+                            ms_pred_dir=model_options.get('ms_pred_dir'))
+                        if group is None:
+                            result['warnings'].append(f'{formula} is absent from the local PubChem snapshot; using the online formula search.')
+                    mass_groups[formula] = group if group is not None else pubchem.candidates_for_formula(
+                        formula, data['parentmass'], data['adduct'], tolerance['ms1_ppm'])
+                    record['candidate_source'] = {key: mass_groups[formula][key] for key in
+                        ('source', 'coverage_scope', 'formula_index', 'formula_index_sha256', 'dataset_url',
+                         'index_records', 'excluded_records') if key in mass_groups[formula]}
                 record['prediction_source'] = f'local {model_options["model"].upper()}'
                 record['reason'] = 'formula_direct_prediction' if direct_formulas else 'mass_only_direct_prediction'
                 record['pubchem_structures'] = len(mass_groups[formula]['candidates'])
                 python = python or model_python(python_option)
                 candidates.extend(_mass_formula_candidates(python, path, mass_groups[formula], record,
-                    args.collision_unit, out, model_options, result['instrument'], shard_size, top_k))
+                    args.collision_unit, out, model_options, result['instrument'], shard_size, top_k,
+                    getattr(args, 'prepare_only', False)))
                 continue
             if args.atlas_mgf and len(formulas) > 1:
                 raise ValueError('--atlas-mgf can only be used with one formula')
@@ -423,7 +474,7 @@ def run(args):
                 record['prediction_source'] = 'local ICEBERG'
                 simulated, simulated_count = _simulate_shards(python, path, mgf, formula, args.collision_unit, out,
                     model_options, result['instrument'],
-                    shard_size, top_k, coverage['smiles'])
+                    shard_size, top_k, coverage['smiles'], getattr(args, 'prepare_only', False))
                 candidates.extend(simulated)
                 record['status'] = 'ranked' if simulated else 'no_model_predictions'
                 record['scored_structures'] = simulated_count
@@ -447,11 +498,27 @@ def run(args):
                 record['error'] = str(exc)
                 operational_error = exc
                 break
+    _finalize_result(result, data, candidates, operational_error, mass_only, direct_formulas, formulas, mass_groups, top_k, out)
+    if getattr(args, 'prepare_only', False) and not operational_error:
+        from msms_structure_elucidation.preparation import publish
+        publish(out, result, args)
+    _save(result, out, args.no_report)
+    print(json.dumps({'output_dir': str(out), 'status': result['status'], 'formula': result['formula'],
+        'candidates': len(result['candidates']), 'formula_results': result['formula_results'],
+        'warnings': result['warnings']}, indent=2))
+    if operational_error:
+        raise RuntimeError(f'{operational_error} (result: {out / "retrieval.json"})') from operational_error
+    return 0
+
+
+def _finalize_result(result: dict, data: dict, candidates: list, operational_error, mass_only: bool,
+                     direct_formulas: bool, formulas: list, mass_groups: dict, top_k: int, out: Path) -> None:
+    """Publish the same ranking, accounting and peak evidence after either execution route."""
     from msms_structure_elucidation.worker import sort_candidates
     if (mass_only or direct_formulas) and operational_error:
         attempted = {row['formula'] for row in result['formula_results']}
         result['formula_results'].extend({'formula': formula, 'status': 'not_processed',
-            'candidate_structures': len(mass_groups[formula]['candidates']),
+            'candidate_structures': len(mass_groups[formula]['candidates']) if formula in mass_groups else None,
             'reason': 'A previous formula failed; resume after resolving the error.'}
             for formula in formulas if formula not in attempted)
     result['candidates'] = sort_candidates(candidates)[:top_k]
@@ -487,14 +554,6 @@ def run(args):
         result['warnings'].append(
             'No ICEBERG Atlas entry for the searched formulas. Predict their PubChem structures with ICEBERG: '
             f'review --result {out / "retrieval.json"} --proposals pubchem --model iceberg (add --formula to pick one).')
-    _save(result, out, args.no_report)
-    print(json.dumps({'output_dir': str(out), 'status': result['status'], 'formula': result['formula'],
-        'candidates': len(result['candidates']), 'formula_results': result['formula_results'],
-        'warnings': result['warnings']}, indent=2))
-    if operational_error:
-        raise RuntimeError(f'{operational_error} (result: {out / "retrieval.json"})') from operational_error
-    return 0
-
 
 def pubchem_formulas(result: dict, data: dict, elements: str, limit: int = 3) -> list[str]:
     """When MSBuddy proposes nothing, take formulas of PubChem structures matching the precursor mass."""
@@ -666,7 +725,8 @@ def _batch_feature(key, row, context: dict) -> dict:
         if previous.get('status') in ('ranked', 'needs_formula', 'no_atlas_coverage', 'no_candidates'):
             return {'feature_id': feature, 'status': previous['status'], 'output_dir': str(target), 'resumed': True}
     opts = argparse.Namespace(input=path, collision_unit=unit, output_dir=str(target), formula=formula,
-        formulas_file=args.formulas_file, ms_pred_python=args.ms_pred_python, ms_pred_dir=args.ms_pred_dir,
+        formulas_file=args.formulas_file, pubchem_formula_map=getattr(args, 'pubchem_formula_map', None),
+        ms_pred_python=args.ms_pred_python, ms_pred_dir=args.ms_pred_dir,
         config=args.config, instrument=row.get('instrument') or args.instrument,
         cuda_devices=args.cuda_devices, model=args.model, checkpoint=args.checkpoint,
         gen_checkpoint=args.gen_checkpoint, inten_checkpoint=args.inten_checkpoint,
@@ -703,6 +763,10 @@ def batch(args):
     asset_versions = {key: (model_options[key], Path(model_options[key]).stat().st_size,
         Path(model_options[key]).stat().st_mtime_ns) for key in ('checkpoint', 'gen_checkpoint', 'inten_checkpoint')
         if model_options.get(key) and Path(model_options[key]).is_file()}
+    formula_map = _pubchem_formula_map(args, config, model_options)
+    if formula_map:
+        stat = Path(formula_map).stat()
+        asset_versions['pubchem_formula_map'] = (formula_map, stat.st_size, stat.st_mtime_ns)
     defaults = config.get('models', {}).get('batch', {})
     max_model_jobs = args.max_model_jobs or defaults.get('max_model_jobs', 1)
     min_free_gb = args.min_free_memory_gb if args.min_free_memory_gb is not None else defaults.get('min_free_memory_gb', 4)
@@ -970,8 +1034,10 @@ def main(argv=None):
     command.add_argument('--collision-unit', required=True, choices=['NCE', 'eV'],
                          help='verified unit of all experimental collision labels')
     command.add_argument('--output-dir', required=True)
+    command.add_argument('--prepare-only', action='store_true', help='CPU preparation only; publish prediction requests without running a model')
     command.add_argument('--formula', help='neutral molecular formula; otherwise inferred with MSBuddy')
     command.add_argument('--formulas-file', help='one neutral formula per line; all are searched')
+    command.add_argument('--pubchem-formula-map', help='local PubChem formula-to-SMILES/InChIKey HDF5 snapshot')
     command.add_argument('--ms-pred-python', help='Python interpreter with ms_pred, msbuddy, RDKit')
     command.add_argument('--ms-pred-dir', help='ms-pred source checkout used as model working directory')
     command.add_argument('--config', help='shared YAML settings (default configs/default.yaml)')
@@ -1042,6 +1108,7 @@ def main(argv=None):
     batcher.add_argument('--output-dir', required=True)
     batcher.add_argument('--collision-unit', choices=['NCE', 'eV'], help='fallback when manifest has no unit')
     batcher.add_argument('--formulas-file')
+    batcher.add_argument('--pubchem-formula-map', help='local PubChem formula-to-SMILES/InChIKey HDF5 snapshot')
     batcher.add_argument('--ms-pred-python')
     batcher.add_argument('--ms-pred-dir')
     batcher.add_argument('--config')

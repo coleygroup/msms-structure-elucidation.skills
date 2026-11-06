@@ -33,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
                      devices=devices, slurm_job_id=os.environ.get('SLURM_JOB_ID'))
     request = store.request(job_id)
     config = read_json(job_dir / 'config.json') or settings(None)
+    if (job_dir/'config.json').is_file():
+        os.environ['MSMS_CONFIG'] = str(job_dir/'config.json')
     if request.get('kind') == 'gpu' and config.get('mcp', {}).get('backend') == 'kubernetes' and not devices:
         # Device plugins expose only the allocated GPUs. Do not set physical GPU
         # indices in the Pod manifest; some clusters prohibit that env override.
@@ -47,10 +49,13 @@ def main(argv: list[str] | None = None) -> int:
     with (job_dir / 'log.txt').open('a') as log:
         try:
             environment = config.get('mcp', {}).get('worker_environment', {})
-            if any(key in environment for key in ('CUDA_VISIBLE_DEVICES', 'MSMS_PIPELINE_JOB')):
+            if any(key in environment for key in ('CUDA_VISIBLE_DEVICES', 'MSMS_PIPELINE_JOB','MSMS_CONFIG')):
                 raise ValueError('worker_environment must not override scheduler GPU or pipeline ownership')
             os.environ.update({str(key): str(value) for key, value in environment.items()})
             os.environ.setdefault('MSMS_PUBCHEM_RATE_FILE', str(store.root / 'pubchem-rate.json'))
+            os.environ.setdefault('MSMS_PUBCHEM_CACHE_DIR', str(store.root / 'pubchem-responses'))
+            os.environ.setdefault('MSMS_PUBCHEM_CACHE_TTL_SECONDS',
+                                  str(config.get('mcp', {}).get('pubchem_cache_ttl_seconds', 86400)))
             if request.get('kind') == 'gpu':
                 from msms_structure_elucidation.mcp.metrics import GpuMonitor
                 with GpuMonitor(job_dir, devices, config.get('mcp', {}).get('gpu_monitor_interval_seconds', 1.)):

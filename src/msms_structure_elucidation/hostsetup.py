@@ -326,6 +326,42 @@ def write_client_config(path: Path, name: str, entry: dict) -> dict:
     return data
 
 
+def stage_worker_settings(host: dict, saved: dict) -> tuple[dict, dict]:
+    """Record per-host stage counts from the GPU ratio, retaining explicit host tuning."""
+    from msms_structure_elucidation.mcp.cpu_pool import limits, stage_defaults
+    devices = saved.get('gpu_devices')
+    allowed = {int(device) for device in devices} if devices is not None else None
+    gpu_slots = sum(allowed is None or gpu['index'] in allowed for gpu in host['gpus'])
+    cap = saved.get('max_concurrent_jobs', 'auto')
+    scheduled = saved.get('backend') in ('slurm', 'kubernetes')
+    if scheduled and cap in (None, 'auto'):
+        gpu_slots = 1  # The scheduler adapters default to one queued GPU job.
+    elif cap not in (None, 'auto'):
+        if int(cap) < 1:
+            raise ValueError('max_concurrent_jobs must be positive or auto')
+        gpu_slots = int(cap) if scheduled else min(gpu_slots, int(cap))
+    proposed = stage_defaults(max(1, gpu_slots))
+    # A manually selected legacy total/reservation remains a supported input.
+    legacy = (saved.get('feature_cpu_workers') is not None or saved.get('feature_preparation_workers') == 0) \
+        and saved.get('feature_scoring_workers') is None
+    if legacy:
+        budgets = limits(saved)
+    else:
+        chosen = {**proposed, **{key: saved[key] for key in
+                  ('feature_preparation_workers', 'feature_scoring_workers') if saved.get(key) not in (None, 'auto')}}
+        budgets = limits(chosen)
+    if 'shared' in budgets:
+        proposed['feature_cpu_workers'] = budgets['shared']
+    proposed.update(feature_preparation_workers=budgets.get('preparation', 0),
+                    feature_scoring_workers=budgets.get('scoring'))
+    for key in ('feature_output_workers', 'max_cpu_jobs'):
+        if saved.get(key) is not None:
+            proposed[key] = saved[key]
+    return proposed, {'status': 'saved_choices' if legacy or any(key in saved for key in proposed) else 'starting_point',
+                      'gpu_slots': gpu_slots, 'ratio': [2, 1, 0.5, 1],
+                      'mcp_settings': proposed, 'measured': False}
+
+
 def setup(args, model_options: dict, find_python, batch_defaults: dict | None = None) -> dict:
     """Probe this host, benchmark ICEBERG when possible, and save configs/local.yaml."""
     if args.remote:
@@ -391,8 +427,10 @@ def setup(args, model_options: dict, find_python, batch_defaults: dict | None = 
     features = hostprobe.batch_workers(host['cpu_threads'], host['ram_total_gb'],
                                        batch_defaults.get('max_model_jobs', 1), batch_defaults.get('min_free_memory_gb', 4))
     update = {'models': {'simulator': simulator, 'batch': {'max_workers': features}}}
-    if mcp_paths(args):
-        update['mcp'] = mcp_paths(args)
+    existing = read_yaml(LOCAL_CONFIG) if LOCAL_CONFIG.is_file() else {}
+    same_host = existing.get('host_profile', {}).get('hostname') in (None, host['hostname'])
+    stage_settings, stage_profile = stage_worker_settings(host, existing.get('mcp', {}) if same_host else {})
+    update['mcp'] = {**stage_settings, **mcp_paths(args)}
     paths = model_paths(args)
     notes += check_interpreters(paths)
     update['models']['simulator'].update(paths['simulator'])
@@ -402,9 +440,11 @@ def setup(args, model_options: dict, find_python, batch_defaults: dict | None = 
         'cpu_threads': host['cpu_threads'], 'ram_total_gb': host['ram_total_gb'], 'status': status,
         'configured': datetime.datetime.now().isoformat(timespec='seconds'), 'notes': notes,
         'tuning_model': model, 'trials': trials,
+        'pipeline_workers': stage_profile,
         'benchmark': {str(t['batch_size']): t.get('spectra_per_second') if fits(t) else 'failed' for t in trials}}
     save_local(update)
     return {'status': status, 'host': host, 'simulator': simulator, 'batch_max_workers': features,
+            'mcp_worker_settings': stage_settings,
             'notes': notes, 'trials': trials,
             'config': str(LOCAL_CONFIG)}
 
@@ -416,9 +456,46 @@ def setup_pool(servers_path: Path, probe: bool = True) -> dict:
     if not isinstance(servers, dict) or not servers:
         raise ValueError('The servers file must contain a nonempty JSON mapping of endpoint names to settings')
     reports = {}
+    identities = {}
     for name, settings in servers.items():
         remote = Endpoint(name, settings)
         if settings.get('enabled', True):
             reports[name] = remote.call('probe') if probe else {'status': 'not_probed'}
-    save_local({'mcp': {'backend': 'pool', 'servers': servers}, 'execution': {'mode': 'local'}})
+            overrides = {**settings.get('feature_config', {}).get('mcp', {}), **settings.get('mcp', {})}
+            stage_keys = ('feature_cpu_workers', 'feature_preparation_workers',
+                          'feature_scoring_workers', 'feature_output_workers')
+            if settings.get('features') and not settings.get('config') and not any(k in overrides for k in stage_keys):
+                slots = settings.get('max_jobs', 'auto')
+                if slots in (None, 'auto'):
+                    slots = overrides.get('max_concurrent_jobs', reports[name].get('max_concurrent_jobs'))
+                if slots not in (None, 'auto'):
+                    from msms_structure_elucidation.mcp.cpu_pool import stage_defaults
+                    if settings.get('backend', 'local') == 'local' and 'gpus' in reports[name]:
+                        devices = overrides.get('gpu_devices')
+                        allowed = set(map(int, devices)) if devices is not None else None
+                        detected = sum(allowed is None or gpu['index'] in allowed for gpu in reports[name]['gpus'])
+                        slots = min(int(slots), max(1, detected))
+                    target = settings.setdefault('feature_config', {}).setdefault('mcp', {})
+                    for key, value in stage_defaults(int(slots)).items():
+                        target.setdefault(key, value)
+                    reports[name]['stage_worker_settings'] = {key: target[key] for key in
+                        ('feature_preparation_workers', 'feature_scoring_workers', 'feature_output_workers', 'max_cpu_jobs')}
+                    remote = Endpoint(name, settings)
+            if probe and settings.get('features'):
+                reports[name]['features'] = {}
+                for model in settings.get('models',[]):
+                    result = remote.call('worker-probe',{'model':model})
+                    identity = result['contract']
+                    if not identity.get('ready'):
+                        raise ValueError(f'{name} cannot run {model} features: {identity.get("missing")}')
+                    scientific = {key:identity[key] for key in ('weights','source','adapter','sparse_k')}
+                    if model in identities and identities[model]!=scientific:
+                        raise ValueError(f'{name}: all {model} feature workers must use the same approved weights and source')
+                    identities[model] = scientific
+                    reports[name]['features'][model] = result
+    mcp = {'backend':'pool','servers':servers,
+           'feature_placement':'workers' if any(node.get('features') for node in servers.values()) else 'coordinator'}
+    if identities:
+        mcp['approved_model_identities'] = identities
+    save_local({'mcp': mcp, 'execution': {'mode': 'local'}})
     return {'backend': 'pool', 'servers': reports, 'config': str(LOCAL_CONFIG)}

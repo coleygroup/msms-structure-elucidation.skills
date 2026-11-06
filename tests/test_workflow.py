@@ -366,7 +366,8 @@ class WorkflowTests(unittest.TestCase):
             with patch.object(cli, 'worker', side_effect=fake_worker), patch.object(cli, 'download_mgf', return_value=mgf), \
                     patch.object(cli, '_simulate_shards', return_value=(simulated, 2)) as shards:
                 self.assertEqual(cli.run(args), 0)
-            self.assertEqual(shards.call_args.args[-1], ['C', 'CC'])
+            self.assertEqual(shards.call_args.args[10], ['C', 'CC'])
+            self.assertFalse(shards.call_args.args[11])  # Run inference, not preparation only.
             record = json.loads((root / 'out/retrieval.json').read_text())['formula_results'][0]
             self.assertEqual((record['reason'], record['atlas_adduct'], record['status']),
                              ('atlas_lacks_adduct', '[M+H]+', 'ranked'))

@@ -104,6 +104,99 @@ class BatchConcurrencyTest(unittest.TestCase):
 
 
 class TuneTest(unittest.TestCase):
+    def test_pool_setup_records_worker_ratio_and_retains_explicit_tuning(self):
+        contract = {'ready': True, 'weights': {'checkpoint':'same'}, 'source':'native',
+                    'adapter':'package', 'sparse_k':100}
+        calls = []
+        def probe(endpoint, operation, payload=None):
+            calls.append((endpoint.name, operation, dict(endpoint.settings.get('feature_config', {}).get('mcp', {}))))
+            return {'max_concurrent_jobs':8} if operation=='probe' else {'contract':contract}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)/'servers.json'
+            base = {'transport':'local', 'job_root':str(Path(tmp)/'jobs'), 'features':True,
+                    'models':['glacier'], 'max_jobs':'auto'}
+            source.write_text(json.dumps({'new':base, 'tuned':{**base, 'feature_config':{
+                'mcp':{'feature_preparation_workers':10,'feature_scoring_workers':3,'feature_output_workers':4}}}}))
+            with patch('msms_structure_elucidation.mcp.fleet.Endpoint.call',new=probe), \
+                    patch.object(hostsetup,'save_local') as save:
+                hostsetup.setup_pool(source)
+            nodes=save.call_args.args[0]['mcp']['servers']
+            configured=nodes['new']['feature_config']['mcp']
+            self.assertEqual((configured['feature_preparation_workers'],configured['feature_scoring_workers'],
+                              configured['feature_output_workers'],configured['max_cpu_jobs']), (16,4,8,'auto'))
+            self.assertEqual(nodes['tuned']['feature_config']['mcp']['feature_preparation_workers'],10)
+            self.assertEqual(next(row[2] for row in calls if row[:2]==('new','worker-probe')),
+                             configured)
+
+    def test_setup_records_separate_eight_gpu_stage_counts(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(hostsetup, 'LOCAL_CONFIG', Path(tmp)/'local.yaml'), \
+                patch.object(hostprobe, 'probe', return_value=host([gpu(i,24,24) for i in range(8)],52,256)), \
+                patch.object(hostsetup, 'save_local') as save:
+            args = SimpleNamespace(remote=None, scheduler=None, no_benchmark=True, model='glacier')
+            report = hostsetup.setup(args, {'model':'glacier'}, lambda value:value)
+            saved = save.call_args.args[0]
+            self.assertEqual(saved['mcp']['feature_preparation_workers'], 16)
+            self.assertEqual(saved['mcp']['feature_scoring_workers'], 4)
+            self.assertEqual(saved['mcp']['feature_output_workers'], 8)
+            self.assertEqual(saved['mcp']['max_cpu_jobs'], 'auto')
+            self.assertNotIn('feature_cpu_workers', saved['mcp'])
+            self.assertEqual(report['mcp_worker_settings'], saved['mcp'])
+            self.assertFalse(saved['host_profile']['pipeline_workers']['measured'])
+
+    def test_pool_worker_ratio_respects_allowed_physical_gpu_capacity(self):
+        contract = {'ready': True, 'weights': {'checkpoint': 'same'}, 'source': 'native',
+                    'adapter': 'package', 'sparse_k': 100}
+        def probe(endpoint, operation, payload=None):
+            if operation == 'probe':
+                return {'max_concurrent_jobs': 8, 'gpus': [gpu(i, 24, 24) for i in range(3)]}
+            return {'contract': contract}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'servers.json'
+            base = {'transport': 'local', 'job_root': str(Path(tmp) / 'jobs'),
+                    'features': True, 'models': ['glacier'], 'max_jobs': 8,
+                    'mcp': {'gpu_devices': [1]}}
+            source.write_text(json.dumps({'local': base, 'scheduled': {**base, 'backend': 'slurm'}}))
+            with patch('msms_structure_elucidation.mcp.fleet.Endpoint.call', new=probe), \
+                    patch.object(hostsetup, 'save_local') as save:
+                hostsetup.setup_pool(source)
+            nodes = save.call_args.args[0]['mcp']['servers']
+            local = nodes['local']['feature_config']['mcp']
+            scheduled = nodes['scheduled']['feature_config']['mcp']
+            self.assertEqual((local['feature_preparation_workers'], local['feature_scoring_workers'],
+                              local['feature_output_workers']), (2, 1, 1))
+            self.assertEqual((scheduled['feature_preparation_workers'], scheduled['feature_scoring_workers'],
+                              scheduled['feature_output_workers']), (16, 4, 8))
+
+    def test_setup_handles_auto_preparation_and_explicit_legacy_shared_workers(self):
+        machine = host([gpu(0, 24, 1), gpu(1, 24, 24)])
+        counts, _ = hostsetup.stage_worker_settings(machine, {'feature_preparation_workers': 'auto'})
+        self.assertEqual((counts['feature_preparation_workers'], counts['feature_scoring_workers'],
+                          counts['feature_output_workers']), (4, 1, 2))
+        counts, _ = hostsetup.stage_worker_settings(machine, {'feature_preparation_workers': 0})
+        self.assertEqual(counts['feature_cpu_workers'], 2)
+        self.assertEqual(counts['feature_preparation_workers'], 0)
+        self.assertIsNone(counts['feature_scoring_workers'])
+
+    def test_stage_ratio_counts_busy_gpus_and_preserves_saved_host_tuning(self):
+        machine = host([gpu(0,24,1), gpu(1,24,24), gpu(2,24,24)])
+        counts, profile = hostsetup.stage_worker_settings(machine, {})
+        self.assertEqual((counts['feature_preparation_workers'], counts['feature_scoring_workers'],
+                          counts['feature_output_workers']), (6,2,3))
+        self.assertEqual(profile['gpu_slots'], 3)
+        counts, _ = hostsetup.stage_worker_settings(machine, {'gpu_devices':[1]})
+        self.assertEqual(counts['feature_preparation_workers'], 2)
+        counts, _ = hostsetup.stage_worker_settings(machine, {'max_concurrent_jobs':2})
+        self.assertEqual(counts['feature_scoring_workers'], 1)
+        counts, profile = hostsetup.stage_worker_settings(machine, {'backend':'slurm'})
+        self.assertEqual(profile['gpu_slots'], 1)
+        counts, profile = hostsetup.stage_worker_settings(machine, {'backend':'slurm','max_concurrent_jobs':8})
+        self.assertEqual(profile['gpu_slots'], 8)
+        counts, _ = hostsetup.stage_worker_settings(machine, {'feature_cpu_workers':20,
+            'feature_preparation_workers':16, 'feature_output_workers':8, 'max_cpu_jobs':24})
+        self.assertEqual((counts['feature_preparation_workers'], counts['feature_scoring_workers'],
+                          counts['feature_output_workers'], counts['max_cpu_jobs']), (16,4,8,24))
+
     def test_glacier_setup_tunes_its_own_batch_and_keeps_one_gpu_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint = Path(tmp) / 'glacier.ckpt'

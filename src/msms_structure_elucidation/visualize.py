@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -232,6 +234,53 @@ def candidate_payload(candidate: dict, adduct: str) -> dict:
     return payload
 
 
+def _payload_key(candidate: dict, adduct: str) -> str:
+    """Bind a pre-rendered structure to its exact peak and fragment annotations."""
+    paired = {row.get('prediction_key') or row.get('atlas_key') for row in candidate.get('energy_alignment',[])}
+    fields = {key:candidate.get(key) for key in ('smiles','energy_alignment')}
+    fields.update({key:{ce:rows for ce,rows in candidate.get(key,{}).items() if ce in paired}
+                   for key in ('predicted_spectra','predicted_fragment_ids')})
+    return hashlib.sha256(json.dumps([adduct,fields],
+                                    sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def write_structure_cache(result: dict, target: Path) -> Path:
+    """Render final candidates on the scientific worker for a lightweight local viewer."""
+    adduct = result.get('adduct','')
+    payload = {'version':1,'candidates':{_payload_key(candidate,adduct):candidate_payload(candidate,adduct)
+                                      for candidate in result.get('candidates',[])}}
+    temporary = target.with_suffix('.tmp')
+    temporary.write_text(json.dumps(payload,separators=(',',':')))
+    os.replace(temporary,target)
+    return target
+
+
+@lru_cache(maxsize=8)
+def _saved_payloads(path: str, modified: int, size: int) -> dict:
+    """Bound viewer memory and invalidate worker renderings when a result is replaced."""
+    payload = json.loads(Path(path).read_text())
+    if payload.get('version')!=1:
+        raise ValueError('Unsupported viewer structure cache')
+    return payload.get('candidates',{})
+
+
+def saved_candidate_payload(result_path: Path, result: dict, candidate: dict) -> dict:
+    """Use verified worker renderings when available, otherwise the configured local renderer."""
+    cache = Path(result.get('viewer_structures_path') or result_path.with_name('viewer_structures.json'))
+    if result.get('viewer_structures_path') and not cache.is_absolute():
+        cache = result_path.parent/cache
+    if not cache.is_file():
+        cache = result_path.with_name('viewer_structures.json')
+    if not cache.is_file() and result.get('original_retrieval'):
+        cache = Path(result['original_retrieval']).with_name('viewer_structures.json')
+    if cache.is_file():
+        stat = cache.stat()
+        saved = _saved_payloads(str(cache),stat.st_mtime_ns,stat.st_size).get(_payload_key(candidate,result.get('adduct','')))
+        if saved is not None:
+            return saved
+    return candidate_payload(candidate,result.get('adduct',''))
+
+
 def client_result(result: dict, top_k: int | None = None, max_exp_peaks: int | None = None) -> dict:
     """What the page needs: paired-energy predictions only, optionally fewer candidates/peaks."""
     keep = ('smiles', 'canonical_smiles', 'inchikey', 'formula', 'source', 'entropy_similarity',
@@ -256,7 +305,8 @@ def client_result(result: dict, top_k: int | None = None, max_exp_peaks: int | N
             top = set(map(tuple, sorted(peaks, key=lambda p: -p[1])[:max_exp_peaks]))
             spectra[ce] = [p for p in peaks if tuple(p) in top or (ce, round(float(p[0]), 5)) in matched]
     fields = ('input', 'parentmass', 'adduct', 'peaks', 'formula', 'formula_source', 'formula_hypotheses',
-              'collision_unit', 'energy_mapping', 'warnings', 'library_structures', 'review_evidence', 'review',
+              'collision_unit', 'energy_mapping', 'acquisition_mode', 'stepped_collision',
+              'warnings', 'library_structures', 'review_evidence', 'review',
               'next_step', 'status', 'formula_results', 'instrument', 'mass_tolerance',
               'search_mode', 'pubchem_mass_search', 'prediction_complete', 'scored_structures')
     return {**{k: result[k] for k in fields if k in result}, 'spectra': spectra, 'candidates': candidates}
@@ -323,6 +373,32 @@ def _ms_header(path: str | None) -> dict:
     return header
 
 
+def spectrum_qc(result: dict) -> dict:
+    """Summarize full experimental spectra for adjustable, precursor-free viewer QC."""
+    precursor = result.get('parentmass')
+    known = isinstance(precursor, (int, float)) and math.isfinite(precursor) and precursor > 0
+    if not known:
+        return {'relative_intensities': [], 'precursor_known': False}
+    peaks = []
+    for spectrum in (result.get('spectra') or {}).values():
+        for mz, intensity in spectrum:
+            if (math.isfinite(mz) and mz > 0 and math.isfinite(intensity) and intensity > 0
+                    and abs(mz - precursor) / precursor * 1e6 > 20):
+                peaks.append((mz, intensity))
+    # Use the viewer's 20 ppm grouping and summed intensities across all energies.
+    merged = []
+    for mz, intensity in sorted(peaks, key=lambda p: p[0]):
+        if merged and abs(mz - merged[-1][0]) / merged[-1][0] * 1e6 <= 20:
+            previous_mz, previous_intensity = merged[-1]
+            total = previous_intensity + intensity
+            merged[-1] = ((previous_mz * previous_intensity + mz * intensity) / total, total)
+        else:
+            merged.append((mz, intensity))
+    base = max((intensity for _, intensity in merged), default=1)
+    return {'relative_intensities': sorted((100 * (intensity / base) for _, intensity in merged),
+                                           reverse=True), 'precursor_known': True}
+
+
 def _summarize(index: int, result_path: Path) -> tuple[dict, list[str]]:
     """Light per-result entry for the unknowns list, read once at startup."""
     result = json.loads(result_path.read_text())
@@ -346,7 +422,10 @@ def _summarize(index: int, result_path: Path) -> tuple[dict, list[str]]:
         'energies_ev': energies, 'outcome': _outcome(result), 'candidates': len(candidates),
         'top_similarity': top.get('entropy_similarity'), 'top_explained': top.get('explained_intensity'),
         'top_source': top.get('source'), 'top_smiles': top.get('smiles'), 'top_model': model_label(top),
-        'review': _review_summary(notes, keys)}
+        'ranked_candidates': [{'smiles': c.get('smiles'),
+                               'entropy_similarity': c.get('entropy_similarity')}
+                              for c in candidates[:10]],
+        'spectrum_qc': spectrum_qc(result), 'review': _review_summary(notes, keys)}
     summary['reviewed'] = summary['review']['reviewed']
     return summary, keys
 
@@ -392,7 +471,7 @@ def export_static(result_paths, output: Path, top_k: int = 5, max_exp_peaks: int
             for candidate in slim['candidates']:
                 if candidate.get('model_checkpoint'):
                     candidate['model_checkpoint'] = Path(candidate['model_checkpoint']).name
-        structures = [candidate_payload(c, result.get('adduct', '')) for c in slim['candidates']]
+        structures = [saved_candidate_payload(path,result,c) for c in slim['candidates']]
         index.append(summary)
         results.append({'label': summary['label'], 'result': slim, 'structures': structures,
                         'notes': _read_notes(path.with_name('review_notes.json'))})
@@ -483,13 +562,14 @@ def create_app(result_paths, atlas_mgf: Path | None = None, cache_size: int = 8,
         result, _ = loaded(index)
         if not 0 <= candidate_index < len(result['candidates']):
             return jsonify({'error': 'Unknown candidate'}), 404
-        return jsonify(candidate_payload(result['candidates'][candidate_index], result.get('adduct', '')))
+        return jsonify(saved_candidate_payload(paths[index],result,result['candidates'][candidate_index]))
 
     @app.get('/api/thumb/<int:index>')
     def thumb(index: int):
         if result_index(index) is None or not summaries[index]['top_smiles']:
             return '', 404
-        svg, _ = _structure_svg(summaries[index]['top_smiles'])
+        result,_ = loaded(index)
+        svg = saved_candidate_payload(paths[index],result,result['candidates'][0])['svg']
         return svg, 200, {'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=3600'}
 
     def fragment_response(index: int, candidate_index: int, ce: str, peak_index: int):

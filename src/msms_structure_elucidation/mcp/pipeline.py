@@ -45,6 +45,11 @@ def group_size(config: dict, model: str, energy_count: int = 5) -> int:
     if not math.isfinite(rate) or not math.isfinite(duration) or rate < 0 or duration <= 0:
         raise ValueError('Prediction rate must be finite/nonnegative and target duration positive')
     estimate = int(rate * duration / max(1, energy_count)) if rate else 4096
+    spectrum_target = settings.get('prediction_group_spectra')
+    if spectrum_target is not None:
+        if int(spectrum_target)<1:
+            raise ValueError('prediction_group_spectra must be positive')
+        estimate = max(estimate,math.ceil(int(spectrum_target)/max(1,energy_count)))
     from msms_structure_elucidation import hostprobe
     available = hostprobe.ram_gb()[1]
     # Decoded peaks, fragments, cache validation and JSON can coexist in RAM.
@@ -52,7 +57,7 @@ def group_size(config: dict, model: str, energy_count: int = 5) -> int:
     peaks = int(profile.get('sparse_k', 100))
     if available is not None:
         estimate = min(estimate, int(available * 1024**3 * .2 / (max(1, energy_count) * max(1, peaks) * 512)))
-    maximum = int(settings.get('max_group_candidates', 32768))
+    maximum = int(settings.get('max_group_candidates', 131072 if spectrum_target is not None else 32768))
     if maximum < 1:
         raise ValueError('max_group_candidates must be positive')
     return max(1, min(maximum, estimate))
@@ -73,7 +78,24 @@ def _prepare_submission(arguments: dict, store: JobStore, parent: str, config: d
         _check_glacier_features(checkpoint)
         keys = ('smiles', 'energies', 'nce', 'adduct', 'instrument', 'checkpoint', 'cuda_devices',
                 'batch_size', 'num_cpu_workers', 'num_writers', 'num_h5_chunks', 'feat_cache_size', 'sparse_k')
-        prepared = glacier.prepare(**{key: arguments[key] for key in keys}, work_dir=store.path(parent))
+        options = {key: arguments[key] for key in keys}
+        workers = config.get('mcp', {}).get('cpu_preparation_workers', 'auto')
+        if workers == 'auto':
+            allocated = os.environ.get('SLURM_CPUS_PER_TASK')
+            if allocated:
+                cpus = int(allocated)
+            elif hasattr(os, 'sched_getaffinity'):
+                cpus = len(os.sched_getaffinity(0))
+            else:
+                cpus = os.cpu_count() or 1
+            workers = min(options['num_cpu_workers'], cpus)
+        if int(workers) < 0:
+            raise ValueError('CPU preparation workers must be nonnegative or auto')
+        options['num_cpu_workers'] = int(workers)
+        prepared = glacier.prepare(**options, work_dir=store.path(parent))
+        manifest = read_json(prepared)
+        manifest['options']['num_cpu_workers'] = arguments['num_cpu_workers']
+        write_json(prepared, manifest)
     else:
         from msms_structure_elucidation import iceberg
         # Older runtimes without the native CLI retain their existing wrapper;
@@ -214,8 +236,17 @@ def inference(params: dict, job_dir: Path, config: dict, devices: str | None, lo
     request = job_dir / 'model.json'
     write_json(request, {'arguments': arguments, 'prepared': params.get('prepared'),
                          'publish_dir': str(job_dir / 'native_outputs')})
-    return cli.worker(params['python'], 'run-model', model_request=request,
-                      ms_pred_dir=params['ms_pred_dir'], log_handle=log)
+    result = cli.worker(params['python'], 'run-model', model_request=request,
+                        ms_pred_dir=params['ms_pred_dir'], log_handle=log)
+    if params.get('publish_raw_records') and not params.get('defer_raw_publication'):
+        import subprocess
+        env = {**os.environ, 'CUDA_VISIBLE_DEVICES': '', 'PYTHONPATH':
+            str(Path(params['ms_pred_dir']) / 'src') + os.pathsep +
+            str(Path(__file__).parents[2]) + os.pathsep + os.environ.get('PYTHONPATH', '')}
+        subprocess.run([params['python'], '-m', 'msms_structure_elucidation.mcp.raw_outputs',
+            '--folder', result['save_dir'], '--request', str(request)], env=env, check=True,
+            stdout=log, stderr=subprocess.STDOUT)
+    return result
 
 
 def cancel_children(store: JobStore, job_id: str, config: dict) -> None:

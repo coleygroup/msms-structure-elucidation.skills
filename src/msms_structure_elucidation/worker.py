@@ -11,6 +11,8 @@ import threading
 from collections import defaultdict
 from pathlib import Path
 
+from msms_structure_elucidation.pubchem import has_negatively_charged_carbon
+
 _MSBUDDY_LOCK = threading.Lock()
 
 
@@ -162,6 +164,20 @@ def _scoring_prediction(predicted, source: dict):
         retained.add(key)
     if not components:
         raise ValueError('Stepped prediction has no positive intensity')
+    if source['stepped'].get('merge_method') == 'arithmetic_mean':
+        cleaned = {int(round(float(s.collision_energy))): s for s in components}
+        union = {}
+        for energy in requested:
+            if energy in cleaned:
+                union = cleaned[energy]._merge_spec_to_tup(union, merge_method='sum')
+        values = list(union.values())
+        first = components[0]
+        merged = common.MassSpec(collision_energy=first.collision_energy,
+            root_canonical_smiles=first.root_canonical_smiles, adduct=first.adduct,
+            masses=np.array([v[0] for v in values], dtype=float),
+            intens=np.array([v[1] / len(requested) for v in values], dtype=float),
+            frags=np.stack([v[2] for v in values]) if values and values[0][2] is not None else None)
+        return {**dict(predicted.items()), 'stepped': merged}
     merged = common.CompositeMassSpec(components).merge_spectra(
         energies=[indexed[ev] for ev in requested if indexed[ev] in retained], merge_method='sum')
     return {**dict(predicted.items()), 'stepped': merged}
@@ -258,7 +274,7 @@ def rank(spectrum: str, mgf: str, formula: str, top_k: int,
     for meta, peaks in common.parse_spectra_mgf(mgf):
         smiles = meta.get('SMILES')
         ce = meta.get('COLLISION_ENERGY')
-        if not smiles or not ce or len(peaks) == 0:
+        if not smiles or not ce or len(peaks) == 0 or has_negatively_charged_carbon(smiles):
             continue
         try:
             ce = float(str(ce).split()[0])
@@ -345,6 +361,24 @@ def formula_candidates(spectrum: str, experimental_unit: str, max_candidates: in
                 for mz, inten in peaks:
                     out.write(f'{mz} {inten}\n')
                 out.write('END IONS\n')
+        from msms_structure_elucidation.config import settings
+        options = settings().get('pipeline', {}).get('formula_search', {})
+        if options.get('backend') == 'native':
+            from ms_pred.common.buddy import form_from_mgf_buddy
+            ranked = form_from_mgf_buddy(str(mgf), top_k_buddy_preds=max_candidates,
+                profile=None, ms1_ppm=ms1_ppm, ms2_ppm=ms2_ppm, fdr_cutoff=1.0,
+                halogen=options.get('halogen', True), backend='native',
+                buddy_runtime=options.get('buddy_runtime'), n_cpu=options.get('n_cpu', 1))
+            hypotheses = []
+            for entries in ranked.values():
+                for entry in sorted(entries, key=lambda row: row['rnk']):
+                    if entry['form'] and entry['form'] not in [h['formula'] for h in hypotheses]:
+                        hypotheses.append({'formula': entry['form'], 'rank': len(hypotheses) + 1,
+                            'source': 'BUDDY native inferred', 'backend': 'native',
+                            'attribution': 'Mingxun Wang @ UCR'})
+                    if len(hypotheses) >= max_candidates:
+                        return hypotheses
+            return hypotheses
         try:
             import msbuddy
             # Use MSBuddy's own annotated MGF importer and formula ranking. MSBuddy keeps its database
@@ -382,6 +416,10 @@ def validate_smiles(smiles: list[str], formula: str, keep_duplicates: bool = Fal
             out.append({'smiles': entry, 'input_smiles': entry, 'formula': None, 'formula_match': False,
                         'invalid_smiles': True})
             continue
+        if has_negatively_charged_carbon(entry):
+            out.append({'smiles': entry, 'input_smiles': entry, 'formula': rdMolDescriptors.CalcMolFormula(mol),
+                        'formula_match': False, 'negatively_charged_carbon': True})
+            continue
         unsupported = sorted({atom.GetSymbol() for atom in mol.GetAtoms()} - set(common.VALID_ELEMENTS))
         if unsupported:
             out.append({'smiles': entry, 'input_smiles': entry, 'formula': rdMolDescriptors.CalcMolFormula(mol),
@@ -412,7 +450,7 @@ def atlas_smiles(mgf: str) -> list[str]:
     for meta, _ in common.parse_spectra_mgf(mgf):
         smiles = meta.get('SMILES')
         key = meta.get('INCHIKEY') or smiles
-        if smiles and key not in seen:
+        if smiles and key not in seen and not has_negatively_charged_carbon(smiles):
             seen.add(key)
             result.append(smiles)
     return result
@@ -431,7 +469,7 @@ def atlas_info(mgf: str, expected_energies: list[int], spectrum: str, formula: s
     for meta, _ in common.parse_spectra_mgf(mgf):
         smiles = meta.get('SMILES')
         label = meta.get('COLLISION_ENERGY')
-        if not smiles or not label:
+        if not smiles or not label or has_negatively_charged_carbon(smiles):
             continue
         try:
             ev = int(round(float(str(label).split()[0])))

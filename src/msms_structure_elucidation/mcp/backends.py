@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 
 from msms_structure_elucidation import hostprobe
-from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, now, read_json, write_json, timestamp
+from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, now, read_json, write_json, timestamp, WORKER_OWNED_TASKS, VIRTUAL_BACKENDS
 from msms_structure_elucidation.prediction_cache import file_lock
 
 RUNNER = 'msms_structure_elucidation.mcp.runner'
@@ -54,12 +54,16 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def pipeline_limit(settings: dict, prepared_default: int = 2) -> int:
+def pipeline_limit(settings: dict, prepared_default: int = 2, cpu_default: int | None = None) -> int:
     """Bound all resident CPU parents, including every resource-wait phase."""
     prepared = settings.get('max_prepared_jobs', 'auto')
     prepared = prepared_default if prepared in ('auto', None) else int(prepared)
     limit = settings.get('max_live_pipelines', 'auto')
-    limit = int(settings.get('max_cpu_jobs', 2)) + prepared if limit in ('auto', None) else int(limit)
+    if limit in ('auto', None):
+        from msms_structure_elucidation.mcp.cpu_pool import cpu_job_limit
+        limit = (cpu_job_limit(settings) if cpu_default is None else cpu_default) + prepared
+    else:
+        limit = int(limit)
     if limit < 1:
         raise ValueError('max_live_pipelines must be positive or auto')
     return limit
@@ -83,11 +87,12 @@ class LocalBackend:
         self.gpu_count = sum(self.devices is None or gpu['index'] in self.devices for gpu in detected)
         limit = settings.get('max_concurrent_jobs', 'auto')
         self.max_jobs = max(1, self.gpu_count) if limit in (None, 'auto') else int(limit)
-        self.max_cpu_jobs = int(settings.get('max_cpu_jobs', 2))
+        from msms_structure_elucidation.mcp.cpu_pool import cpu_job_limit
+        self.max_cpu_jobs = cpu_job_limit(settings, self.max_jobs)
         prepared = settings.get('max_prepared_jobs', 'auto')
         self.max_prepared_jobs = max(2, 2 * self.gpu_count) if prepared in (None, 'auto') else int(prepared)
         self.min_free_memory_gb = float(settings.get('min_free_memory_gb', 2.))
-        self.max_live_pipelines = pipeline_limit(settings, self.max_prepared_jobs)
+        self.max_live_pipelines = pipeline_limit(settings, self.max_prepared_jobs, self.max_cpu_jobs)
         self.managed = bool(settings.get('scheduler_process', False))
         self.queue_snapshot = []
         from msms_structure_elucidation.mcp.admission import Admission
@@ -121,6 +126,18 @@ class LocalBackend:
                                  'kind': self.store.request(job['job_id']).get('kind', 'gpu')})
         return rows
 
+    def _resource_snapshot(self) -> list[dict]:
+        """Skip virtual queue files after discovering legacy allocations owned here."""
+        excluded = self.exclude_tasks | WORKER_OWNED_TASKS
+        if getattr(self,'_resource_excluded',None)!=excluded:
+            rows = self.store.active()
+            self._resource_legacy = {row['job_id'] for row in rows if row['task'] in excluded
+                and self.store.launch(row['job_id']).get('backend')==self.name
+                and self.store.launch(row['job_id']).get('host')==self.host}
+            self._resource_excluded = set(excluded)
+            return rows
+        return self.store.active(exclude_tasks=excluded,include_jobs=self._resource_legacy)
+
     def pump(self) -> None:
         """Schedule from one live snapshot; waiters never scan or lock the queue."""
         owner = self.config.get('_mcp_cpu_dispatcher')
@@ -134,7 +151,7 @@ class LocalBackend:
         if not self.dispatcher:
             return
         with self.lock, file_lock(self.store.root / 'scheduler.lock'):
-            snapshot = self.store.active()
+            snapshot = self._resource_snapshot()
             self.queue_snapshot = snapshot
             running = []
             for row in snapshot:
@@ -152,7 +169,7 @@ class LocalBackend:
                     del self.processes[job_id]
             # Resume scoring before starting new preparation. Sleeping orchestrators do
             # not consume CPU slots, and CPU work never consumes the GPU concurrency limit.
-            cpu = sum(row['kind'] != 'gpu' and row.get('phase') not in ('waiting_gpu', 'waiting_cpu', 'waiting_cache')
+            cpu = sum(row['kind'] != 'gpu' and row.get('phase') not in ('waiting_gpu', 'waiting_cpu', 'waiting_cache', 'cpu_idle')
                       for row in running)
             for row in sorted(running, key=lambda r: (r.get('cpu_ready_at', r.get('phase_started', 0)), r['job_id'])):
                 if row.get('phase') == 'waiting_cpu' and cpu < self.max_cpu_jobs:
@@ -161,7 +178,9 @@ class LocalBackend:
                     cpu += 1
             queued = [job for job in snapshot if job['state'] == 'queued']
             for job in sorted(queued, key=lambda job: (timestamp(job.get('created')), job['job_id'])):
-                if job['task'] in self.exclude_tasks:
+                if self.store.launch(job['job_id']).get('backend') in ('feature-pipeline','feature-worker','cpu-worker'):
+                    continue
+                if job['task'] in self.exclude_tasks or job['task'] in WORKER_OWNED_TASKS:
                     continue
                 request = self.store.request(job['job_id'])
                 kind = request.get('kind', 'gpu')
@@ -175,7 +194,7 @@ class LocalBackend:
                 else:
                     if sum(row['kind'] != 'gpu' for row in running) >= self.max_live_pipelines:
                         continue
-                    cpu = sum(row['kind'] != 'gpu' and row.get('phase') not in ('waiting_gpu', 'waiting_cpu', 'waiting_cache')
+                    cpu = sum(row['kind'] != 'gpu' and row.get('phase') not in ('waiting_gpu', 'waiting_cpu', 'waiting_cache', 'cpu_idle')
                               for row in running)
                     prepared = sum(row.get('phase') == 'waiting_gpu' for row in running)
                     if cpu >= self.max_cpu_jobs or prepared >= self.max_prepared_jobs:
@@ -302,6 +321,30 @@ SLURM_WAITING = {'PENDING', 'CONFIGURING', 'REQUEUED', 'REQUEUE_HOLD', 'REQUEUE_
 SLURM_FAILED = {'FAILED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL', 'BOOT_FAIL', 'DEADLINE', 'COMPLETED'}
 
 
+def scheduler_states(jobs: list[str]) -> dict[str, str]:
+    """Read one accounting snapshot for all jobs, falling back to the live queue for missing records."""
+    if not jobs:
+        return {}
+    run = subprocess.run(['sacct', '-j', ','.join(jobs), '-X', '-n', '-P', '-o', 'JobIDRaw,State'],
+                         capture_output=True, text=True, timeout=30)
+    states = {}
+    if run.returncode == 0:
+        for line in run.stdout.splitlines():
+            fields = line.strip().split('|')
+            if len(fields) >= 2 and fields[0] in jobs and fields[1].strip():
+                states[fields[0]] = fields[1].split()[0]
+    missing = sorted(set(jobs) - states.keys())
+    if missing:
+        run = subprocess.run(['squeue', '-h', '-j', ','.join(missing), '-o', '%i|%T'],
+                             capture_output=True, text=True, timeout=30)
+        if run.returncode == 0:
+            for line in run.stdout.splitlines():
+                fields = line.strip().split('|')
+                if len(fields) == 2 and fields[0] in missing and fields[1].strip():
+                    states[fields[0]] = fields[1].split()[0]
+    return states
+
+
 class SlurmBackend:
     """Submit bounded CPU parents and GPU stages; require runner and Slurm completion."""
     name = 'slurm'
@@ -313,15 +356,24 @@ class SlurmBackend:
         self.child_cancel = self.cancel
         self.exclude_tasks: set[str] = set()
         self._last_poll = 0.
+        self._poll_states = None
+        self._pump_allocated = None
         self.lock = threading.Lock()
         from msms_structure_elucidation.mcp.admission import Admission
         self.admission = Admission(store, config)
-        self.max_live_pipelines = pipeline_limit(config.get('mcp', {}))
+        from msms_structure_elucidation.mcp.cpu_pool import cpu_job_limit
+        cpu_budget = cpu_job_limit(config.get('mcp', {}), self.capacity())
+        self.max_live_pipelines = pipeline_limit(config.get('mcp', {}), cpu_default=cpu_budget)
 
     @property
     def dispatcher(self) -> bool:
         owner = self.config.get('_mcp_dispatcher')
         return not owner or owner == {'host': socket.gethostname(), 'pid': os.getpid()}
+
+    def capacity(self) -> int:
+        """Use the configured GPU queue budget, rather than the login node's GPUs."""
+        value = self.config.get('mcp',{}).get('max_concurrent_jobs','auto')
+        return 1 if value in (None, 'auto') else max(1,int(value))
 
     def pump(self) -> None:
         """Bound CPU allocations and canary admission before submitting queued work."""
@@ -331,12 +383,22 @@ class SlurmBackend:
         rows = self.store.active()
         if time.monotonic() - self._last_poll >= float(self.config.get('mcp', {}).get('poll_seconds', 15)):
             self._last_poll = time.monotonic()
-            for row in rows:
-                if self.store.launch(row['job_id']).get('backend') == self.name:
+            allocated = [row for row in rows if self.store.launch(row['job_id']).get('backend') == self.name]
+            self._poll_states = scheduler_states([self.store.launch(row['job_id'])['slurm_job_id'] for row in allocated])
+            try:
+                for row in allocated:
                     self.poll(row['job_id'])
-        for row in sorted(rows, key=lambda r: (timestamp(r.get('created')), r['job_id'])):
-            if row['state'] == 'queued' and row['task'] not in self.exclude_tasks:
-                self.submit(row['job_id'])
+            finally:
+                self._poll_states = None
+        self._pump_allocated = sum(r.get('kind') != 'gpu' and self.store.status(r['job_id'])['state'] in ('submitted', 'running', 'done')
+                                   and self.store.launch(r['job_id']).get('backend') not in ('feature-pipeline','feature-worker','cpu-worker') for r in rows)
+        try:
+            for row in sorted(rows, key=lambda r: (timestamp(r.get('created')), r['job_id'])):
+                if (row['state']=='queued' and row['task'] not in self.exclude_tasks | WORKER_OWNED_TASKS
+                        and self.store.launch(row['job_id']).get('backend') not in VIRTUAL_BACKENDS):
+                    self.submit(row['job_id'])
+        finally:
+            self._pump_allocated = None
 
     def submit(self, job_id: str) -> None:
         if not self.dispatcher:
@@ -350,12 +412,16 @@ class SlurmBackend:
             return
         job_dir = self.store.path(job_id)
         request = self.store.request(job_id)
+        if request['task'] in WORKER_OWNED_TASKS:
+            return
         if request.get('kind') != 'gpu':
-            allocated = sum(r.get('kind') != 'gpu' and r['state'] in ('submitted', 'running', 'done')
+            allocated = self._pump_allocated if self._pump_allocated is not None else sum(r.get('kind') != 'gpu' and r['state'] in ('submitted', 'running', 'done')
+                            and self.store.launch(r['job_id']).get('backend') not in ('feature-pipeline','feature-worker','cpu-worker')
                             for r in self.store.active())
             if allocated >= self.max_live_pipelines or not self.admission.admit(job_id):
                 return
-        options, script = sbatch_script(self.slurm, request.get('kind', 'gpu'), runner_command(job_dir, self.python))
+        resources = {**self.slurm, **self.config.get('mcp', {}).get('task_slurm', {}).get(request['task'], {})}
+        options, script = sbatch_script(resources, request.get('kind', 'gpu'), runner_command(job_dir, self.python))
         (job_dir / 'job.sh').write_text(script)
         command = ['sbatch', '--parsable', f'--job-name=msms-{request["task"]}', f'--output={job_dir}/slurm-%j.log',
                    f'--chdir={REPO}', *options, str(job_dir / 'job.sh')]
@@ -366,6 +432,8 @@ class SlurmBackend:
         job = parse_job_id(done.stdout)
         self.store.set_launch(job_id, backend=self.name, slurm_job_id=job, sbatch=command)
         self.store.set_status(job_id, 'submitted', slurm_job_id=job, submitted=now(), admission_hold=None)
+        if request.get('kind') != 'gpu' and self._pump_allocated is not None:
+            self._pump_allocated += 1
 
     def poll(self, job_id: str) -> dict:
         status = self.store.status(job_id)
@@ -376,7 +444,7 @@ class SlurmBackend:
             return status
         if status['state'] not in ('submitted', 'running', 'done') or not job:
             return status
-        state = scheduler_state(job)
+        state = self._poll_states.get(job) if self._poll_states is not None else scheduler_state(job)
         status = self.store.status(job_id)
         if status['state'] in ('failed', 'cancelled'):
             return status
@@ -451,9 +519,23 @@ class SlurmBackend:
 
 
 def make_backend(name: str, store: JobStore, config: dict, python: str | None = None):
-    from msms_structure_elucidation.mcp.kubernetes import KubernetesBackend
-    from msms_structure_elucidation.mcp.fleet import FleetBackend
-    backends = {'local': LocalBackend, 'slurm': SlurmBackend, 'kubernetes': KubernetesBackend, 'pool': FleetBackend}
-    if name not in backends:
+    """Load only the selected execution adapter; a single host needs no fleet layer."""
+    if name == 'local':
+        backend = LocalBackend(store, config, python)
+    elif name == 'slurm':
+        backend = SlurmBackend(store, config, python)
+    elif name == 'kubernetes':
+        from msms_structure_elucidation.mcp.kubernetes import KubernetesBackend
+        backend = KubernetesBackend(store, config, python)
+    elif name == 'pool':
+        from msms_structure_elucidation.mcp.fleet import FleetBackend
+        backend = FleetBackend(store, config, python)
+    else:
         raise ValueError(f'Unknown MCP backend {name!r}; use local, slurm, kubernetes or pool')
-    return backends[name](store, config, python)
+    if config.get('mcp', {}).get('feature_pipeline', False) and name == config.get('mcp', {}).get('backend'):
+        if name=='pool' and config['mcp'].get('feature_placement','workers')=='workers':
+            from msms_structure_elucidation.mcp.placement import WorkerFeatureBackend
+            return WorkerFeatureBackend(backend,store,config,python)
+        from msms_structure_elucidation.mcp.features import FeatureBackend
+        return FeatureBackend(backend, store, config, python)
+    return backend

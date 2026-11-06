@@ -7,7 +7,7 @@ import socket
 import subprocess
 from pathlib import Path
 
-from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, now, write_json
+from msms_structure_elucidation.mcp.jobs import ACTIVE, JobStore, now, write_json, WORKER_OWNED_TASKS, VIRTUAL_BACKENDS
 from msms_structure_elucidation.prediction_cache import file_lock
 
 
@@ -96,11 +96,14 @@ class KubernetesBackend:
     def __init__(self, store: JobStore, config: dict, python: str | None = None):
         self.store, self.python = store, python
         self.config = config
+        self.exclude_tasks: set[str] = set()
         self.settings = config.get('mcp', {}).get('kubernetes') or {}
         from msms_structure_elucidation.mcp.admission import Admission
         self.admission = Admission(store, config)
         from msms_structure_elucidation.mcp.backends import pipeline_limit
-        self.max_live_pipelines = pipeline_limit(config.get('mcp', {}))
+        from msms_structure_elucidation.mcp.cpu_pool import cpu_job_limit
+        cpu_budget = cpu_job_limit(config.get('mcp', {}), self.capacity())
+        self.max_live_pipelines = pipeline_limit(config.get('mcp', {}), cpu_default=cpu_budget)
         if not self.settings.get('shared_workspace'):
             raise ValueError('Kubernetes needs shared_workspace: true and a mounted persistent job root')
 
@@ -109,19 +112,28 @@ class KubernetesBackend:
         owner = self.config.get('_mcp_dispatcher')
         return not owner or owner == {'host': socket.gethostname(), 'pid': os.getpid()}
 
+    def capacity(self) -> int:
+        """Bound worker prediction groups by the configured cluster GPU-job budget."""
+        value = self.config.get('mcp',{}).get('max_concurrent_jobs','auto')
+        return 1 if value in (None, 'auto') else max(1,int(value))
+
     def pump(self) -> None:
         """Only the MCP coordinator uses the API; CPU pods publish requests on shared storage."""
         if not self.dispatcher or self.settings.get('external_scheduler'):
             return
         with file_lock(self.store.root / 'kubernetes-scheduler.lock'):
             for row in self.store.active():
+                if (row['task'] in WORKER_OWNED_TASKS or
+                        self.store.launch(row['job_id']).get('backend') in VIRTUAL_BACKENDS):
+                    continue
                 status = self.store.status(row['job_id'])
                 if status['state'] in ACTIVE:
                     parent = self.store.request(row['job_id'])['params'].get('_parent_job')
                     if status.get('cancel_requested') or (parent and self.store.status(parent)['state'] not in ACTIVE):
                         self.cancel(row['job_id'])
                     elif status['state'] == 'queued':
-                        self.submit(row['job_id'])
+                        if row['task'] not in self.exclude_tasks:
+                            self.submit(row['job_id'])
                     else:
                         self._poll(row['job_id'])
                 elif status['state'] == 'done' and not status.get('scheduler_confirmed'):
@@ -131,8 +143,12 @@ class KubernetesBackend:
         if not self.dispatcher:
             return
         request = self.store.request(job_id)
+        if request['task'] in WORKER_OWNED_TASKS:
+            return
         if request.get('kind') != 'gpu':
-            live = sum(r.get('kind') != 'gpu' and r['state'] in ('submitted', 'running', 'done') for r in self.store.active())
+            live = sum(r.get('kind') != 'gpu' and r['state'] in ('submitted', 'running', 'done')
+                       and self.store.launch(r['job_id']).get('backend') not in ('feature-pipeline','feature-worker','cpu-worker')
+                       for r in self.store.active())
             if live >= self.max_live_pipelines or not self.admission.admit(job_id):
                 return
         from msms_structure_elucidation.mcp.backends import runner_command
@@ -144,6 +160,10 @@ class KubernetesBackend:
         # Record the deterministic name before submission, permitting recovery after connection loss.
         self.store.set_launch(job_id, backend=self.name, kubernetes_job=name)
         if self.settings.get('external_scheduler'):
+            if self.config.get('mcp',{}).get('feature_worker'):
+                marker = self.store.root/'external-scheduler'
+                marker.mkdir(exist_ok=True)
+                (marker/job_id).touch()
             self.store.set_status(job_id, 'submitted', kubernetes_job=name, submitted=now())
             return
         result = kubectl(self.settings, 'create', '-f', '-', input=json.dumps(manifest))

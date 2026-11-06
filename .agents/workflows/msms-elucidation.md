@@ -21,6 +21,8 @@ After the user selects BUDDY and an MCP server is connected, use `infer_formulas
 
    **Agent review.** Apply step 3 and this review to each feature as its result becomes available; the whole batch does not need to finish first. Use [msms-evidence-review](../skills/msms-evidence-review/SKILL.md) to review every result, including high-scoring candidates. Delegate ready batch reviews to a bounded pool when available, following the skill and `pipeline.evidence_review`; otherwise review directly. The main agent keeps monitoring jobs, checks reviewer drafts and publishes the accepted per-feature reviews. Compare the leading candidates' matched and unexplained peaks across all supplied energies, assess the supporting evidence and remaining ambiguities, and record the assessment in a per-feature `evidence_review.json`. Label reviews of incomplete candidate/energy coverage as provisional and refresh them when the result changes. Continue monitoring other jobs between reviews. Follow the [evidence-review checklist](../skills/msms-evidence-review/references/evidence-review.md).
 
+   Keep the skill's [continuous review queue](../skills/msms-evidence-review/references/review-queue.md) moving: refill available reviewer slots from newly ready features and required refreshes, publish each accepted assessment promptly, and keep deeper investigations in a separate follow-up queue. Preserve the full review checklist and keep monitoring predictions while reviews run.
+
    **User choice for weak entries.** If evidence is weak or important peaks remain unexplained, summarize the affected entries and ask which optional route the user wants:
 
    | Choice | Route |

@@ -10,7 +10,7 @@ import sqlite3
 import time
 import uuid
 from collections import defaultdict
-from contextlib import contextmanager, closing
+from contextlib import contextmanager, closing, nullcontext
 from pathlib import Path
 from typing import Callable
 
@@ -29,11 +29,17 @@ def digest(value: object) -> str:
 def _raw_adapter_source(worker_path: Path) -> str:
     """Fingerprint raw generation conservatively, excluding only stepped scoring and identity bookkeeping."""
     tree = ast.parse(worker_path.read_text(encoding='utf-8'))
+    tree.body = [node for node in tree.body if not (
+        isinstance(node, ast.FunctionDef) and node.name == '_wait_for_idle_gpu')]
     for node in tree.body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if node.name == '_scoring_prediction':
+        if node.name in ('_scoring_prediction', 'formula_candidates'):
             node.body = [ast.Pass()]
+        elif node.name == '_run_model':
+            node.body = [statement for statement in node.body if not (
+                isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Name) and statement.value.func.id == '_wait_for_idle_gpu')]
         elif node.name == '_model_predictions':
             node.body = [statement for statement in node.body if not (
                 isinstance(statement, ast.Import) and all(alias.name == 'hashlib' for alias in statement.names)
@@ -63,8 +69,15 @@ def adapter_fingerprint(worker_path: Path) -> str:
     source = _raw_adapter_source(worker_path)
     # This exact raw source previously used the whole-file fingerprint. Preserve
     # that namespace only for the verified source; other generation changes miss.
-    if source == '528de0a3baec3e786eaf35074a62a3373259c3dd63004cab2d13cb2a6de671f2':
-        return '9410f95c968745fc30145fef606e2ffaaab66b094977d18931a4a18f0545382e'
+    if source in ('528de0a3baec3e786eaf35074a62a3373259c3dd63004cab2d13cb2a6de671f2',
+                  '4116460df09642d1ca64381b287450ad5ea3e370e6b9e1bf10190749a720b87d'):
+        preferred = os.environ.get('MSMS_PREDICTION_CACHE_ADAPTER') or '9410f95c968745fc30145fef606e2ffaaab66b094977d18931a4a18f0545382e'
+        if preferred not in ('9410f95c968745fc30145fef606e2ffaaab66b094977d18931a4a18f0545382e',
+                             'e06de0363d3b474f1683b692d8faafe435244861a76ebf2e38aa4a9af491a42f'):
+            raise ValueError('Unverified prediction adapter compatibility identity')
+        return preferred
+    if os.environ.get('MSMS_PREDICTION_CACHE_ADAPTER'):
+        raise ValueError('Prediction adapter source is incompatible with the selected cache identity')
     return digest({'raw_adapter_schema': 2, 'source_sha256': source})
 
 
@@ -155,7 +168,7 @@ def _lease_busy(path: Path) -> bool:
 
 
 @contextmanager
-def candidate_guard(folder: Path, molecules: list[str], on_wait=None, on_acquired=None):
+def candidate_guard(folder: Path, molecules: list[str], on_wait=None, on_acquired=None, blocking: bool = True):
     """Protect overlapping sets with one live lease per request, independent of candidate count."""
     leases = folder / 'leases'
     leases.mkdir(parents=True, exist_ok=True)
@@ -185,12 +198,15 @@ def candidate_guard(folder: Path, molecules: list[str], on_wait=None, on_acquire
                         break
                 if on_wait and not waited:
                     on_wait()
+                if not blocking:
+                    yield False
+                    return
                 waited = True
                 time.sleep(.2)
             try:
                 if waited and on_acquired:
                     on_acquired()
-                yield
+                yield True
             finally:
                 with file_lock(leases / 'registry.lock'):
                     entry.unlink(missing_ok=True)
@@ -246,8 +262,47 @@ def _validate(row: dict, smiles: str, energy: str) -> None:
         raise RuntimeError('Invalid peak-aligned fragments in prediction cache')
 
 
+@contextmanager
+def read_cache(database: Path, timeout: float = 120):
+    """Read shared spectra, allowing SQLite to recover an interrupted writer first."""
+    def open_reader():
+        db = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=timeout)
+        try:
+            db.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone()
+        except BaseException:
+            db.close()
+            raise
+        return db
+    try:
+        db = open_reader()
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, 'sqlite_errorcode', None)
+        # Python 3.10 does not expose SQLite error codes on exceptions.
+        readonly = (code & 255) == 8 if code is not None else 'readonly database' in str(exc).lower()
+        if not readonly:
+            raise
+        # A read-only connection cannot roll back a hot journal. Let SQLite
+        # recover under the existing writer gate; never remove journal files.
+        with file_lock(database.parent / '.validated-cache-writer.lock',blocking=timeout>0) as acquired:
+            if not acquired:
+                raise sqlite3.OperationalError('database is locked during cache recovery') from exc
+            with closing(sqlite3.connect(database.as_uri() + '?mode=rw', uri=True, timeout=timeout)) as recovery:
+                recovery.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone()
+        db = open_reader()
+    with closing(db):
+        yield db
+
+
+def cache_busy(error: sqlite3.OperationalError) -> bool:
+    """Recognize temporary SQLite contention without masking corruption or missing assets."""
+    code = getattr(error,'sqlite_errorcode',None)
+    return (code & 255) in (5,6) if code is not None else any(
+        message in str(error).lower() for message in ('database is locked','database table is locked'))
+
+
 def predictions(root: Path, identity: dict, smiles: list[str], energies: list[int],
-                produce: Callable[[list[str], list[int]], list[dict]], refresh: bool = False) -> tuple[list[dict], dict]:
+                produce: Callable[[list[str], list[int]], list[dict]], refresh: bool = False,
+                lease_held: bool = False) -> tuple[list[dict], dict]:
     """Predict only missing structure/energy pairs, with single-flight candidate locks."""
     namespace = digest(identity)
     folder = root / namespace
@@ -258,44 +313,59 @@ def predictions(root: Path, identity: dict, smiles: list[str], energies: list[in
     hits = 0
     database = folder / 'spectra.sqlite3'
     if database.is_file() and not refresh:
-        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=120)) as db:
-            db.execute('BEGIN')
+        with read_cache(database) as db:
             if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='spectra'").fetchone():
-                for smi in unique:
+                width = max(1, 256 // max(1, len(requested)))
+                for start in range(0, len(unique), width):
+                    db.execute('BEGIN')
+                    for smi in unique[start:start + width]:
+                        for energy in requested:
+                            cursor = db.execute('SELECT payload FROM spectra WHERE smiles=? AND energy=?', (smi, energy))
+                            saved = cursor.fetchone()
+                            cursor.close()
+                            if saved:
+                                row = json.loads(saved[0])
+                                _validate(row, smi, energy)
+                                rows[smi, energy] = row
+                                hits += 1
+                    # Rows in a scientific namespace remain compatible across these
+                    # windows. Release readers so validated writers can publish.
+                    db.commit()
+    if hits == len(unique) * len(requested):
+        return _records(rows, unique, requested), {'namespace': namespace, 'reused_spectra': hits,
+            'predicted_spectra': 0, 'identity': identity}
+    missing_molecules = [smi for smi in unique if any((smi, e) not in rows for e in requested)]
+    if os.environ.get('MSMS_PREDICTION_CACHE_ONLY') == '1':
+        raise RuntimeError(f'Prepared scoring requires complete cached predictions: {len(missing_molecules)} structures missing')
+    from msms_structure_elucidation.mcp.pipeline import cache_wait_callbacks
+    on_wait, on_acquired = cache_wait_callbacks()
+    with nullcontext() if lease_held else candidate_guard(folder, missing_molecules, on_wait, on_acquired):
+        with closing(sqlite3.connect(folder / 'spectra.sqlite3', timeout=120)) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS spectra (smiles TEXT, energy TEXT, payload TEXT, '
+                       'PRIMARY KEY(smiles, energy))')
+            missing = defaultdict(list)
+            # Recheck under short read transactions: individual autocommit
+            # lookups otherwise acquire a remote filesystem lock for every row.
+            width = max(1, 256 // max(1, len(requested)))
+            for start in range(0, len(unique), width):
+                db.execute('BEGIN')
+                for smi in unique[start:start + width]:
+                    needed = []
                     for energy in requested:
-                        saved = db.execute('SELECT payload FROM spectra WHERE smiles=? AND energy=?', (smi, energy)).fetchone()
+                        if (smi, energy) in rows:
+                            continue
+                        saved = None if refresh else db.execute(
+                            'SELECT payload FROM spectra WHERE smiles=? AND energy=?', (smi, energy)).fetchone()
                         if saved:
                             row = json.loads(saved[0])
                             _validate(row, smi, energy)
                             rows[smi, energy] = row
                             hits += 1
-    if hits == len(unique) * len(requested):
-        return _records(rows, unique, requested), {'namespace': namespace, 'reused_spectra': hits,
-            'predicted_spectra': 0, 'identity': identity}
-    missing_molecules = [smi for smi in unique if any((smi, e) not in rows for e in requested)]
-    from msms_structure_elucidation.mcp.pipeline import cache_wait_callbacks
-    on_wait, on_acquired = cache_wait_callbacks()
-    with candidate_guard(folder, missing_molecules, on_wait, on_acquired):
-        with sqlite3.connect(folder / 'spectra.sqlite3', timeout=120) as db:
-            db.execute('CREATE TABLE IF NOT EXISTS spectra (smiles TEXT, energy TEXT, payload TEXT, '
-                       'PRIMARY KEY(smiles, energy))')
-            missing = defaultdict(list)
-            for smi in unique:
-                needed = []
-                for energy in requested:
-                    if (smi, energy) in rows:
-                        continue
-                    saved = None if refresh else db.execute(
-                        'SELECT payload FROM spectra WHERE smiles=? AND energy=?', (smi, energy)).fetchone()
-                    if saved:
-                        row = json.loads(saved[0])
-                        _validate(row, smi, energy)
-                        rows[smi, energy] = row
-                        hits += 1
-                    else:
-                        needed.append(energy)
-                if needed:
-                    missing[tuple(needed)].append(smi)
+                        else:
+                            needed.append(energy)
+                    if needed:
+                        missing[tuple(needed)].append(smi)
+                db.commit()
             for needed, molecules in missing.items():
                 produced = produce(molecules, list(map(int, needed)))
                 by_smiles = {r['smiles']: r for r in produced}
@@ -312,8 +382,12 @@ def predictions(root: Path, identity: dict, smiles: list[str], energies: list[in
                         rows[smi, energy] = row
                         pending.append((smi, energy, json.dumps(row, allow_nan=False)))
                 # Commit only after the complete requested group passed validation.
-                db.executemany('INSERT OR REPLACE INTO spectra VALUES (?, ?, ?)', pending)
-                db.commit()
+                if db.in_transaction:
+                    raise RuntimeError('Cache writer gate must precede the write transaction')
+                with file_lock(folder / '.validated-cache-writer.lock'):
+                    with db:
+                        db.executemany('INSERT OR REPLACE INTO spectra VALUES (?, ?, ?)', pending)
+                        db.commit()
     return _records(rows, unique, requested), {'namespace': namespace, 'reused_spectra': hits,
                      'predicted_spectra': len(unique) * len(requested) - hits, 'identity': identity}
 

@@ -76,14 +76,21 @@ def remap(params: dict, endpoint: dict, folder: Path, prepared: dict | None) -> 
         raise FileNotFoundError('Endpoint ms_pred_dir does not contain src/ms_pred')
     if source_fingerprint(Path(params['ms_pred_dir']) / 'src/ms_pred') != params['native_source']:
         raise ValueError('Endpoint native source differs from the confirmed model implementation')
-    if params.get('adapter_source') and params['adapter_source'] != source_fingerprint(Path(__file__).parents[1]):
-        raise ValueError('Endpoint package source differs from the coordinator; synchronize the checkout')
+    actual_adapter = source_fingerprint(Path(__file__).parents[1])
+    if params.get('adapter_source') and params['adapter_source'] != actual_adapter:
+        from msms_structure_elucidation.prediction_cache import _raw_adapter_source
+        raw = _raw_adapter_source(Path(__file__).parents[1]/'worker.py')
+        if endpoint.get('compatible_prepared_adapters',{}).get(params['adapter_source'])!=raw:
+            raise ValueError('Endpoint package source differs from the coordinator; synchronize the checkout')
+        params['prepared_adapter_source'] = params['adapter_source']
+        params['adapter_source'] = actual_adapter
     arguments['cuda_devices'] = None  # assigned by the endpoint's scheduler
     if arguments['model'] == 'glacier':
         arguments['num_gpu_workers'] = 1
     else:
         devices = str(profile.get('cuda_devices') or '0').split(',')
-        arguments['num_gpu_workers'] = max(1, int(arguments['num_gpu_workers']) // len(devices))
+        arguments['num_gpu_workers'] = max(1, int(arguments['num_gpu_workers']) // (
+            len(devices) if 'num_gpu_workers' in profile else 1))
     if prepared is not None:
         if arguments['model'] == 'glacier':
             prepared['options']['checkpoint'] = arguments['checkpoint']
@@ -100,6 +107,7 @@ def remap(params: dict, endpoint: dict, folder: Path, prepared: dict | None) -> 
 def handle(operation: str, data: dict):
     """Idempotent submission, status, collection and acknowledged cleanup."""
     endpoint = data['endpoint']
+    saved = None
     if endpoint.get('config'):
         saved = load_settings(endpoint['config'])
         profile = saved.get('models', {}).get('simulator', {})
@@ -115,6 +123,9 @@ def handle(operation: str, data: dict):
         mcp = dict(saved.get('mcp', {}))
         overlay(mcp, endpoint.get('mcp', {}))
         endpoint = {**endpoint, 'simulator': mapped, 'mcp': mcp}
+    if operation.startswith('worker-'):
+        from msms_structure_elucidation.mcp.workers import handle as worker_handle
+        return worker_handle(operation,data,endpoint,saved)
     store = JobStore(Path(endpoint['job_root']))
     config = {'mcp': {**endpoint.get('mcp', {}), 'backend': endpoint.get('backend', 'local')},
               '_mcp_python': endpoint.get('python') or sys.executable}
@@ -123,10 +134,8 @@ def handle(operation: str, data: dict):
     if operation == 'probe':
         from msms_structure_elucidation import hostprobe
         description = backend.describe()
-        if hasattr(backend, 'pump'):
-            backend.pump()
         return {**description, 'cpu': hostprobe.probe(), 'active_jobs': sum(
-            row['state'] in ACTIVE for row in store.list(100000))}
+            row['state'] in ACTIVE for row in store.active())}
     if operation == 'validate':
         with tempfile.TemporaryDirectory(dir=store.root) as temp:
             remap(data['params'], endpoint, Path(temp), None)
@@ -193,7 +202,9 @@ def handle(operation: str, data: dict):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['probe', 'validate', 'submit', 'poll', 'bundle', 'cleanup', 'cancel'])
+    parser.add_argument('operation', choices=['probe', 'validate', 'submit', 'poll', 'bundle', 'cleanup', 'cancel',
+        'worker-probe','worker-submit','worker-poll','worker-bundle','worker-cleanup','worker-cancel',
+        'worker-scheduler-update'])
     args = parser.parse_args()
     try:
         result = handle(args.operation, json.load(sys.stdin))

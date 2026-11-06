@@ -92,6 +92,24 @@ class SteppedMergeTests(unittest.TestCase):
         self.assertNotEqual(worker._serial_fragment_ids({'stepped': first['stepped']}),
                             worker._serial_fragment_ids({'stepped': second['stepped']}))
 
+    def test_explicit_arithmetic_mean_preserves_native_summation_order(self):
+        import numpy as np
+        predicted = self.prediction(np.float32)
+        union = {}
+        for key in ('10', '10', '20'):
+            spec = predicted[key]
+            keep = spec.intens > 0
+            component = self.common.MassSpec(float(key), root_canonical_smiles=spec.root_canonical_smiles,
+                adduct=spec.adduct, masses=spec.masses[keep].copy(), intens=spec.intens[keep].copy(),
+                frags=spec.frags[keep].copy())
+            union = component._merge_spec_to_tup(union, merge_method='sum')
+        values = list(union.values())
+        result = worker._scoring_prediction(predicted, {'stepped': {
+            'model_energies_ev': [10,10,20], 'merge_method': 'arithmetic_mean'}})['stepped']
+        np.testing.assert_array_equal(result.masses, [v[0] for v in values])
+        np.testing.assert_array_equal(result.intens, [v[1] / 3 for v in values])
+        np.testing.assert_array_equal(result.frags, np.stack([v[2] for v in values]))
+
     def test_empty_invalid_and_missing_components_keep_existing_validation(self):
         import numpy as np
         source = {'stepped': {'model_energies_ev': [10, 20]}}

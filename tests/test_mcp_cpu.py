@@ -70,6 +70,16 @@ class CpuBudgetTests(unittest.TestCase):
 
 
 class CpuWorkloadTests(unittest.TestCase):
+    def test_virtual_execution_and_verified_delivery_are_reported_separately(self):
+        rows = [{'execution_backend':'feature-worker', 'kind':'pipeline', 'state':'running',
+                 'phase':'cpu_preparation'},
+                {'execution_backend':'feature-worker', 'kind':'pipeline', 'state':'running',
+                 'phase':'result_collection', 'worker_status':{'state':'done'}}]
+        report = workload(rows, {}, SimpleNamespace(name='local', max_live_pipelines=4))
+        self.assertEqual(report['feature_execution_pending'], 1)
+        self.assertEqual(report['feature_delivery_pending'], 1)
+        self.assertEqual(report['working_jobs'], 0)
+
     def test_waiting_pipelines_and_submitted_jobs_do_not_count_as_useful_cpu_work(self):
         rows = [{'kind': 'pipeline', 'state': 'running', 'phase': phase} for phase in
                 ['cpu_preparation', 'cpu_scoring', *['waiting_gpu'] * 5, 'waiting_cache', 'waiting_cpu']]

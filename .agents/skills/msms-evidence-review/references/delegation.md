@@ -2,7 +2,7 @@
 
 ## Coordinator
 
-Dispatch stable features as they become ready. Use the effective `pipeline.evidence_review` settings: `mode` (`auto`, `main`, `delegate`), `max_reviewers` and `features_per_task`. `auto` uses delegation for independent batch work when the client supports it; a single ordinary feature can be reviewed directly. `delegate` requests delegation but falls back to direct review if unavailable. Keep worker counts within available slots and preserve the main agent's capacity to monitor jobs. Never leave a feature unreviewed because delegation is unavailable.
+Dispatch stable features as they become ready using the [continuous review queue](review-queue.md). Refill individual available slots from ready initial assessments and required refreshes before optional deeper follow-ups; a returned draft does not need to wait for other reviewers. Use the effective `pipeline.evidence_review` settings: `mode` (`auto`, `main`, `delegate`), `max_reviewers` and `features_per_task`. `auto` uses delegation for independent batch work when the client supports it; a single ordinary feature can be reviewed directly. `delegate` requests delegation but falls back to direct review if unavailable. Keep worker counts within available slots and preserve the main agent's capacity to monitor jobs. Never leave a feature unreviewed because delegation is unavailable.
 
 Create a disjoint assignment with a task directory for its outputs. Give the reviewer:
 

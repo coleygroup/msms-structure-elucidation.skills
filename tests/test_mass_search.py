@@ -105,6 +105,14 @@ class PubChemMassTests(unittest.TestCase):
 
 
 class MassWorkflowTests(unittest.TestCase):
+    def test_unsearched_formula_accounting_preserves_the_original_failure(self):
+        result = {'formula_results':[{'formula':'CH4','status':'error'}], 'warnings':[], 'status':'running'}
+        cli._finalize_result(result,{},[],RuntimeError('original failure'),False,True,
+            ['CH4','C2H6'],{'CH4':{'candidates':[]}},10,Path('.'))
+        self.assertEqual(result['status'],'error')
+        self.assertEqual(result['formula_results'][1]['status'],'not_processed')
+        self.assertIsNone(result['formula_results'][1]['candidate_structures'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -202,6 +210,27 @@ class MassWorkflowTests(unittest.TestCase):
         self.assertEqual(result['search_mode'],'pubchem-formulas')
         self.assertEqual(result['scored_structures'],3)
         self.assertTrue(result['prediction_complete'])
+
+    def test_formula_index_route_preserves_provenance_and_reuses_validated_structures(self):
+        group = self.matches()['formulas'][0]
+        group.update(source='PubChem formula index', coverage_scope='configured PubChem index snapshot',
+                     formula_index_sha256='a'*64, validated_structures=[
+                         {'input_smiles':'C','smiles':'C','formula_match':True,'model_inchikey':'METHANE'}])
+        index = self.root/'formulae.hdf5'
+        index.write_bytes(b'fixture index handled by the scientific worker')
+        calls=[]
+        fake=self.fake_worker(calls)
+        def run(python, action, **kwargs):
+            if action=='pubchem-formula':return group
+            return fake(python,action,**kwargs)
+        argv=self.argv();argv.remove('--mass-only');argv+=['--formula','CH4','--pubchem-formula-map',str(index)]
+        with patch.object(cli,'worker',side_effect=run), \
+             patch.object(pubchem,'candidates_for_formula',side_effect=AssertionError('Offline index went online')):
+            self.assertEqual(cli.main(argv),0)
+        result=self.result()
+        self.assertFalse(any(action=='validate' for action,_ in calls))
+        self.assertEqual(result['formula_results'][0]['candidate_source']['formula_index_sha256'],'a'*64)
+        self.assertEqual(result['scored_structures'],1)
 
     def test_resume_reuses_predictions_but_checkpoint_change_invalidates_them(self):
         calls = []

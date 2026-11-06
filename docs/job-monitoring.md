@@ -14,7 +14,7 @@ Each monitoring pass should:
 
 1. Refresh job states and feature counts, distinguishing queued, waiting for resources, computing, completed, failed and excluded entries.
 2. Identify newly published per-feature results, inspect failures or stalled progress, and verify the underlying process/log evidence when status is stale.
-3. Review available spectral results using the procedure below while the remaining jobs continue.
+3. Admit newly ready feature results to the review queue, collect and check individual reviewer handoffs, publish accepted reviews and refill free reviewer slots while the remaining jobs continue.
 4. Resume monitoring after review. Do not end active supervision merely because the launcher returned or a background process remains alive.
 
 Repair recoverable failures within the authorized scope and resume only the affected work, preserving completed results, confirmed weights and scientific settings. Explain issues that need the user's input; do not silently skip failed features or overwrite their evidence.
@@ -28,6 +28,8 @@ Apply the workflow's agent review as soon as a stable per-feature result is avai
 Use [msms-evidence-review](../.agents/skills/msms-evidence-review/SKILL.md) for direct or delegated assessment. Prefer completed per-feature results with settled candidate and energy coverage. A readable partial result can also support a **provisional** review, but record the missing coverage and do not treat its current rank as final. Use published results or stable snapshots rather than files being written. Compare matched/unmatched peaks and leading candidates across the supplied energies using its [evidence-review checklist](../.agents/skills/msms-evidence-review/references/evidence-review.md).
 
 When delegating, keep a bounded pool of reviewers on disjoint features/small groups and retain all energies of a feature in the same assignment. The main agent monitors model jobs and reviewer progress, supplies immutable input snapshots and provenance, checks returned reasoning, and publishes accepted drafts with `msms-workflow-guard review-check --publish`. Reviewers write only their assigned drafts and return gaps/questions to the coordinator. Do not stop supervising work after dispatch or finalize while a requested review remains pending; review directly if a task fails or delegation is unavailable. Operational defaults and overrides are under `pipeline.evidence_review`.
+
+Follow the skill's [continuous review queue](../.agents/skills/msms-evidence-review/references/review-queue.md): persist assignments and outcomes, deduplicate unchanged evidence and refill slots individually. Prioritize ready initial assessments and required refreshes over optional deeper follow-ups. Missing essential evidence produces a provisional draft and an explicit blocked dependency; release that reviewer to another ready feature until the dependency changes. Report distinct features with current accepted reviews separately from handoff counts and follow-up work.
 
 Write `evidence_review.json` beside each feature's result. Record its job/feature ID, source result path and hash, review time, completion/coverage state, supporting and conflicting evidence, ambiguities and recommended next action. Keep the user's selected optional route separate from that assessment. Revisit provisional reviews and refresh any review whose source ranking, candidates or energy coverage changes; do not mark the whole batch reviewed because the first few features were inspected.
 

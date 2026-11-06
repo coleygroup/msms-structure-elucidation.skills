@@ -37,7 +37,7 @@ msms-structure-elucidation preferences \
   --set pipeline.evidence_review.features_per_task 1
 ```
 
-Reuse these settings without repeated questions. They guide agent dispatch; they do not start an LLM pool inside the Python batch worker or authorize proposals/model runs.
+Reuse these settings without repeated questions. They guide the coordinator's [continuous review queue](../.agents/skills/msms-evidence-review/references/review-queue.md): refill each available slot from ready initial assessments and required refreshes, keeping optional deeper follow-ups separate. The configured reviewer count limits active workers, not the number of queued features, and includes reviewers doing follow-ups. These settings do not start an LLM pool inside the Python batch worker or authorize proposals/model runs.
 
 After retrieval/scoring, the agent reviews every result. For weakly supported entries, ask the user whether to use agent proposals scored by ICEBERG/GLACIER (workflow step 4), FRIGID de novo followed by scoring (step 5), both, or skip. Wait for the selection before either optional route. One answer can cover an identified batch or a subset of entries. Reuse an earlier selection only if it explicitly covers the same analysis, inputs, affected entries and model context.
 

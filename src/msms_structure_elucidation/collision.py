@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import math
 import re
+import json
 
 
 def energy_values(value: str | list[float]) -> list[float]:
     """Read explicit energy values without interpreting a range or center/spread."""
     if isinstance(value, str):
+        if value.lstrip().startswith('['):
+            decoded = json.loads(value)
+            if not isinstance(decoded, list) or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in decoded):
+                raise ValueError('Stepped JSON energies must be an explicit numeric list')
+            return energy_values(decoded)
         if not re.fullmatch(r'\s*\d+(?:\.\d+)?(?:\s*[,;/ ]\s*\d+(?:\.\d+)?)*\s*', value):
             raise ValueError('Energy values must be an explicit list, not a range or center/spread')
         values = [float(x) for x in re.split(r'[,;/\s]+', value.strip())]
@@ -30,5 +36,10 @@ def stepped_components(value: str | list[float], precursor: float, unit: str, nc
     model = [int(round(x)) for x in ev]
     if any(not math.isfinite(x) or x <= 0 for x in ev) or any(x <= 0 for x in model):
         raise ValueError('Each stepped component must convert to a positive model energy')
+    from msms_structure_elucidation.config import settings
+    aggregation = settings().get('pipeline', {}).get('stepped_aggregation', 'sum_then_base_peak_normalize')
+    if aggregation not in ('sum_then_base_peak_normalize', 'arithmetic_mean'):
+        raise ValueError('Unsupported stepped aggregation: ' + str(aggregation))
+    weight = 1.0 / len(values) if aggregation == 'arithmetic_mean' else 1.0
     return {'values': values, 'unit': unit, 'energies_ev': ev, 'model_energies_ev': model,
-            'merge_method': 'sum_then_base_peak_normalize', 'weights': [1.0] * len(values)}
+            'merge_method': aggregation, 'weights': [weight] * len(values)}

@@ -40,6 +40,36 @@ class PipelineSchedulingTests(unittest.TestCase):
         self.assertIn((cpu, ''), self.launched)
         self.assertIn((gpu, '0'), self.launched)
 
+    def test_direct_auto_grouping_counts_spectra_and_respects_explicit_overrides(self):
+        config={'mcp':{'prediction_group_spectra':131072}}
+        with patch.object(backends.hostprobe,'ram_gb',return_value=(None,None)):
+            self.assertEqual(pipeline.group_size(config,'glacier',3),43691)
+            # Explicit per-request overrides remain useful for bounded canaries.
+            config['mcp']['prediction_group_size']=128
+            self.assertEqual(pipeline.group_size(config,'glacier',3),128)
+
+    def test_deferred_output_returns_native_files_without_starting_the_exporter(self):
+        from msms_structure_elucidation.prediction_cache import source_fingerprint
+        folder=self.store.root/'native/src/ms_pred';folder.mkdir(parents=True)
+        params={'weights':{},'native_source':source_fingerprint(folder),'ms_pred_dir':str(folder.parent.parent),
+            'python':'scientific-python','arguments':{'model':'glacier'},'publish_raw_records':True,
+            'defer_raw_publication':True}
+        with patch('msms_structure_elucidation.cli.worker',return_value={'save_dir':'closed-native-files'}), \
+                patch('subprocess.run',side_effect=AssertionError('GPU job must not run the CPU exporter')):
+            result=pipeline.inference(params,self.store.root,{},'0',None)
+        self.assertEqual(result,{'save_dir':'closed-native-files'})
+
+    def test_output_service_uses_the_scientific_interpreter_without_gpu_visibility(self):
+        import io
+        with patch.object(tasks,'_ms_pred_python',return_value='scientific-python'), \
+                patch.object(tasks.subprocess,'run',return_value=types.SimpleNamespace(
+                    returncode=0,stdout='RESULT_JSON={"published_jobs":[]}\n')) as run:
+            result=tasks.run('publish_prediction_list',{},self.store.root,{},None,io.StringIO())
+        self.assertEqual(run.call_args.kwargs['env']['CUDA_VISIBLE_DEVICES'],'')
+        self.assertEqual(run.call_args.args[0][0],'scientific-python')
+        self.assertEqual(tasks.KINDS['publish_prediction_list'],'cpu')
+        self.assertEqual(result,{'published_jobs':[]})
+
     def test_waiting_parent_releases_cpu_and_gpu_but_ready_queue_bounds_new_preparation(self):
         parent, _ = self.store.create('score_candidates', {}, kind='pipeline')
         self.backend.pump()
@@ -213,6 +243,34 @@ class StageBoundaryTests(unittest.TestCase):
             payload = json.loads(manifest.read_text())
             self.assertEqual(payload['entries'][0][2], 20)
             self.assertEqual(payload['options']['checkpoint'], 'weights')
+
+    def test_entry_preparation_uses_its_cpu_allocation_and_preserves_gpu_worker_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            native = root/'native/src/ms_pred'
+            native.mkdir(parents=True)
+            (native/'__init__.py').write_text('')
+            checkpoint = root/'model.ckpt'
+            checkpoint.write_bytes(b'weights')
+            store = JobStore(root/'jobs')
+            parent,_ = store.create('predict_spectra',{},kind='pipeline')
+            manifest = root/'prepared.json'
+            args = dict(model='glacier',smiles=['CCO'],energies=[20],nce=False,adduct='[M+H]+',
+                instrument='Orbitrap',checkpoint=str(checkpoint),cuda_devices=None,batch_size=128,
+                num_cpu_workers=4,num_writers=2,num_h5_chunks=4,feat_cache_size=256,sparse_k=100)
+            observed=[]
+            def prepare(**kwargs):
+                observed.append(kwargs['num_cpu_workers'])
+                manifest.write_text(json.dumps({'entries':[],'options':{'num_cpu_workers':kwargs['num_cpu_workers']}}))
+                return manifest
+            with patch.dict(os.environ,{'SLURM_CPUS_PER_TASK':'2'}), \
+                 patch.dict(sys.modules,{'ms_pred':types.SimpleNamespace(__file__=str(native/'__init__.py'))}), \
+                 patch.object(glacier,'prepare',side_effect=prepare), \
+                 patch('msms_structure_elucidation.worker._check_glacier_features'):
+                child,_ = pipeline._prepare_submission(args,store,parent,{})
+            self.assertEqual(observed,[2])
+            self.assertEqual(json.loads(manifest.read_text())['options']['num_cpu_workers'],4)
+            self.assertEqual(store.request(child)['params']['arguments']['num_cpu_workers'],4)
 
     def test_prepared_glacier_uses_every_allocated_gpu_and_keeps_energies_together(self):
         with tempfile.TemporaryDirectory() as tmp:

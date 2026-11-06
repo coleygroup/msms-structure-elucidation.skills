@@ -10,6 +10,7 @@ import re
 import time
 import os
 import ssl
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 import urllib.error
@@ -25,6 +26,31 @@ _BATCH = 500
 
 
 def _get(path: str, data: dict | None = None, retries: int = 3) -> dict:
+    """Reuse complete responses within a configured analysis, with one owner per query."""
+    folder = os.environ.get('MSMS_PUBCHEM_CACHE_DIR')
+    ttl = float(os.environ.get('MSMS_PUBCHEM_CACHE_TTL_SECONDS', '86400'))
+    if not math.isfinite(ttl) or ttl < 0:
+        raise ValueError('PubChem cache TTL must be finite and nonnegative')
+    if not folder or not ttl or 'listkey/' in path:
+        return _get_uncached(path, data, retries)
+    from msms_structure_elucidation.prediction_cache import file_lock
+    from msms_structure_elucidation.mcp.jobs import read_json, write_json
+    identity = {'schema': 1, 'origin': PUBCHEM, 'path': path, 'data': data}
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    target = Path(folder) / (key + '.json')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(target.with_suffix('.lock')):
+        cached = read_json(target)
+        if cached and cached.get('identity') == identity and 0 <= time.time() - cached['fetched_at'] < ttl:
+            return cached['response']
+        response = _get_uncached(path, data, retries)
+        if 'Waiting' not in response:
+            write_json(target, {'identity': identity, 'fetched_at': time.time(), 'response': response})
+        return response
+
+
+def _get_uncached(path: str, data: dict | None = None, retries: int = 3) -> dict:
+    """Fetch a PubChem response under the shared request budget."""
     body = urllib.parse.urlencode(data).encode() if data else None
     for attempt in range(retries):
         try:
@@ -50,16 +76,19 @@ def _rate_limit() -> None:
     from msms_structure_elucidation.prediction_cache import file_lock
     from msms_structure_elucidation.mcp.jobs import read_json, write_json
     configured = os.environ.get('MSMS_PUBCHEM_RATE_FILE')
+    interval = float(os.environ.get('MSMS_PUBCHEM_RATE_SECONDS', '.25'))
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError('PubChem request interval must be positive and finite')
     if not configured:
-        time.sleep(.25)
+        time.sleep(interval)
         return
     path = Path(configured)
     with file_lock(path.with_suffix('.lock')):
         previous = read_json(path, {}).get('next_request', 0.)
-        delay = max(0., min(.25, previous - time.time()))
+        delay = max(0., previous - time.time())
         if delay:
             time.sleep(delay)
-        write_json(path, {'next_request': time.time() + .25})
+        write_json(path, {'next_request': time.time() + interval})
 
 
 def _elements(formula: str) -> set[str]:
@@ -78,12 +107,18 @@ def _closed_shell(formula: str) -> bool:
     return float(rdbe).is_integer() and rdbe + counts.get('P', 0) >= 0
 
 
+def has_negatively_charged_carbon(smiles: str) -> bool:
+    """Detect negative formal charge on bracketed carbon atoms without model dependencies."""
+    return bool(re.search(r'\[(?:\d+)?[Cc](?![a-z])[^\]]*-(?:0*[1-9]\d*|(?=[^\d]))', smiles))
+
+
 def _usable(props: dict, elements: str) -> bool:
     smiles = props.get('SMILES', '')
     formula = props.get('MolecularFormula', '')
     allowed = set(re.findall(r'[A-Z][a-z]?', elements))
     # Isotope-labelled records (e.g. [2H]) list the unlabelled formula but a heavier mass.
     return (smiles and '.' not in smiles and not re.search(r'\[\d', smiles) and int(props.get('Charge', 0)) == 0
+            and not has_negatively_charged_carbon(smiles)
             and not re.search(r'[+-]', formula) and _elements(formula) <= allowed and _closed_shell(formula))
 
 
@@ -154,7 +189,7 @@ def mass_candidates(precursor_mz: float, adduct: str = '[M+H]+', ppm: float = 10
     return {'source': 'PubChem monoisotopic mass search', 'query_url': f'{PUBCHEM}/{query}',
             'queried_at': datetime.now(timezone.utc).isoformat(), 'precursor_mz': precursor_mz,
             'adduct': adduct, 'neutral_mass': neutral, 'ppm_tolerance': ppm, 'mass_range': [lower, upper],
-            'elements': elements, 'filters': ['neutral', 'single-component', 'non-isotope-labelled', 'closed-shell'],
+            'elements': elements, 'filters': ['neutral', 'single-component', 'non-isotope-labelled', 'closed-shell', 'no-negatively-charged-carbon'],
             'matched_cids': len(cids), 'eligible_cids': eligible, 'excluded_cids': len(cids) - eligible,
             'candidate_structures': sum(map(len, groups.values())), 'complete': True,
             'formulas': [{'formula': formula, 'candidates': list(by_smiles.values())}
@@ -230,7 +265,8 @@ def candidates_for_formula(formula: str, precursor_mz: float, adduct: str, ppm: 
             record['pubchem_cids'].append(row['CID'])
             if row['InChIKey'] not in record['pubchem_inchikeys']:
                 record['pubchem_inchikeys'].append(row['InChIKey'])
-    return {'formula': formula, 'candidates': list(found.values()), 'complete': True, 'matched_cids': len(cids)}
+    return {'formula': formula, 'candidates': list(found.values()), 'complete': True, 'matched_cids': len(cids),
+            'source': 'PubChem online formula search', 'coverage_scope': 'completed PubChem formula search'}
 
 
 _PROPERTIES = 'ConnectivitySMILES,InChIKey,MolecularFormula,MolecularWeight,IUPACName'

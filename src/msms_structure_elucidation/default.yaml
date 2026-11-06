@@ -29,6 +29,7 @@ models:
   retrieval:
     top_k: 10
     atlas_url: https://iceberg-ms.mit.edu
+    pubchem_formula_map: '' # optional HDF5; also discovered under the configured ms-pred data/retrieval/pubchem
   batch:
     max_workers: auto   # batch worker processes; auto: up to 8 from CPU threads and RAM, setup saves a value
     max_model_jobs: 1
@@ -46,13 +47,27 @@ models:
     cuda_devices: null
 mcp:  # prediction server; setup writes host-specific values to configs/local.yaml
   backend: local          # local, slurm, kubernetes, or pool
+  feature_pipeline: true  # backend CPU lists -> ready files -> shared prediction groups -> independent scoring
+  feature_placement: workers # pool: whole requests stay on a worker; coordinator drains existing staged jobs
+  approved_model_identities: {} # setup-pool records matching remote weight/native identities for a thin coordinator
+  feature_cpu_workers: 3  # legacy total; ignored when explicit preparation/scoring counts are set
+  feature_preparation_workers: auto # legacy split; setup saves 2 preparation services per GPU
+  feature_scoring_workers: null # explicit scoring services; setup saves ceil(GPU slots / 2); null uses legacy total
+  feature_worker_idle_seconds: 60 # reuse CPU workers for new lists and scoring before releasing their allocation
+  feature_prediction_groups: auto # two queued prediction groups per endpoint slot
+  feature_group_builds_per_tick: 2 # yield to GPU dispatch and collection between large group builds
+  feature_queue_cache_mb: 64 # SQLite page cache per feature-driver connection; tune on large queues
+  feature_cpu_output: true # decode native HDF5 and publish cache in CPU output jobs after GPU release
+  feature_output_workers: auto # bounded output services; setup saves one per GPU slot
+  feature_output_idle_seconds: 60 # finite reuse window for CPU output allocations
   job_root: results/mcp_jobs  # relative to the checkout
   wait_seconds: 600       # tools wait this long for a result before returning a job id
   gpu_monitor_interval_seconds: 1  # sampled allocated-task activity; 0 disables recording
   gpu_min_free_fraction: 0.8  # a GPU is free when idle with this fraction of its memory free
   gpu_devices: null        # optional list of physical GPU indices; null allows all detected GPUs
   max_concurrent_jobs: auto  # GPU job limit; auto: one per GPU, or one on CPU-only hosts
-  max_cpu_jobs: 2          # independent local CPU preparation/scoring slots
+  max_cpu_jobs: auto       # preparation + scoring + output services; optional explicit host cap
+  cpu_preparation_workers: auto # GLACIER entry preparation respects CPU allocation; GPU featurization stays tuned separately
   scheduler_process: true # one detached local scheduler; workers only publish state
   max_live_pipelines: auto # cap running/waiting CPU processes; auto: CPU slots + prepared limit
   route_canary: true      # one successful PubChem route request before expanding a new environment
@@ -62,10 +77,22 @@ mcp:  # prediction server; setup writes host-specific values to configs/local.ya
   max_prepared_jobs: auto  # pause new CPU preparations at two waiting parents per GPU (at least two)
   prediction_group_size: auto  # measured rate × target duration; fallback 4096 candidates; GPU batch is separate
   target_prediction_seconds: 600  # scheduling hint, not a minimum runtime or latency
-  max_group_candidates: 32768  # upper bound for a prepared work group
+  prediction_group_spectra: 131072 # unique structure/actual-energy pairs per bulk GPU job
+  prediction_group_min_spectra: 100001 # bulk goal; small requests and final remainders run below this
+  prediction_small_job_spectra: 10000 # small-workload classification, never pad requested spectra
+  prediction_coalesce_seconds: 60 # flush an undersized ready pool after growth stops
+  prediction_coalesce_max_seconds: 300 # bounded wait while CPU preparation continues
+  max_group_candidates: 131072 # structure ceiling for a prepared work group
   prepared_groups: auto    # two groups per endpoint slot, capped at eight per orchestrator
   coordinator_backend: local  # pool CPU orchestrators: local or slurm
   poll_seconds: 15         # endpoint inventory refresh interval
+  pool_async_dispatch: true # endpoint RPC and collection run outside the scheduling tick
+  pool_rpc_workers: 4      # bounded endpoint control operations
+  pool_rpc_workers_per_server: 2 # isolated per resource_group; 0 shares the RPC executor
+  pool_submission_workers: 2 # independent execution-write capacity in shared mode
+  pool_submission_workers_per_server: 1 # independent write worker per resource_group
+  pool_transfer_workers: 2 # independent artifact transfer capacity
+  pubchem_cache_ttl_seconds: 86400 # analysis-local complete response snapshots; 0 disables reuse
   servers: {}             # named private endpoints; see docs/prediction-servers.md
   kubernetes: {}          # explicit context, namespace, pinned runtime image and shared storage
   slurm:  # every unset key is left out of sbatch

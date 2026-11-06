@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -16,6 +17,21 @@ from unittest.mock import patch
 from msms_structure_elucidation.mcp import backends, endpoint, fleet, kubernetes, pipeline
 from msms_structure_elucidation.mcp.jobs import JobStore, write_json
 from msms_structure_elucidation.prediction_cache import source_fingerprint
+
+
+class LocalEndpointEnvironmentTests(unittest.TestCase):
+    def test_local_endpoint_uses_its_own_environment_and_working_directory(self):
+        with tempfile.TemporaryDirectory(prefix='endpoint space ') as tmp:
+            root=Path(tmp);module=root/'msms_structure_elucidation/mcp'
+            module.mkdir(parents=True)
+            for folder in (module,module.parent):(folder/'__init__.py').write_text('')
+            (module/'endpoint.py').write_text('import json,os\nprint(json.dumps({"cwd":os.getcwd(),"profile":os.environ["MSMS_TEST_PROFILE"]}))\n')
+            node=fleet.Endpoint('local',{'transport':'local','job_root':str(root/'jobs'),
+                'repo':str(root),'python':sys.executable,
+                'prefix':'export MSMS_TEST_PROFILE=worker PYTHONPATH='+shlex.quote(str(root))+';'})
+            self.assertEqual(node.call('probe'),{'cwd':str(root),'profile':'worker'})
+            output=root/'stream.json';node.call('export',output=output)
+            self.assertEqual(json.loads(output.read_text()),{'cwd':str(root),'profile':'worker'})
 
 
 class CollectionTests(unittest.TestCase):
@@ -58,7 +74,7 @@ class PoolTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.store = JobStore(self.root / 'coordinator')
-        config = {'mcp': {'backend': 'pool', 'min_free_memory_gb': 0, 'servers': {
+        config = {'mcp': {'backend': 'pool', 'pool_async_dispatch': False, 'min_free_memory_gb': 0, 'servers': {
             'busy': {'transport': 'local', 'job_root': str(self.root / 'busy')},
             'free': {'transport': 'local', 'job_root': str(self.root / 'free')}}}}
         with patch.object(backends.hostprobe, 'gpus', return_value=[]):
@@ -87,6 +103,20 @@ class PoolTests(unittest.TestCase):
         self.backend.pump()
         self.assertEqual(self.calls.count(('free', 'submit')), 1)
         self.assertEqual(self.calls.count(('busy', 'submit')), 0)
+
+    def test_whole_worker_inventory_does_not_run_the_raw_endpoint_scheduler(self):
+        node=self.backend.endpoints['free'];node.settings.update(features=True,models=['glacier'])
+        with patch.object(node,'call',return_value={'free_gpus':[0]}) as call:
+            self.backend._probe('free')
+        call.assert_called_once_with('worker-probe',{'model':'glacier'})
+
+    def test_whole_worker_is_not_a_legacy_native_group_target(self):
+        self.backend.endpoints.pop('busy')
+        self.backend.endpoints['free'].settings.update(features=True,models=['glacier'])
+        job=self.child('owned-by-worker')
+        self.backend.pump()
+        self.assertFalse(self.store.launch(job))
+        self.assertFalse(self.calls)
 
     def test_endpoint_limit_is_respected_for_queued_group(self):
         first, second = self.child('first'), self.child('second')
@@ -181,6 +211,7 @@ class EndpointTests(unittest.TestCase):
             store = JobStore(root / 'client')
             with patch.object(backends.hostprobe, 'gpus', return_value=[]):
                 backend = fleet.FleetBackend(store, config)
+            self.addCleanup(backend.close)
             arguments = dict(smiles=['CCO'], energies=[20], nce=False, adduct='[M+H]+', model='iceberg',
                 checkpoint=None, gen_checkpoint=str(weight), inten_checkpoint=str(weight), instrument='Orbitrap',
                 cuda_devices=None, batch_size=128, num_cpu_workers=4, num_gpu_workers=2,
@@ -205,6 +236,9 @@ class EndpointTests(unittest.TestCase):
                 backend.submit(job)
                 deadline = time.monotonic() + 30
                 while backend.poll(job)['state'] in ('queued', 'submitted', 'running') and time.monotonic() < deadline:
+                    time.sleep(.05)
+                while store.status(job).get('remote_cleanup_pending') and time.monotonic() < deadline:
+                    backend.pump()
                     time.sleep(.05)
             self.assertEqual(store.status(job)['state'], 'done', store.status(job))
             self.assertEqual(submitted[0], submitted[1])
@@ -232,9 +266,36 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual(mapped['arguments']['batch_size'], 256)
             self.assertEqual(mapped['arguments']['checkpoint'], str(weight))
             self.assertEqual(json.loads((root / 'prepared.json').read_text())['options']['checkpoint'], str(weight))
+            params['adapter_source']='verified-previous-package'
+            with self.assertRaisesRegex(ValueError,'package source'):
+                endpoint.remap(params,settings,root,None)
+            from msms_structure_elucidation.prediction_cache import _raw_adapter_source
+            raw=_raw_adapter_source(Path(endpoint.__file__).parents[1]/'worker.py')
+            settings['compatible_prepared_adapters']={'verified-previous-package':raw}
+            accepted=endpoint.remap(params,settings,root,None)
+            self.assertEqual(accepted['prepared_adapter_source'],'verified-previous-package')
+            self.assertEqual(accepted['adapter_source'],source_fingerprint(Path(endpoint.__file__).parents[1]))
+            settings['compatible_prepared_adapters']['verified-previous-package']='unverified-raw-source'
+            with self.assertRaisesRegex(ValueError,'package source'):
+                endpoint.remap(params,settings,root,None)
             weight.write_bytes(b'other')
             with self.assertRaisesRegex(ValueError, 'approved weights'):
                 endpoint.remap(params, settings, root, None)
+
+    def test_iceberg_inherited_workers_are_already_per_gpu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); native = root/'native/src/ms_pred'; native.mkdir(parents=True)
+            (native/'__init__.py').write_text('')
+            weight = root/'weight.ckpt'; weight.write_bytes(b'approved')
+            sha = hashlib.sha256(b'approved').hexdigest()
+            params = {'arguments':{'model':'iceberg','gen_checkpoint':str(weight),'inten_checkpoint':str(weight),
+                                   'num_gpu_workers':3,'sparse_k':100},
+                      'weights':{str(weight):sha},'native_source':source_fingerprint(native),
+                      'ms_pred_dir':str(root/'native'),'python':sys.executable}
+            for tuning in ({'cuda_devices':'0,1,2,3'}, {'cuda_devices':'0,1,2,3','num_gpu_workers':12}):
+                with self.subTest(tuning=tuning):
+                    result = endpoint.remap(params,{'simulator':tuning},root,None)
+                    self.assertEqual(result['arguments']['num_gpu_workers'],3)
 
     def test_cleanup_requires_exact_acknowledgement(self):
         with tempfile.TemporaryDirectory() as tmp:
